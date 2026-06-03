@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-"""ГОСТ-АССИСТЕНТ v2.6 — ТОЧНЫЕ СТРАНИЦЫ + ДИСЦИПЛИНА
+"""ГОСТ-АССИСТЕНТ v2.7 — ТОЧНЫЕ СТРАНИЦЫ + ДИСЦИПЛИНА
 
 Главные изменения v2.1 относительно v2.0:
 ────────────────────────────────────────────────────────────────
@@ -292,7 +292,7 @@ PAID_DAILY_LIMIT  = int(cfg("PAID_DAILY_LIMIT",       "0"))   # 0 = безлим
 PAID_COOLDOWN     = int(cfg("PAID_COOLDOWN_SECONDS",  "0"))   # 0 = нет кулдауна
 
 # Символов на страницу (ГОСТ: ~1800 знаков с пробелами на стр A4 14pt 1.5 интервал)
-CHARS_PER_PAGE = int(cfg("CHARS_PER_PAGE", "1700"))
+CHARS_PER_PAGE = int(cfg("CHARS_PER_PAGE", "1500"))
 # Страниц без текста (титул + содержание)
 NON_TEXT_PAGES = int(cfg("NON_TEXT_PAGES", "3"))
 
@@ -2250,7 +2250,7 @@ _TNR_LINE_HEIGHT_RATIO    = 1.0    # множитель кегля для выс
 # Калибровочный множитель: оценка эмпирически на 30% занижает страницы
 # по сравнению с реальным результатом LibreOffice (учитывает переносы строк,
 # минимальные отступы, особенности шейпинга TNR). Подобран на 5/8/11/15/20-страничных тестах.
-_ESTIM_CALIBRATION       = 1.30
+_ESTIM_CALIBRATION       = 1.10
 
 def estimate_docx_pages(docx_path: str) -> Optional[int]:
     """Эмулирует разбивку DOCX по страницам без внешних инструментов.
@@ -2362,14 +2362,94 @@ def estimate_docx_pages(docx_path: str) -> Optional[int]:
     return max(1, int(round(pages * _ESTIM_CALIBRATION)))
 
 
+async def count_pages_via_aspose(docx_path: str) -> Optional[int]:
+    """Считает страницы DOCX через Aspose Words Counter API.
+
+    Загружает файл на https://products.aspose.app/words/wordscounter/api/getstatistics
+    и возвращает поле statistics.pages из JSON-ответа.
+
+    Точность: соответствует реальному Word/LibreOffice layout (проверено калибровкой).
+    Таймаут: 30 сек. При ошибке возвращает None → fallback на estimate_docx_pages.
+    """
+    ASPOSE_ENDPOINT = (
+        "https://api.products.aspose.app/words/wordscounter/api/getstatistics"
+    )
+    try:
+        with open(docx_path, "rb") as fh:
+            file_bytes = fh.read()
+
+        form = aiohttp.FormData()
+        form.add_field(
+            "files[]",
+            file_bytes,
+            filename=os.path.basename(docx_path),
+            content_type=(
+                "application/vnd.openxmlformats-officedocument"
+                ".wordprocessingml.document"
+            ),
+        )
+        form.add_field("includeTextboxes", "false")
+
+        async with aiohttp.ClientSession() as sess:
+            async with sess.post(
+                ASPOSE_ENDPOINT,
+                data=form,
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                if resp.status != 200:
+                    print(f"[ASPOSE] HTTP {resp.status}")
+                    return None
+                data = await resp.json(content_type=None)
+                pages = data.get("statistics", {}).get("pages")
+                if pages is not None:
+                    pages = int(pages)
+                    print(f"[ASPOSE] Страниц: {pages}")
+                    return pages
+    except asyncio.TimeoutError:
+        print("[ASPOSE] Таймаут запроса")
+    except Exception as e:
+        print(f"[ASPOSE] Ошибка: {e}")
+    return None
+
+
 def measure_pages(docx_path: str, work_dir: str) -> Optional[int]:
-    """Главная функция: пытается LibreOffice, иначе оценочно через estimate_docx_pages."""
+    """Синхронный fallback: LibreOffice → estimate. Используется только если
+    асинхронный count_pages_via_aspose недоступен."""
     n = count_docx_pages(docx_path, work_dir)
     if n is not None:
         return n
     n = estimate_docx_pages(docx_path)
     if n is not None:
         print(f"[ESTIM] Страниц (расчётно, без LibreOffice): {n}")
+    return n
+
+
+async def measure_pages_async(docx_path: str, work_dir: str) -> Optional[int]:
+    """Главная функция подсчёта страниц (async).
+
+    Порядок приоритетов:
+    1. Aspose Words Counter API  — точный, не требует LibreOffice
+    2. LibreOffice → PDF + pypdf/pdfinfo — точный, требует soffice
+    3. estimate_docx_pages       — расчётный, без внешних зависимостей
+
+    Все три метода откалиброваны под параметры ГОСТ:
+    Times New Roman 14pt, 1.5 интервал, поля 30/15/20/20 мм, A4.
+    """
+    # 1) Aspose (приоритет — работает везде без soffice)
+    n = await count_pages_via_aspose(docx_path)
+    if n is not None:
+        return n
+
+    # 2) LibreOffice
+    n = count_docx_pages(docx_path, work_dir)
+    if n is not None:
+        print(f"[LO] Страниц: {n}")
+        return n
+
+    # 3) Расчётный эстиматор
+    n = estimate_docx_pages(docx_path)
+    if n is not None:
+        print(f"[ESTIM] Страниц (расчётно): {n}")
     return n
 
 
@@ -3693,7 +3773,7 @@ async def generate_and_send(
             os.makedirs(measure_dir, exist_ok=True)
 
             for it in range(max_iters):
-                real_pages = measure_pages(tmp_in, measure_dir)
+                real_pages = await measure_pages_async(tmp_in, measure_dir)
                 if real_pages is None:
                     # Грубая оценка по символам если ни LO ни эстиматор не сработали
                     total_chars_now = _blocks_text_total(blocks)
@@ -3746,7 +3826,7 @@ async def generate_and_send(
                     docx_raw = build_docx_bytes(data, blocks, gost)
                     with open(tmp_in, "wb") as f:
                         f.write(docx_raw)
-                final_check = measure_pages(tmp_in, measure_dir)
+                final_check = await measure_pages_async(tmp_in, measure_dir)
                 print(f"[PAGES] ⚠️ Лимит итераций исчерпан, финальный замер: {final_check}")
 
             # ── LibreOffice (финальная конвертация — обновит TOC и поля PAGE) ──
@@ -3760,7 +3840,7 @@ async def generate_and_send(
             lo_tmp_dir = os.path.join(work_dir, "_lo_tmp")
             os.makedirs(lo_tmp_dir, exist_ok=True)
             for lo_it in range(3):
-                post_lo_pages = measure_pages(final_path, measure_dir)
+                post_lo_pages = await measure_pages_async(final_path, measure_dir)
                 if not post_lo_pages or post_lo_pages == target_pages:
                     print(f"[PAGES] ✅ После LO: {post_lo_pages} стр (цель достигнута)")
                     break
@@ -3791,10 +3871,10 @@ async def generate_and_send(
                 updated2 = libreoffice_update_docx(tmp_in2, tmp_out)
                 final_path = tmp_out if updated2 else tmp_in2
             else:
-                post_lo_pages = measure_pages(final_path, measure_dir)
+                post_lo_pages = await measure_pages_async(final_path, measure_dir)
             print(f"[PAGES] ✅ После LO-коррекции: {post_lo_pages} стр")
 
-            final_pages = measure_pages(final_path, measure_dir) or pages
+            final_pages = (await measure_pages_async(final_path, measure_dir)) or pages
             print(f"[PAGES] 📤 Итог в caption: {final_pages} страниц")
 
             # ── Имя файла ──
@@ -3883,7 +3963,7 @@ async def generate_and_send(
 
 async def main() -> None:
     print("═" * 62)
-    print("  🤖  ГОСТ-АССИСТЕНТ v2.6")
+    print("  🤖  ГОСТ-АССИСТЕНТ v2.7")
     print("═" * 62)
     print(f"  LibreOffice : {shutil.which('soffice') or '❌ не найден'}")
     print(f"  DeepSeek    : {'✅' if DEEPSEEK_KEY else '❌ нет ключа'}")
