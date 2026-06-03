@@ -1,0 +1,3 @@
+libreoffice
+poppler-utils
+fonts-liberation
