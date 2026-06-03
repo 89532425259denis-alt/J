@@ -1483,6 +1483,50 @@ def _stub_text(key: str, topic: str) -> str:
 #  ГОСТ-DOCX: СТИЛИ, TOC, НУМЕРАЦИЯ, ПОДГЛАВЫ
 # ═══════════════════════════════════════════════════════════════
 
+def _normalize_punctuation(text: str) -> str:
+    """Чистит технические дефекты текста (ошибка #5):
+    убирает лишние пробелы перед знаками препинания и дублирующиеся пробелы.
+    """
+    if not text:
+        return ""
+    # Убираем пробелы перед . , ; : ! ? ) » и перед закрывающими знаками
+    text = re.sub(r"\s+([.,;:!?])", r"\1", text)
+    text = re.sub(r"\s+([)»])", r"\1", text)
+    text = re.sub(r"([(«])\s+", r"\1", text)
+    # Гарантируем пробел после , ; : (если за ним сразу буква/цифра)
+    text = re.sub(r"([,;:])([^\s\d)»])", r"\1 \2", text)
+    # Схлопываем повторяющиеся пробелы/табы (но не переводы строк)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    # Убираем пробелы в конце строк
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    return text.strip()
+
+
+def _normalize_bibliography(text: str) -> str:
+    """Приводит список литературы к единому формату нумерации (ошибка #9):
+    каждая позиция оформляется как '1. Автор...', '2. Автор...' с одним
+    пробелом после точки и без пустых строк между пунктами.
+    """
+    if not text:
+        return ""
+    raw = text.replace("\r\n", "\n").replace("\r", "\n")
+    # Разбиваем по новым строкам и по началам пунктов вида "12. "
+    candidates = re.split(r"\n+|(?<=\S)\s+(?=\d{1,3}\s*[.)]\s)", raw)
+    items: list[str] = []
+    for c in candidates:
+        c = c.strip()
+        if not c:
+            continue
+        # Снимаем существующую нумерацию "1. ", "1) ", "1 )", "1 " в начале
+        c = re.sub(r"^\d{1,3}\s*[.)]\s*", "", c).strip()
+        c = _normalize_punctuation(c)
+        if c:
+            items.append(c)
+    if not items:
+        return _normalize_punctuation(text)
+    return "\n".join(f"{i}. {it}" for i, it in enumerate(items, start=1))
+
+
 def _set_run_font(run, font_name: str, size_pt: int, bold: bool = False) -> None:
     run.font.name = font_name
     try:
@@ -1525,24 +1569,42 @@ def setup_gost_page(doc: Document, gost: dict) -> None:
     pf.space_after       = Pt(0)
     pf.alignment         = WD_ALIGN_PARAGRAPH.JUSTIFY
 
-    # Настраиваем стили заголовков
-    _setup_heading_style(doc, "Heading 1", font_name, int(gost.get("font_size", 14)))
-    _setup_heading_style(doc, "Heading 2", font_name, int(gost.get("font_size", 14)))
+    # Настраиваем стили заголовков (ошибка #4):
+    # все заголовки 1-го уровня — единый размер; подзаголовки — базовый размер.
+    h_size = heading_font_size(gost)
+    base   = int(gost.get("font_size", 14))
+    _setup_heading_style(doc, "Heading 1", font_name, h_size)
+    _setup_heading_style(doc, "Heading 2", font_name, base)
+
+
+def heading_font_size(gost: dict) -> int:
+    """Единый размер шрифта для ВСЕХ заголовков 1-го уровня (ошибка #4).
+    Берём базовый размер текста + 2 (например, текст 14 → заголовки 16).
+    """
+    return int(gost.get("heading_font_size", int(gost.get("font_size", 14)) + 2))
 
 
 def _setup_heading_style(doc: Document, style_name: str, font_name: str, size_pt: int) -> None:
-    """Настраивает стиль заголовка по ГОСТ (полужирный, без отступа, по центру)."""
+    """Настраивает стиль заголовка по ГОСТ (полужирный, без отступа, по центру).
+
+    Единообразие (ошибки #2, #4, #8): одинаковая жирность, размер и
+    одинаковые интервалы до/после у всех заголовков. space_after = 12pt
+    эквивалентно «одной пустой строке» после каждого заголовка.
+    """
     try:
         style = doc.styles[style_name]
         style.font.name  = font_name
         style.font.size  = Pt(size_pt)
         style.font.bold  = True
+        style.font.italic = False
         style.font.color.rgb = RGBColor(0, 0, 0)
         pf = style.paragraph_format
         pf.first_line_indent = Cm(0)
         pf.space_before      = Pt(12)
-        pf.space_after       = Pt(6)
+        pf.space_after       = Pt(12)   # единый отступ = пустая строка
+        pf.line_spacing_rule = WD_LINE_SPACING.ONE_POINT_FIVE
         pf.alignment         = WD_ALIGN_PARAGRAPH.CENTER
+        pf.keep_with_next    = True     # заголовок не отрывается от текста
     except Exception:
         pass
 
@@ -1755,18 +1817,45 @@ def add_paragraphs_from_text(
     Разбивает текст на абзацы и добавляет их в документ.
     Строки вида '1.1. Название подглавы' оформляются как Heading 2.
     """
-    font = gost.get("font_name", "Times New Roman")
-    size = int(gost.get("font_size", 14))
+    font   = gost.get("font_name", "Times New Roman")
+    size   = int(gost.get("font_size", 14))
+    indent = Cm(float(gost.get("first_line_indent_cm", 1.25)))  # ошибка #7
+
+    # Список литературы: единый формат нумерации (ошибка #9)
+    if is_bib:
+        text = _normalize_bibliography(text)
+    else:
+        text = _normalize_punctuation(text)  # ошибка #5
+
+    def _apply_body_format(p) -> None:
+        """Единое оформление абзаца основного текста (ошибки #6, #7)."""
+        p.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+        p.paragraph_format.first_line_indent = indent
+        p.paragraph_format.space_before = Pt(0)
+        p.paragraph_format.space_after  = Pt(0)
 
     # Паттерн для подглав: "1.1. Текст" или "2.3. Текст"
     subheading_pat = re.compile(r"^(\d+\.\d+\.?\s+.{5,80})$")
+
+    if is_bib:
+        # Каждая позиция списка — отдельный абзац с висячим отступом
+        for line in [l for l in text.split("\n") if l.strip()]:
+            p = doc.add_paragraph()
+            p.paragraph_format.alignment         = WD_ALIGN_PARAGRAPH.JUSTIFY
+            p.paragraph_format.left_indent       = Cm(1.25)
+            p.paragraph_format.first_line_indent = Cm(-1.25)
+            p.paragraph_format.space_before      = Pt(0)
+            p.paragraph_format.space_after       = Pt(0)
+            r = p.add_run(line.strip())
+            _set_run_font(r, font, size, False)
+        return
 
     chunks = [c.strip() for c in re.split(r"\n\s*\n|\n(?=\d+\.\d+\.)", text) if c.strip()]
 
     for ch in chunks:
         first_line = ch.split("\n")[0].strip()
 
-        if subheading_pat.match(first_line) and not is_bib:
+        if subheading_pat.match(first_line):
             # Это подзаголовок — Heading 2
             hp = doc.add_paragraph(first_line, style="Heading 2")
             for run in hp.runs:
@@ -1776,16 +1865,12 @@ def add_paragraphs_from_text(
             rest = ch[len(first_line):].strip()
             if rest:
                 p = doc.add_paragraph()
+                _apply_body_format(p)
                 r = p.add_run(rest)
                 _set_run_font(r, font, size, False)
-                if is_bib:
-                    p.paragraph_format.left_indent       = Cm(1.25)
-                    p.paragraph_format.first_line_indent = Cm(-1.25)
         else:
             p = doc.add_paragraph()
-            if is_bib:
-                p.paragraph_format.left_indent       = Cm(1.25)
-                p.paragraph_format.first_line_indent = Cm(-1.25)
+            _apply_body_format(p)
             r = p.add_run(ch)
             _set_run_font(r, font, size, False)
 
@@ -1806,12 +1891,17 @@ def build_docx_bytes(
     # ── Содержание ──
     fn   = gost.get("font_name", "Times New Roman")
     fs   = int(gost.get("font_size", 14))
+    hfs  = heading_font_size(gost)   # единый размер заголовков 1-го ур. (ошибка #4)
 
+    # «СОДЕРЖАНИЕ» оформляем как заголовок 1-го уровня по виду (ошибка #4),
+    # но НЕ через стиль Heading 1 — иначе попадёт в само поле TOC.
     p_toc_title = doc.add_paragraph()
     p_toc_title.alignment = WD_ALIGN_PARAGRAPH.CENTER
     p_toc_title.paragraph_format.first_line_indent = Cm(0)
+    p_toc_title.paragraph_format.space_before = Pt(12)
+    p_toc_title.paragraph_format.space_after  = Pt(12)
     r = p_toc_title.add_run("СОДЕРЖАНИЕ")
-    _set_run_font(r, fn, 16, True)
+    _set_run_font(r, fn, hfs, True)
 
     add_toc(doc, blocks, gost)
 
@@ -1824,12 +1914,15 @@ def build_docx_bytes(
     )
 
     # ── Тело документа ──
-    for title, level, text, subblocks in blocks:
-        # Заголовок главы
+    last_idx = len(blocks) - 1
+    for idx, (title, level, text, subblocks) in enumerate(blocks):
+        # Заголовок главы. Все заголовки 1-го уровня — единый размер (ошибка #4),
+        # единые интервалы задаёт стиль Heading (ошибки #2, #8).
         style = "Heading 1" if level == 1 else "Heading 2"
+        h_sz  = hfs if level == 1 else fs
         hp    = doc.add_paragraph(title, style=style)
         for run in hp.runs:
-            _set_run_font(run, fn, fs, True)
+            _set_run_font(run, fn, h_sz, True)
         hp.paragraph_format.first_line_indent = Cm(0)
 
         # Основной текст главы
@@ -1862,6 +1955,10 @@ def build_docx_bytes(
         elif text:
             # Нет подблоков — выводим основной текст
             add_paragraphs_from_text(doc, text, gost, is_bib=is_bib)
+
+        # Разрыв страницы после последнего раздела / списка литературы (ошибка #3)
+        if idx == last_idx:
+            doc.add_page_break()
 
     buf = io.BytesIO()
     doc.save(buf)
