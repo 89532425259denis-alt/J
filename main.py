@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-"""ГОСТ-АССИСТЕНТ v2.4 — ЖАНРОВЫЙ СТИЛЬ + ТОЧНЫЕ СТРАНИЦЫ
+"""ГОСТ-АССИСТЕНТ v2.5 — ТОЧНЫЕ СТРАНИЦЫ + ДИСЦИПЛИНА
 
 Главные изменения v2.1 относительно v2.0:
 ────────────────────────────────────────────────────────────────
@@ -292,7 +292,7 @@ PAID_DAILY_LIMIT  = int(cfg("PAID_DAILY_LIMIT",       "0"))   # 0 = безлим
 PAID_COOLDOWN     = int(cfg("PAID_COOLDOWN_SECONDS",  "0"))   # 0 = нет кулдауна
 
 # Символов на страницу (ГОСТ: ~1800 знаков с пробелами на стр A4 14pt 1.5 интервал)
-CHARS_PER_PAGE = int(cfg("CHARS_PER_PAGE", "1550"))
+CHARS_PER_PAGE = int(cfg("CHARS_PER_PAGE", "1100"))
 # Страниц без текста (титул + содержание)
 NON_TEXT_PAGES = int(cfg("NON_TEXT_PAGES", "2"))
 
@@ -1017,8 +1017,11 @@ def build_prompts(
                 writing_style, doc_type,
             ),
             "literature": (
-                f"Составь список из 5–8 источников по теме «{topic}» "
+                f"Составь список из 3–5 источников по теме «{topic}» "
                 f"строго по ГОСТ Р 7.0.5-2008. "
+                f"Включи ТОЛЬКО источники, соответствующие дисциплине «{subject}». "
+                f"Если тема не совпадает с дисциплиной — подбери источники "
+                f"по дисциплине, связанные с темой. "
                 f"Формат: 1. Автор А.А. Название. — М.: Издательство, год. — N с.\n"
                 f"Только список, без заголовков и пояснений."
             ),
@@ -1253,8 +1256,15 @@ async def generate_text_blocks(
             "«меня поражает», «важно отметить». Текст должен быть живым, "
             "размышляющим, с личной авторской позицией. "
             "Никаких «мы рассмотрели», «было установлено» — только «я». "
-            "Избегай наукообразия и канцеляризмов. "
-            "Ссылки на источники [1, с. 45] допустимы, но не обязательны в каждом абзаце."
+            "Избегай наукообразия и канцеляризмов.\n"
+            "ВАЖНО: заявленная дисциплина — «{subject}». Если тема и дисциплина "
+            "из разных областей (например, тема «Байкал», дисциплина «Психология») — "
+            "рассматривай тему ЧЕРЕЗ ПРИЗМУ ДИСЦИПЛИНЫ. "
+            "Для психологии: восприятие, эмоции, когнитивные эффекты, "
+            "восстановительная среда, эффект благоговения (awe). "
+            "Для истории: хронология, личности, события. "
+            "Для биологии: виды, экосистемы, эволюция. "
+            "НЕ пиши общегеографический обзор если дисциплина не география.".format(subject=subject)
         )
     elif doc_type == "doklad":
         style_sys += (
@@ -2000,7 +2010,7 @@ _TNR_LINE_HEIGHT_RATIO    = 1.0    # множитель кегля для выс
 # Калибровочный множитель: оценка эмпирически на 30% занижает страницы
 # по сравнению с реальным результатом LibreOffice (учитывает переносы строк,
 # минимальные отступы, особенности шейпинга TNR). Подобран на 5/8/11/15/20-страничных тестах.
-_ESTIM_CALIBRATION       = 1.00
+_ESTIM_CALIBRATION       = 1.80
 
 def estimate_docx_pages(docx_path: str) -> Optional[int]:
     """Эмулирует разбивку DOCX по страницам без внешних инструментов.
@@ -3423,15 +3433,18 @@ async def generate_and_send(
             #   2) Если мало → дописываем; если много → обрезаем.
             #   3) До 5 итераций, чтобы DeepSeek успел добрать объём.
             target_pages = int(pages)
-            max_iters    = 5
+            max_iters    = 10
             measure_dir  = os.path.join(work_dir, "_measure")
             os.makedirs(measure_dir, exist_ok=True)
 
             for it in range(max_iters):
                 real_pages = measure_pages(tmp_in, measure_dir)
                 if real_pages is None:
-                    print("[PAGES] Не удалось измерить страницы вообще — пропуск подгонки.")
-                    break
+                    # Грубая оценка по символам если ни LO ни эстиматор не сработали
+                    total_chars_now = _blocks_text_total(blocks)
+                    real_pages = max(1, int(total_chars_now / CHARS_PER_PAGE) + NON_TEXT_PAGES)
+                    print(f"[PAGES] Измерение недоступно, оценка по символам: "
+                          f"{total_chars_now} зн → ~{real_pages} стр")
                 diff = real_pages - target_pages
                 print(f"[PAGES] Итерация {it+1}/{max_iters}: цель={target_pages}, "
                       f"получено={real_pages}, разница={diff:+d}")
@@ -3442,13 +3455,16 @@ async def generate_and_send(
                     force=True,
                 )
 
-                if abs(diff) <= 1:  # допустимый разброс ±1 страница
+                if diff == 0:  # только точное совпадение
                     print(f"[PAGES] ✅ Цель достигнута: {real_pages} (±1 от {target_pages})")
                     break
 
-                # 1 страница ≈ CHARS_PER_PAGE символов; для уверенности +50%
-                chars_per_page = max(1500, int(CHARS_PER_PAGE * 1.60))
-                chars_diff = abs(diff) * chars_per_page
+                # chars_per_page с поправкой на калибровку оценщика:
+                # оценщик завышает страницы в _ESTIM_CALIBRATION раз,
+                # поэтому делим чтобы не перерезать/не перелить
+                chars_per_page = max(800, int(CHARS_PER_PAGE / _ESTIM_CALIBRATION))
+                # Демпфирование: корректируем только 70% разницы
+                chars_diff = max(chars_per_page, int(abs(diff) * chars_per_page * 0.7))
 
                 if diff > 0:
                     print(f"[PAGES] ✂️ Обрезаю ~{chars_diff} знаков")
@@ -3465,6 +3481,16 @@ async def generate_and_send(
                     f.write(docx_raw)
             else:
                 # Цикл выполнился max_iters раз без break
+                # Жёсткая коррекция: обрезаем до цели по числу символов
+                total_chars_now = _blocks_text_total(blocks)
+                target_chars_need = target_chars(target_pages)
+                if total_chars_now > target_chars_need:
+                    excess = total_chars_now - target_chars_need
+                    print(f"[PAGES] ⚠️ Лимит итераций, жёсткая обрезка ~{excess} зн")
+                    blocks = _trim_blocks_by_chars(blocks, excess)
+                    docx_raw = build_docx_bytes(data, blocks, gost)
+                    with open(tmp_in, "wb") as f:
+                        f.write(docx_raw)
                 final_check = measure_pages(tmp_in, measure_dir)
                 print(f"[PAGES] ⚠️ Лимит итераций исчерпан, финальный замер: {final_check}")
 
@@ -3475,37 +3501,38 @@ async def generate_and_send(
 
             # ── ФИНАЛЬНАЯ ПОДГОНКА ПОСЛЕ LIBREOFFICE ──
             # LibreOffice переформатирует документ (TOC, поля, шрифты),
-            # что меняет количество страниц. Делаем ещё один замер и при
-            # необходимости — одну итерацию добора/урезания.
-            post_lo_pages = measure_pages(final_path, measure_dir)
-            if post_lo_pages and abs(post_lo_pages - target_pages) > 2:
-                print(f"[PAGES] ⚠️ После LibreOffice: {post_lo_pages} стр "
-                      f"(цель {target_pages}), делаю финальную коррекцию...")
+            # что меняет количество страниц. Итеративно корректируем.
+            for lo_it in range(3):
+                post_lo_pages = measure_pages(final_path, measure_dir)
+                if not post_lo_pages or post_lo_pages == target_pages:
+                    break
+                print(f"[PAGES] ⚠️ После LO итерация {lo_it+1}: {post_lo_pages} стр "
+                      f"(цель {target_pages})")
                 diff2 = post_lo_pages - target_pages
-                chars_per_page2 = max(1500, int(CHARS_PER_PAGE * 1.60))
-                chars_diff2 = abs(diff2) * chars_per_page2
+                chars_per_page2 = max(800, int(CHARS_PER_PAGE / _ESTIM_CALIBRATION))
+                # Делим diff2 на 2 для плавной сходимости (демпфирование)
+                chars_diff2 = max(chars_per_page2, int(abs(diff2) * chars_per_page2 * 0.7))
 
                 if diff2 > 0:
-                    print(f"[PAGES] ✂️ Финальная обрезка ~{chars_diff2} зн")
+                    print(f"[PAGES] ✂️ Обрезка ~{chars_diff2} зн")
                     blocks = _trim_blocks_by_chars(blocks, chars_diff2)
                 else:
-                    print(f"[PAGES] ➕ Финальное дописывание ~{chars_diff2} зн")
+                    print(f"[PAGES] ➕ Дописывание ~{chars_diff2} зн")
                     blocks = await _expand_blocks_by_chars(
                         blocks, chars_diff2, topic, model_key, writing_style, prog,
                     )
 
-                # Пересобираем и конвертируем заново
                 docx_raw = build_docx_bytes(data, blocks, gost)
-                tmp_in2 = tmp_in + ".2.docx"
+                tmp_in2 = tmp_in + f".lo{lo_it}.docx"
                 with open(tmp_in2, "wb") as f:
                     f.write(docx_raw)
                 updated2 = libreoffice_update_docx(tmp_in2, tmp_out)
                 final_path = tmp_out if updated2 else tmp_in2
-                # Чистим
                 try: os.remove(tmp_in2)
                 except: pass
-                post_lo_pages2 = measure_pages(final_path, measure_dir)
-                print(f"[PAGES] ✅ После финальной коррекции: {post_lo_pages2} стр")
+            else:
+                post_lo_pages = measure_pages(final_path, measure_dir)
+            print(f"[PAGES] ✅ После LO-коррекции: {post_lo_pages} стр")
 
             final_pages = measure_pages(final_path, measure_dir) or pages
             print(f"[PAGES] 📤 Итог в caption: {final_pages} страниц")
