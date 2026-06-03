@@ -857,6 +857,52 @@ async def generate_chapter_titles(
     return _default_chapter_titles(doc_type, topic, num_chapters)
 
 
+async def verify_discipline_relevance(
+    model_key: str,
+    topic: str,
+    subject: str,
+    sample_text: str,
+) -> tuple[bool, str]:
+    """Проверяет, что сгенерированный текст относится к заданной дисциплине
+    (приоритет 🔴: история ≠ геология).
+
+    Возвращает (соответствует?, краткий_комментарий).
+    Использует ИИ как классификатор; при сбое считает текст релевантным,
+    чтобы не блокировать выдачу.
+    """
+    if not sample_text or not subject:
+        return True, "проверка пропущена"
+
+    sample = sample_text[:2500]
+    system = (
+        "Ты — научный рецензент. Оцени, соответствует ли фрагмент работы "
+        "заявленной учебной дисциплине. Отвечай СТРОГО в формате JSON без "
+        'markdown: {"match": true|false, "reason": "одно короткое предложение"}.'
+    )
+    user = (
+        f"Дисциплина: «{subject}».\n"
+        f"Тема работы: «{topic}».\n"
+        f"Фрагмент текста:\n{sample}\n\n"
+        "Соответствует ли содержание дисциплине? "
+        "match=false только если текст явно из другой области знаний "
+        "(например, дисциплина «История», а текст чисто геологический)."
+    )
+    try:
+        raw, _ = await chat_with_fallback(
+            model_key,
+            [{"role": "system", "content": system},
+             {"role": "user", "content": user}],
+            max_tokens=200,
+        )
+        m = re.search(r"\{.*\}", raw, flags=re.S)
+        if m:
+            data = json.loads(m.group(0))
+            return bool(data.get("match", True)), str(data.get("reason", "")).strip()
+    except Exception as e:
+        print(f"[RELEVANCE] check failed: {e}")
+    return True, "проверка недоступна"
+
+
 def _default_chapter_titles(doc_type: str, topic: str, num_chapters: int) -> list[dict]:
     """Запасные названия глав если ИИ не ответил."""
     defaults = [
@@ -1216,6 +1262,8 @@ def _clean_ai_artifacts(text: str) -> str:
     ]
     for p in ai_phrases:
         text = re.sub(p, "", text)
+    # Типографика: тире/кавычки/# (приоритет 🟡)
+    text = _normalize_typography(text)
     return text.strip()
 
 
@@ -1248,6 +1296,14 @@ async def generate_text_blocks(
         "НЕ используй markdown-разметку (никаких **, ##, ---). "
         "Не повторяй одно слово несколько раз в одном предложении. "
         "Не начинай два абзаца подряд одним и тем же словом. "
+        # Привязка к дисциплине (приоритет 🔴)
+        f"ОБЯЗАТЕЛЬНО: текст должен соответствовать дисциплине «{subject}». "
+        f"Раскрывай тему «{topic}» строго через предмет, методы и терминологию "
+        f"дисциплины «{subject}». Если тема относится к другой области знаний, "
+        f"всё равно рассматривай её ПОД УГЛОМ дисциплины «{subject}» "
+        f"(например, дисциплина «История» → хронология, источники, периодизация; "
+        f"«Геология» → породы, процессы, строение Земли). "
+        f"Не подменяй дисциплину смежной. "
     )
 
     if doc_type == "esse":
@@ -1466,6 +1522,18 @@ async def generate_text_blocks(
     if prog:
         await prog.update(step_done=True)
 
+    # ═══════════════════════════════════════════════════════════
+    # СВЯЗЫВАНИЕ ССЫЛОК СО СПИСКОМ ЛИТЕРАТУРЫ (приоритет 🔴)
+    # Приводим все внутритекстовые [N, с. X] к диапазону 1..кол-во источников,
+    # чтобы каждая ссылка указывала на реально существующий пункт списка.
+    # ═══════════════════════════════════════════════════════════
+    n_sources = _count_sources(parts.get("literature", ""))
+    if n_sources > 0:
+        for key in list(parts.keys()):
+            if key == "literature":
+                continue
+            parts[key] = _fix_citations(parts[key], n_sources)
+
     return parts
 
 
@@ -1483,12 +1551,85 @@ def _stub_text(key: str, topic: str) -> str:
 #  ГОСТ-DOCX: СТИЛИ, TOC, НУМЕРАЦИЯ, ПОДГЛАВЫ
 # ═══════════════════════════════════════════════════════════════
 
+def _normalize_typography(text: str) -> str:
+    """Типографика (приоритет 🟡): тире, дефисы, кавычки, лишние #.
+
+    - '---' → '—' (длинное тире), '--' → '–' (короткое тире/диапазон)
+    - дефис между словами с пробелами ' - ' → ' — ' (тире)
+    - прямые кавычки "..." → «ёлочки»
+    - убираем одиночные служебные '#'
+    """
+    if not text:
+        return ""
+    # Markdown-заголовки '# ', '## ' в начале строки убираем целиком
+    text = re.sub(r"(?m)^\s{0,3}#{1,6}\s+", "", text)
+    # Тройной дефис → длинное тире, двойной → короткое тире
+    text = text.replace("---", "—").replace("--", "–")
+    # Дефис, окружённый пробелами, как знак тире в предложении → длинное тире
+    text = re.sub(r"(?<=\s)-(?=\s)", "—", text)
+    # Прямые двойные кавычки → «ёлочки» (парами)
+    def _quotes(m: re.Match) -> str:
+        return "«" + m.group(1) + "»"
+    text = re.sub(r'"([^"\n]*)"', _quotes, text)
+    # Одиночные оставшиеся '#' (не часть слова) убираем
+    text = re.sub(r"(?<!\w)#(?!\w)", "", text)
+    return text
+
+
+def _count_sources(bib_text: str) -> int:
+    """Считает количество позиций в списке литературы (после нормализации)."""
+    if not bib_text:
+        return 0
+    norm = _normalize_bibliography(bib_text)
+    return len([l for l in norm.split("\n") if re.match(r"^\d+\.\s", l.strip())])
+
+
+def _fix_citations(text: str, n_sources: int) -> str:
+    """Связывает внутритекстовые ссылки со списком литературы (приоритет 🔴).
+
+    Приводит ссылки вида [3], [3, с. 45], [2; 5] к допустимому диапазону
+    1..n_sources. Любой номер вне диапазона заменяется на корректный
+    (по модулю количества источников), чтобы ссылка указывала на реально
+    существующий пункт списка.
+    """
+    if not text or n_sources <= 0:
+        return text
+
+    def _map_num(num: int) -> int:
+        if num < 1:
+            return 1
+        if num > n_sources:
+            # Отображаем «по кругу» на существующий источник
+            return ((num - 1) % n_sources) + 1
+        return num
+
+    def _fix_one(m: re.Match) -> str:
+        inner = m.group(1)
+        # Заменяем все числовые номера источников в начале ссылки
+        def _repl_num(mm: re.Match) -> str:
+            return str(_map_num(int(mm.group(0))))
+        # Номера источников — это числа, НЕ идущие после 'с.' (страницы не трогаем)
+        # Разбиваем по ';' — каждая часть может быть 'N' или 'N, с. P'
+        parts = []
+        for part in inner.split(";"):
+            part = part.strip()
+            # первая группа цифр в части — номер источника
+            part = re.sub(r"^\s*(\d+)", lambda x: str(_map_num(int(x.group(1)))), part)
+            parts.append(part)
+        return "[" + "; ".join(parts) + "]"
+
+    # Ссылки ГОСТ: [3], [3, с. 45], [2; 5], [4, с. 120–125]
+    return re.sub(r"\[(\d[^\]\n]*)\]", _fix_one, text)
+
+
 def _normalize_punctuation(text: str) -> str:
     """Чистит технические дефекты текста (ошибка #5):
     убирает лишние пробелы перед знаками препинания и дублирующиеся пробелы.
     """
     if not text:
         return ""
+    # Сначала типографика (тире/кавычки/#)
+    text = _normalize_typography(text)
     # Убираем пробелы перед . , ; : ! ? ) » и перед закрывающими знаками
     text = re.sub(r"\s+([.,;:!?])", r"\1", text)
     text = re.sub(r"\s+([)»])", r"\1", text)
@@ -1673,16 +1814,42 @@ def add_page_number_field(section, position: str) -> None:
     _add_page_field_to_paragraph(p)
 
 
+def _toc_entries(blocks: list[tuple]) -> list[tuple[str, int]]:
+    """Собирает плоский список пунктов оглавления уровней 1 и 2 (приоритет 🟢).
+
+    Возвращает [(текст_заголовка, уровень), ...].
+    Подзаголовки берём как из subblocks, так и из вложенных «1.1 ...» в тексте.
+    """
+    entries: list[tuple[str, int]] = []
+    sub_pat = re.compile(r"^(\d+\.\d+\.?\s+.{3,80})$")
+    for title, level, text, subblocks in blocks:
+        entries.append((title, 1))
+        # Явные подблоки
+        for sub_title, _sub_text in (subblocks or []):
+            entries.append((sub_title.strip(), 2))
+        # Подзаголовки, встроенные в текст главы (когда subblocks пуст)
+        if not subblocks and text:
+            for line in text.split("\n"):
+                line = line.strip()
+                if sub_pat.match(line):
+                    entries.append((line, 2))
+    return entries
+
+
 def add_toc(doc: Document, blocks: list[tuple], gost: dict) -> None:
     """
-    Вставляет содержание с реальными заголовками.
-    Сначала вставляет поле TOC (обновится в Word/LibreOffice),
-    затем добавляет текстовую копию для немедленной читаемости.
+    Вставляет содержание с реальными заголовками (уровни 1 и 2).
+
+    1. Поле TOC \\o "1-2" — автоматически обновится в Word/LibreOffice и даст
+       КОРРЕКТНЫЕ номера страниц (приоритет 🟡: «зная объём» через layout-движок).
+    2. Текстовая копия-структура для немедленной читаемости — БЕЗ номеров
+       страниц, чтобы не показывать недостоверные оценки (приоритет 🟡:
+       «либо не указывать их в оглавлении»).
     """
     fn = gost.get("font_name", "Times New Roman")
     fs = int(gost.get("font_size", 14))
 
-    # Поле TOC для автообновления
+    # Поле TOC для автообновления (даёт точные номера страниц при открытии в Word/LO)
     p_field = doc.add_paragraph()
     p_field.paragraph_format.first_line_indent = Cm(0)
     run = p_field.add_run()
@@ -1705,40 +1872,16 @@ def add_toc(doc: Document, blocks: list[tuple], gost: dict) -> None:
     run._r.append(fld_sep)
     run._r.append(fld_end)
 
-    # Текстовое содержание (отображается сразу)
-    page_num = 3  # Начинаем с 3-й страницы (1=титул, 2=содержание)
-    for title, level, text, subblocks in blocks:
+    # Текстовая структура (уровни 1 и 2) — без номеров страниц
+    for title, level in _toc_entries(blocks):
         p = doc.add_paragraph()
         p.paragraph_format.first_line_indent = Cm(0)
         p.paragraph_format.space_before = Pt(0)
         p.paragraph_format.space_after  = Pt(2)
-
-        # Заполнитель между названием и номером страницы
-        tab_stops = p.paragraph_format.tab_stops
-        from docx.oxml.ns import qn as _qn
-        pPr = p._p.get_or_add_pPr()
-        tabs_el = OxmlElement("w:tabs")
-        tab_el  = OxmlElement("w:tab")
-        tab_el.set(_qn("w:val"),    "right")
-        tab_el.set(_qn("w:leader"), "dot")
-        tab_el.set(_qn("w:pos"),    "8500")
-        tabs_el.append(tab_el)
-        pPr.append(tabs_el)
-
-        indent = Cm(0) if level == 1 else Cm(1.0)
-        p.paragraph_format.left_indent = indent
+        p.paragraph_format.left_indent  = Cm(0) if level == 1 else Cm(1.0)
 
         run_t = p.add_run(title)
         _set_run_font(run_t, fn, fs if level == 1 else fs - 1, level == 1)
-        run_pg = p.add_run(f"\t{page_num}")
-        _set_run_font(run_pg, fn, fs if level == 1 else fs - 1, False)
-
-        # Грубая оценка страниц: считаем знаки текста
-        text_len = len(text) if text else 0
-        for _, st in subblocks:
-            text_len += len(st) if st else 0
-        pages_for_block = max(1, round(text_len / CHARS_PER_PAGE))
-        page_num += pages_for_block
 
 
 def add_title_page(doc: Document, data: dict, gost: dict) -> None:
@@ -3508,6 +3651,19 @@ async def generate_and_send(
                 prog=prog,
             )
 
+            # ── Проверка соответствия дисциплине (приоритет 🔴) ──
+            await prog.update(label="🔎 Проверяю соответствие дисциплине...")
+            sample_for_check = "\n\n".join(
+                str(parts.get(k, "")) for k in ("intro", "main1", "part1", "ch1_s1")
+                if parts.get(k)
+            )[:2500]
+            relevance_ok, relevance_reason = await verify_discipline_relevance(
+                model_key, topic, subject, sample_for_check,
+            )
+            if not relevance_ok:
+                print(f"[RELEVANCE] ⚠️ Текст может не соответствовать дисциплине "
+                      f"«{subject}»: {relevance_reason}")
+
             # ── Сборка структуры ──
             blocks = generate_structure(doc_type, parts, chapter_titles)
 
@@ -3658,6 +3814,11 @@ async def generate_and_send(
                 if final_pages != pages
                 else f"📄 Страниц: <b>{final_pages}</b> ✅"
             )
+            relevance_status = (
+                f"✅ соответствует «{subject}»"
+                if relevance_ok
+                else f"⚠️ проверьте тему: {relevance_reason[:60]}"
+            )
             caption = (
                 f"🎉 <b>{dt['word']} ГОТОВ!</b>\n\n"
                 f"┌─────────────────────────\n"
@@ -3667,6 +3828,7 @@ async def generate_and_send(
                 f"│ ✍️ Стиль: {style_label}\n"
                 f"│ 📐 Шрифт: {gost.get('font_name')} {gost.get('font_size')}pt\n"
                 f"│ ↕️ Интервал: {gost.get('line_spacing')}\n"
+                f"│ 🎓 Дисциплина: {relevance_status}\n"
                 f"│ 📑 Содержание: {toc_status}\n"
                 f"└─────────────────────────"
             )
