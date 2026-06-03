@@ -1,3 +1,5 @@
-libreoffice
-poppler-utils
-fonts-liberation
+aiogram>=3.0
+aiohttp>=3.9
+python-docx>=1.1
+pypdf>=4.0
+pymupdf>=1.22.0
