@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-"""ГОСТ-АССИСТЕНТ v2.5 — ТОЧНЫЕ СТРАНИЦЫ + ДИСЦИПЛИНА
+"""ГОСТ-АССИСТЕНТ v2.6 — ТОЧНЫЕ СТРАНИЦЫ + ДИСЦИПЛИНА
 
 Главные изменения v2.1 относительно v2.0:
 ────────────────────────────────────────────────────────────────
@@ -292,9 +292,9 @@ PAID_DAILY_LIMIT  = int(cfg("PAID_DAILY_LIMIT",       "0"))   # 0 = безлим
 PAID_COOLDOWN     = int(cfg("PAID_COOLDOWN_SECONDS",  "0"))   # 0 = нет кулдауна
 
 # Символов на страницу (ГОСТ: ~1800 знаков с пробелами на стр A4 14pt 1.5 интервал)
-CHARS_PER_PAGE = int(cfg("CHARS_PER_PAGE", "1100"))
+CHARS_PER_PAGE = int(cfg("CHARS_PER_PAGE", "1700"))
 # Страниц без текста (титул + содержание)
-NON_TEXT_PAGES = int(cfg("NON_TEXT_PAGES", "2"))
+NON_TEXT_PAGES = int(cfg("NON_TEXT_PAGES", "3"))
 
 DEEPSEEK_PRICE  = int(cfg("DEEPSEEK_PRICE",           "5"))
 GROQ_PRICE      = int(cfg("GROQ_PRICE",               "3"))
@@ -2250,7 +2250,7 @@ _TNR_LINE_HEIGHT_RATIO    = 1.0    # множитель кегля для выс
 # Калибровочный множитель: оценка эмпирически на 30% занижает страницы
 # по сравнению с реальным результатом LibreOffice (учитывает переносы строк,
 # минимальные отступы, особенности шейпинга TNR). Подобран на 5/8/11/15/20-страничных тестах.
-_ESTIM_CALIBRATION       = 1.80
+_ESTIM_CALIBRATION       = 1.30
 
 def estimate_docx_pages(docx_path: str) -> Optional[int]:
     """Эмулирует разбивку DOCX по страницам без внешних инструментов.
@@ -3710,14 +3710,14 @@ async def generate_and_send(
                     force=True,
                 )
 
-                if diff == 0:  # только точное совпадение
+                if abs(diff) <= 1:  # допуск ±1 страница
                     print(f"[PAGES] ✅ Цель достигнута: {real_pages} (±1 от {target_pages})")
                     break
 
                 # chars_per_page с поправкой на калибровку оценщика:
                 # оценщик завышает страницы в _ESTIM_CALIBRATION раз,
                 # поэтому делим чтобы не перерезать/не перелить
-                chars_per_page = max(800, int(CHARS_PER_PAGE / _ESTIM_CALIBRATION))
+                chars_per_page = CHARS_PER_PAGE
                 # Демпфирование: корректируем только 70% разницы
                 chars_diff = max(chars_per_page, int(abs(diff) * chars_per_page * 0.7))
 
@@ -3768,7 +3768,7 @@ async def generate_and_send(
                       f"(цель {target_pages})")
                 diff2 = post_lo_pages - target_pages
                 # chars_per_page с демпфированием ×0.5 для плавной сходимости
-                cpp = max(700, int(CHARS_PER_PAGE / _ESTIM_CALIBRATION))
+                cpp = CHARS_PER_PAGE
                 chars_diff2 = max(cpp, int(abs(diff2) * cpp * 0.5))
 
                 if diff2 > 0:
@@ -3883,7 +3883,7 @@ async def generate_and_send(
 
 async def main() -> None:
     print("═" * 62)
-    print("  🤖  ГОСТ-АССИСТЕНТ v2.0")
+    print("  🤖  ГОСТ-АССИСТЕНТ v2.6")
     print("═" * 62)
     print(f"  LibreOffice : {shutil.which('soffice') or '❌ не найден'}")
     print(f"  DeepSeek    : {'✅' if DEEPSEEK_KEY else '❌ нет ключа'}")
