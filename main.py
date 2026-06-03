@@ -3425,6 +3425,8 @@ async def generate_and_send(
             docx_raw = build_docx_bytes(data, blocks, gost)
             with open(tmp_in, "wb") as f:
                 f.write(docx_raw)
+            if not os.path.exists(tmp_in):
+                raise RuntimeError(f"Не удалось записать {tmp_in}")
 
             # ── ИТЕРАТИВНАЯ ПОДГОНКА ЧИСЛА СТРАНИЦ ──
             # Цель: получить ровно `pages` ± 1 страница.
@@ -3502,16 +3504,19 @@ async def generate_and_send(
             # ── ФИНАЛЬНАЯ ПОДГОНКА ПОСЛЕ LIBREOFFICE ──
             # LibreOffice переформатирует документ (TOC, поля, шрифты),
             # что меняет количество страниц. Итеративно корректируем.
+            lo_tmp_dir = os.path.join(work_dir, "_lo_tmp")
+            os.makedirs(lo_tmp_dir, exist_ok=True)
             for lo_it in range(3):
                 post_lo_pages = measure_pages(final_path, measure_dir)
                 if not post_lo_pages or post_lo_pages == target_pages:
+                    print(f"[PAGES] ✅ После LO: {post_lo_pages} стр (цель достигнута)")
                     break
                 print(f"[PAGES] ⚠️ После LO итерация {lo_it+1}: {post_lo_pages} стр "
                       f"(цель {target_pages})")
                 diff2 = post_lo_pages - target_pages
-                chars_per_page2 = max(800, int(CHARS_PER_PAGE / _ESTIM_CALIBRATION))
-                # Делим diff2 на 2 для плавной сходимости (демпфирование)
-                chars_diff2 = max(chars_per_page2, int(abs(diff2) * chars_per_page2 * 0.7))
+                # chars_per_page с демпфированием ×0.5 для плавной сходимости
+                cpp = max(700, int(CHARS_PER_PAGE / _ESTIM_CALIBRATION))
+                chars_diff2 = max(cpp, int(abs(diff2) * cpp * 0.5))
 
                 if diff2 > 0:
                     print(f"[PAGES] ✂️ Обрезка ~{chars_diff2} зн")
@@ -3523,13 +3528,15 @@ async def generate_and_send(
                     )
 
                 docx_raw = build_docx_bytes(data, blocks, gost)
-                tmp_in2 = tmp_in + f".lo{lo_it}.docx"
+                # Отдельная поддиректория чтобы LO не коллизировал имена
+                tmp_in2 = os.path.join(lo_tmp_dir, f"lo_{lo_it}.docx")
                 with open(tmp_in2, "wb") as f:
                     f.write(docx_raw)
+                if not os.path.exists(tmp_in2) or os.path.getsize(tmp_in2) < 1000:
+                    print(f"[PAGES] ⚠️ tmp_in2 повреждён, пропуск LO-итерации")
+                    break
                 updated2 = libreoffice_update_docx(tmp_in2, tmp_out)
                 final_path = tmp_out if updated2 else tmp_in2
-                try: os.remove(tmp_in2)
-                except: pass
             else:
                 post_lo_pages = measure_pages(final_path, measure_dir)
             print(f"[PAGES] ✅ После LO-коррекции: {post_lo_pages} стр")
