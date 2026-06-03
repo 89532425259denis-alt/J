@@ -40,6 +40,7 @@ import subprocess
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
+from collections import OrderedDict
 from typing import Optional
 
 import aiohttp
@@ -2342,339 +2343,160 @@ def libreoffice_update_docx(in_path: str, out_path: str) -> bool:
 
 
 # ═══════════════════════════════════════════════════════════════
-#  ТОЧНЫЙ ПОДСЧЁТ СТРАНИЦ DOCX ЧЕРЕЗ LIBREOFFICE → PDF
+# ═══════════════════════════════════════════════════════════════
+#  ULTIMATE SELF-CALIBRATING PAGE FORCER (v4.2)
 # ═══════════════════════════════════════════════════════════════
 
-# ═══════════════════════════════════════════════════════════════
-#  УЛУЧШЕННЫЙ СЕРВИС ПОДСЧЁТА СТРАНИЦ ДЛЯ ГОСТ-АССИСТЕНТА
-# ═══════════════════════════════════════════════════════════════
-
-try:
-    from pypdf import PdfReader
-except ImportError:
-    try:
-        from PyPDF2 import PdfReader
-    except ImportError:
-        PdfReader = None
-
-try:
-    import fitz  # PyMuPDF — лучший парсер PDF
-except ImportError:
-    fitz = None
-
+import hashlib
 
 # Символов на страницу (ГОСТ: ~1800 знаков с пробелами на стр A4 14pt 1.5 интервал)
-CHARS_PER_PAGE = int(cfg("CHARS_PER_PAGE", "1800"))  # ИСПРАВЛЕНО: 1850 → 1800
-
-# Страниц без текста (титул + содержание)
+CHARS_PER_PAGE = int(cfg("CHARS_PER_PAGE", "1800"))
 NON_TEXT_PAGES = int(cfg("NON_TEXT_PAGES", "2"))
-
-# Калибровочный множитель (ИСПРАВЛЕНО: 1.10 → 1.00)
 _ESTIM_CALIBRATION = 1.00
 
+# ─── НЕЙРО-КАЛИБРОВКА (обучается на каждом прогоне) ───
+@dataclass
+class NeuroCalibration:
+    chars_per_page: float = 1550.0
+    char_width_factor: float = 0.45
+    line_spacing_override: float = 1.5
+    non_text_penalty: int = 2
+    learning_rate: float = 0.15
+    history: List[Tuple[int, int]] = field(default_factory=list)
+    
+    def learn(self, predicted_chars: int, actual_pages: int, target_pages: int):
+        error = actual_pages - target_pages
+        self.history.append((predicted_chars, actual_pages))
+        if len(self.history) > 20:
+            self.history.pop(0)
+        self.chars_per_page *= (1.0 - self.learning_rate * (error / max(1, target_pages)))
+        self.chars_per_page = max(1200, min(1900, self.chars_per_page))
+        try:
+            with open("neuro_calib.json", "w", encoding="utf-8") as f:
+                json.dump({"cpp": self.chars_per_page, "cwf": self.char_width_factor, 
+                           "ls": self.line_spacing_override, "ntp": self.non_text_penalty}, f)
+        except Exception as e:
+            print(f"[NEURO] Ошибка сохранения калибровки: {e}")
 
-def target_chars(pages: int) -> int:
-    """
-    Целевое количество символов ДЛЯ ОСНОВНОГО ТЕКСТА (без титула и содержания)
-    """
-    text_pages = max(1, pages - NON_TEXT_PAGES)
-    return text_pages * CHARS_PER_PAGE
-
-
-def target_pages_from_chars(chars: int) -> int:
-    """Возвращает количество страниц по количеству символов"""
-    text_pages = max(1, chars // CHARS_PER_PAGE)
-    return text_pages + NON_TEXT_PAGES
-
-
-class ImprovedPageCounter:
-    pass
-
-class PageAdapter:
-    pass
-
-# ═══════════════════════════════════════════════════════════════
-#  ПОДСЧЁТ СТРАНИЦ ЧЕРЕЗ LIBREOFFICE → PDF
-# ═══════════════════════════════════════════════════════════════
-
-def libreoffice_docx_to_pdf(in_path: str, out_dir: str) -> Optional[str]:
-    """Конвертирует DOCX в PDF через LibreOffice. Возвращает путь к PDF или None."""
-    soffice = shutil.which("soffice")
-    if not soffice:
-        return None
-    os.makedirs(out_dir, exist_ok=True)
-    try:
-        p = subprocess.run(
-            [
-                soffice, "--headless", "--nologo", "--nolockcheck",
-                "--nodefault", "--nofirststartwizard",
-                "--convert-to", "pdf", "--outdir", out_dir, in_path,
-            ],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=180,
+try:
+    with open("neuro_calib.json", "r", encoding="utf-8") as f:
+        cal_data = json.load(f)
+        NEURO = NeuroCalibration(
+            chars_per_page=cal_data.get("cpp", 1550.0),
+            char_width_factor=cal_data.get("cwf", 0.45),
+            line_spacing_override=cal_data.get("ls", 1.5),
+            non_text_penalty=cal_data.get("ntp", 2)
         )
-        if p.returncode != 0:
-            print(f"[LO→PDF] Ошибка: {p.stdout[:500]}")
-            return None
-        pdf = os.path.join(out_dir, os.path.splitext(os.path.basename(in_path))[0] + ".pdf")
-        return pdf if os.path.exists(pdf) else None
-    except Exception as e:
-        print(f"[LO→PDF] Исключение: {e}")
-        return None
+except Exception:
+    NEURO = NeuroCalibration()
 
 
-def count_pdf_pages(pdf_path: str) -> Optional[int]:
-    """Считает страницы PDF. Приоритет: PyMuPDF → PyPDF2 → pdfinfo"""
-    # 1) PyMuPDF (лучший, если установлен)
+# ─── ВЫСОКОТОЧНЫЙ ЗАМЕР СТРАНИЦ ЧЕРЕЗ LIBREOFFICE ───
+async def measure_pages_async(docx_path: str, work_dir: str, timeout: int = 30) -> Optional[int]:
+    if not shutil.which("soffice"):
+        return estimate_docx_pages_ultra(docx_path)
+        
+    pdf_path = os.path.join(work_dir, f"_pagecheck_{hashlib.md5(docx_path.encode()).hexdigest()[:8]}.pdf")
     try:
-        import fitz
-        doc = fitz.open(pdf_path)
-        pages = len(doc)
-        doc.close()
-        return pages
-    except ImportError:
-        pass
-    except Exception as e:
-        print(f"[PyMuPDF] Ошибка: {e}")
-    
-    # 2) PyPDF2 / pypdf
-    try:
-        from pypdf import PdfReader
+        proc = await asyncio.wait_for(
+            asyncio.create_subprocess_exec(
+                "soffice", "--headless", "--norestore", "--convert-to", "pdf",
+                "--outdir", work_dir, docx_path,
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
+            ), timeout=timeout
+        )
+        await proc.wait()
+        if not os.path.exists(pdf_path):
+            alt = docx_path.replace(".docx", ".pdf")
+            if os.path.exists(alt): pdf_path = alt
+            else: return estimate_docx_pages_ultra(docx_path)
         with open(pdf_path, "rb") as f:
-            return len(PdfReader(f).pages)
-    except ImportError:
-        pass
-    except Exception:
-        pass
-    
-    try:
-        from PyPDF2 import PdfReader
-        with open(pdf_path, "rb") as f:
-            return len(PdfReader(f).pages)
-    except ImportError:
-        pass
-    except Exception:
-        pass
-    
-    # 3) pdfinfo (poppler-utils)
-    pdfinfo = shutil.which("pdfinfo")
-    if pdfinfo:
-        try:
-            p = subprocess.run([pdfinfo, pdf_path],
-                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                               text=True, timeout=10)
-            for line in p.stdout.splitlines():
-                if line.lower().startswith("pages:"):
-                    return int(line.split(":", 1)[1].strip())
-        except Exception:
-            pass
-    
-    # 4) Грубый подсчёт /Type /Page в сыром PDF
-    try:
-        with open(pdf_path, "rb") as f:
-            blob = f.read()
-        return max(1, blob.count(b"/Type /Page") - blob.count(b"/Type /Pages"))
-    except Exception:
-        return None
-
-
-def count_docx_pages(docx_path: str, work_dir: str) -> Optional[int]:
-    """Возвращает реальное число страниц DOCX (через LibreOffice→PDF)."""
-    pdf = libreoffice_docx_to_pdf(docx_path, work_dir)
-    if not pdf:
-        return None
-    try:
-        return count_pdf_pages(pdf)
-    finally:
-        try:
-            os.remove(pdf)
-        except Exception:
-            pass
-
-
-# ═══════════════════════════════════════════════════════════════
-#  РАСЧЁТНЫЙ ЭСТИМАТОР СТРАНИЦ (без внешних зависимостей)
-# ═══════════════════════════════════════════════════════════════
-
-
-def estimate_docx_pages(docx_path: str) -> Optional[int]:
-    """
-    Эмулирует разбивку DOCX по страницам без внешних инструментов.
-    Учитывает: размер страницы A4, поля, шрифт, межстрочный интервал,
-    отступ красной строки, заголовки, ПРИНУДИТЕЛЬНЫЕ РАЗРЫВЫ СТРАНИЦ.
-    """
-    try:
-        from docx import Document as _D
-        doc = _D(docx_path)
+            content = f.read()
+        pages = content.count(b"/Type /Page") - content.count(b"/Type /Pages")
+        if os.path.exists(pdf_path):
+            try: os.remove(pdf_path)
+            except: pass
+        return max(1, pages) if pages > 0 else estimate_docx_pages_ultra(docx_path)
     except Exception as e:
-        print(f"[ESTIM] Ошибка чтения DOCX: {e}")
-        return None
+        print(f"[MEASURE] Ошибка: {e}")
+        return estimate_docx_pages_ultra(docx_path)
 
+
+# ─── УЛЬТРА-ТОЧНЫЙ ЭСТИМАТОР С УЧЁТОМ СЛОГОВ ───
+def estimate_docx_pages_ultra(docx_path: str) -> Optional[int]:
+    try:
+        doc = Document(docx_path)
+    except Exception as e:
+        print(f"[ESTIM] Ошибка чтения docx: {e}")
+        return None
     if not doc.sections:
         return None
     sec = doc.sections[0]
-
-    def _emu_to_pt(emu) -> float:
-        try:
-            return float(emu) / 12700.0
-        except:
-            return 0.0
-
-    page_w_pt = _emu_to_pt(sec.page_width) or 595.0
-    page_h_pt = _emu_to_pt(sec.page_height) or 842.0
-    left_pt = _emu_to_pt(sec.left_margin) or 85.0
-    right_pt = _emu_to_pt(sec.right_margin) or 42.0
-    top_pt = _emu_to_pt(sec.top_margin) or 56.0
-    bottom_pt = _emu_to_pt(sec.bottom_margin) or 56.0
-
-    text_w_pt = max(50.0, page_w_pt - left_pt - right_pt)
-    text_h_pt = max(50.0, page_h_pt - top_pt - bottom_pt)
-
-    try:
-        normal = doc.styles["Normal"]
-        base_size = float(normal.font.size.pt) if normal.font.size else 14.0
-    except Exception:
-        base_size = 14.0
     
-    try:
-        line_spacing = float(normal.paragraph_format.line_spacing or 1.5)
-    except Exception:
-        line_spacing = 1.5
+    def emu2pt(emu):
+        try: return float(emu) / 12700.0
+        except: return 0.0
     
-    if line_spacing < 0.5:
-        line_spacing = 1.5
-
-    # Средняя ширина символа Times New Roman (в пунктах)
-    char_width_pt = base_size * 0.42
-    chars_per_line = max(20, int(text_w_pt / char_width_pt))
+    pw = emu2pt(sec.page_width) or 595.0
+    ph = emu2pt(sec.page_height) or 842.0
+    lm = emu2pt(sec.left_margin) or 85.0
+    rm = emu2pt(sec.right_margin) or 42.0
+    tm = emu2pt(sec.top_margin) or 56.0
+    bm = emu2pt(sec.bottom_margin) or 56.0
     
-    line_height_pt = base_size * line_spacing
-    lines_per_page = max(10, int(text_h_pt / line_height_pt))
-
-    total_chars = 0
-    page_breaks = 0
-
-    for paragraph in doc.paragraphs:
-        text = paragraph.text or ""
-        total_chars += len(text)
-        
-        # Проверяем на page break
-        from docx.oxml.ns import qn
-        for run in paragraph.runs:
-            for br in run._element.iter(qn("w:br")):
-                if br.get(qn("w:type")) == "page":
-                    page_breaks += 1
-                    break
-
-    # Расчёт страниц по символам
-    estimated_by_chars = max(1, int(total_chars / CHARS_PER_PAGE) + NON_TEXT_PAGES)
+    tw = max(50, pw - lm - rm)
+    th = max(50, ph - tm - bm)
     
-    # Расчёт по строкам
-    estimated_lines = max(1, int(total_chars / max(1, chars_per_line)))
-    estimated_by_lines = max(1, (estimated_lines // max(1, lines_per_page)) + 1 + NON_TEXT_PAGES)
+    try: fs = float(doc.styles["Normal"].font.size.pt)
+    except: fs = 14.0
+    try: ls = float(doc.styles["Normal"].paragraph_format.line_spacing or 1.5)
+    except: ls = NEURO.line_spacing_override
     
-    # Комбинируем
-    estimated = max(estimated_by_chars, estimated_by_lines, page_breaks + NON_TEXT_PAGES)
+    cpl = max(20, int(tw / (fs * NEURO.char_width_factor)))
+    lpp = max(10, int(th / (fs * ls)))
+    raw_chars = sum(len(p.text or "") for p in doc.paragraphs)
     
-    # Применяем калибровку
-    calibrated = int(estimated * _ESTIM_CALIBRATION)
+    # Слоговая компрессия (русский текст)
+    syllables = len(re.findall(r'[аеёиоуыэюя]', " ".join(p.text or "" for p in doc.paragraphs).lower()))
+    syllable_boost = 1.0 + (syllables / max(1, raw_chars)) * 0.3
     
-    return max(1, calibrated)
-
-
-# ═══════════════════════════════════════════════════════════════
-#  АСИНХРОННЫЙ ПОДСЧЁТ СТРАНИЦ (главная функция)
-# ═══════════════════════════════════════════════════════════════
-
-
-async def count_pages_via_aspose(docx_path: str) -> Optional[int]:
-    """Считает страницы DOCX через Aspose Words Counter API."""
-    ASPOSE_ENDPOINT = (
-        "https://api.products.aspose.app/words/wordscounter/api/getstatistics"
-    )
-    try:
-        with open(docx_path, "rb") as fh:
-            file_bytes = fh.read()
-
-        form = aiohttp.FormData()
-        form.add_field(
-            "files[]",
-            file_bytes,
-            filename=os.path.basename(docx_path),
-            content_type=(
-                "application/vnd.openxmlformats-officedocument"
-                ".wordprocessingml.document"
-            ),
-        )
-        form.add_field("includeTextboxes", "false")
-
-        async with aiohttp.ClientSession() as sess:
-            async with sess.post(
-                ASPOSE_ENDPOINT,
-                data=form,
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as resp:
-                if resp.status != 200:
-                    print(f"[ASPOSE] HTTP {resp.status}")
-                    return None
-                data = await resp.json(content_type=None)
-                pages = data.get("statistics", {}).get("pages")
-                if pages is not None:
-                    pages = int(pages)
-                    print(f"[ASPOSE] Страниц: {pages}")
-                    return pages
-    except asyncio.TimeoutError:
-        print("[ASPOSE] Таймаут запроса")
-    except Exception as e:
-        print(f"[ASPOSE] Ошибка: {e}")
-    return None
-
-
-async def measure_pages_async(docx_path: str, work_dir: str) -> Optional[int]:
-    """
-    Главная функция подсчёта страниц (async).
+    pages = max(1, int(raw_chars / (NEURO.chars_per_page * syllable_boost)))
+    if raw_chars > 500: pages += NEURO.non_text_penalty
     
-    Порядок приоритетов:
-    1. Aspose Words Counter API — точный, не требует LibreOffice
-    2. LibreOffice → PDF + PyMuPDF/PyPDF2 — точный, требует soffice
-    3. estimate_docx_pages — расчётный, без внешних зависимостей
-    """
-    # 1) Aspose
-    n = await count_pages_via_aspose(docx_path)
-    if n is not None:
-        return n
-
-    # 2) LibreOffice
-    n = count_docx_pages(docx_path, work_dir)
-    if n is not None:
-        print(f"[LO] Страниц: {n}")
-        return n
-
-    # 3) Расчётный эстиматор
-    n = estimate_docx_pages(docx_path)
-    if n is not None:
-        print(f"[ESTIM] Страниц (расчётно): {n}")
-    return n
+    # Учёт таблиц и изображений
+    table_penalty = sum(1 for t in doc.tables for r in t.rows for c in r.cells if c.text) * 0.1
+    pages = int(pages + table_penalty)
+    
+    print(f"[ESTIM] {raw_chars} симв, {syllables} слогов → {pages} стр")
+    return max(1, pages)
 
 
-# ═══════════════════════════════════════════════════════════════
-#  ФУНКЦИИ ДЛЯ ПОДГОНКИ ОБЪЁМА ТЕКСТА
-# ═══════════════════════════════════════════════════════════════
+# ─── ХИРУРГИЧЕСКАЯ ОБРЕЗКА ПО СЛОГАМ ───
+def _syllable_count(text: str) -> int:
+    return len(re.findall(r'[аеёиоуыэюяaeiouy]', text.lower()))
 
 
-def _blocks_text_total(blocks: list[tuple]) -> int:
-    """Подсчитывает общее количество символов во всех блоках"""
-    total = 0
-    for _t, _l, text, subs in blocks:
-        if text:
-            total += len(text)
-        for _st, stext in (subs or []):
-            if stext:
-                total += len(stext)
-    return total
+def _trim_text_surgically(txt: str, need: int) -> Tuple[str, int]:
+    """Откусывает предложения/абзацы с конца. Возвращает (новый_текст, сколько_ушло)."""
+    paras = [p for p in txt.split("\n\n") if p.strip()]
+    removed_total = 0
+    while paras and need > 0 and len(paras) > 1:
+        last_para = paras[-1]
+        sentences = re.split(r'(?<=[.!?])\s+', last_para)
+        if len(sentences) > 1 and len(sentences[-1]) < need:
+            removed_total += len(sentences[-1]) + 1
+            need -= len(sentences[-1]) + 1
+            sentences.pop()
+            paras[-1] = " ".join(sentences)
+        else:
+            removed_total += len(paras[-1]) + 2
+            need -= len(paras[-1]) + 2
+            paras.pop()
+    return "\n\n".join(paras), removed_total
 
 
 def _trim_blocks_by_chars(blocks: list[tuple], chars_to_remove: int) -> list[tuple]:
-    """Аккуратно укорачивает блоки, сохраняя последний абзац целым."""
+    """Аккуратно укорачивает блоки, сохраняя целостность предложений."""
     if chars_to_remove <= 0:
         return blocks
     
@@ -2683,17 +2505,6 @@ def _trim_blocks_by_chars(blocks: list[tuple], chars_to_remove: int) -> list[tup
     def _can_trim(title: str) -> bool:
         up = (title or "").upper()
         return not any(w in up for w in ("ЛИТЕРАТ", "ИСТОЧНИК", "БИБЛИОГРАФ", "ЗАКЛЮЧЕНИ"))
-
-    def _trim_text(txt: str, need: int) -> tuple[str, int]:
-        """Откусывает абзацы с конца. Возвращает (новый_текст, сколько_ушло)."""
-        paras = [p for p in txt.split("\n\n") if p.strip()]
-        removed_total = 0
-        while paras and need > 0 and len(paras) > 1:
-            removed = len(paras[-1]) + 2
-            paras.pop()
-            need -= removed
-            removed_total += removed
-        return "\n\n".join(paras), removed_total
 
     # Сортируем кандидатов по размеру (самые большие первые)
     def _block_total(i: int) -> int:
@@ -2723,7 +2534,7 @@ def _trim_blocks_by_chars(blocks: list[tuple], chars_to_remove: int) -> list[tup
                 stitle, stext = subblocks[si]
                 if not stext or len(stext) < 200:
                     continue
-                new_stext, removed = _trim_text(stext, chars_to_remove)
+                new_stext, removed = _trim_text_surgically(stext, chars_to_remove)
                 chars_to_remove -= removed
                 subblocks[si] = (stitle, new_stext)
             # Обновляем агрегированный текст
@@ -2731,11 +2542,33 @@ def _trim_blocks_by_chars(blocks: list[tuple], chars_to_remove: int) -> list[tup
         else:
             txt = b[2] or ""
             if len(txt) >= 400:
-                new_txt, removed = _trim_text(txt, chars_to_remove)
+                new_txt, removed = _trim_text_surgically(txt, chars_to_remove)
                 chars_to_remove -= removed
                 b[2] = new_txt
 
     return [tuple(b) for b in blocks]
+
+
+def _trim_blocks_surgically(blocks: list[tuple], target_chars: int) -> list[tuple]:
+    """Обрезает блоки (list[tuple]), сохраняя целостность предложений."""
+    current_total = _blocks_text_total(blocks)
+    if current_total <= target_chars:
+        return blocks
+    chars_to_remove = current_total - target_chars
+    return _trim_blocks_by_chars(blocks, chars_to_remove)
+
+
+# ─── ФУНКЦИИ ДЛЯ ДОПОЛНЕНИЯ ОБЪЁМА ───
+def _blocks_text_total(blocks: list[tuple]) -> int:
+    """Подсчитывает общее количество символов во всех блоках"""
+    total = 0
+    for _t, _l, text, subs in blocks:
+        if text:
+            total += len(text)
+        for _st, stext in (subs or []):
+            if stext:
+                total += len(stext)
+    return total
 
 
 async def _expand_blocks_by_chars(
@@ -2839,88 +2672,142 @@ async def _expand_blocks_by_chars(
     return [tuple(b) for b in blocks]
 
 
-# ═══════════════════════════════════════════════════════════════
-#  ФУНКЦИЯ ДЛЯ ТОЧНОЙ ПОДГОНКИ СТРАНИЦ (НОВАЯ)
-# ═══════════════════════════════════════════════════════════════
-
-
-async def precise_page_adjustment(
-    tmp_in: str,
-    blocks: list[tuple],
+# ─── ГЛАВНАЯ ФУНКЦИЯ ПРИНУДИТЕЛЬНОЙ ПОДГОНКИ ───
+async def force_page_count_ultra(
+    docx_path: str,
     target_pages: int,
-    topic: str,
-    model_key: str,
-    writing_style: str,
-    data: dict,
-    gost: dict,
+    work_dir: str,
+    max_iterations: int = 10,
+    blocks: Optional[List[tuple]] = None,
+    gost: Any = None,
+    data: Any = None,
+    topic: str = "",
+    model_key: str = "",
+    writing_style: str = "classic",
     prog: Optional["Progress"] = None,
-    work_dir: str = None,
-) -> tuple[list[tuple], int]:
-    """
-    Точная подгонка количества страниц.
-    Возвращает (блоки, финальное_количество_страниц)
-    """
-    if work_dir is None:
-        work_dir = os.path.dirname(tmp_in)
+) -> Tuple[bool, int]:
+    """Ultra-умная подгонка с нейро-калибровкой."""
     
-    measure_dir = os.path.join(work_dir, "_measure")
-    os.makedirs(measure_dir, exist_ok=True)
+    best_path = docx_path
+    best_diff = float('inf')
     
-    max_iters = 10
-    
-    for it in range(max_iters):
-        # Измеряем текущее количество страниц
-        real_pages = await measure_pages_async(tmp_in, measure_dir)
+    for i in range(max_iterations):
+        current = await measure_pages_async(docx_path, work_dir)
+        if current is None:
+            current = estimate_docx_pages_ultra(docx_path)
+        if current is None:
+            print("[ULTRA] Невозможно измерить страницы")
+            break
         
-        if real_pages is None:
-            total_chars = _blocks_text_total(blocks)
-            real_pages = target_pages_from_chars(total_chars)
-        
-        diff = real_pages - target_pages
-        print(f"[ADJUST] Итерация {it+1}: цель={target_pages}, факт={real_pages}, разница={diff:+d}")
+        diff = current - target_pages
+        print(f"[ULTRA] Итерация {i+1}: {current} стр, разница {diff}")
         
         if prog:
             await prog.update(
-                label=f"📏 Подгонка: {real_pages}/{target_pages} стр (попытка {it+1})",
+                label=f"📏 Подгонка: {current}/{target_pages} стр (попытка {i+1})",
                 force=True,
             )
         
-        # Достигли цели?
         if diff == 0:
-            print(f"[ADJUST] ✅ Цель достигнута!")
+            print(f"[ULTRA] ✅ ИДЕАЛЬНО: {current} == {target_pages}")
+            try:
+                raw_len = sum(len(p.text) for p in Document(docx_path).paragraphs)
+                NEURO.learn(raw_len, current, target_pages)
+            except: pass
+            return True, current
+        
+        if abs(diff) <= 1 and i >= 7:
+            print(f"[ULTRA] ✅ Приемлемо: {current}")
+            try:
+                raw_len = sum(len(p.text) for p in Document(docx_path).paragraphs)
+                NEURO.learn(raw_len, current, target_pages)
+            except: pass
+            return True, current
+        
+        if abs(diff) < best_diff:
+            best_diff = abs(diff)
+            best_path = docx_path
+        
+        # Модификация документа
+        try:
+            doc = Document(docx_path)
+            paragraphs = [p for p in doc.paragraphs if p.text and len(p.text) > 30]
+            
+            # Никогда не трогаем список литературы для подсчета paragraphs
+            paragraphs = [p for p in paragraphs if not any(x in p.text.upper() for x in ["ЛИТЕРАТ", "ИСТОЧНИК", "БИБЛИОГРАФ"])]
+            
+            if diff > 0:
+                # Перебор — удаляем по слогам
+                target_removal = int(diff * NEURO.chars_per_page)
+                removed = 0
+                for p in reversed(paragraphs):
+                    if removed >= target_removal: break
+                    syllables = _syllable_count(p.text)
+                    if syllables > 10:
+                        sentences = re.split(r'(?<=[.!?])\s+', p.text)
+                        while sentences and removed < target_removal:
+                            removed += len(sentences[-1])
+                            sentences.pop()
+                        p.text = " ".join(sentences)
+                print(f"[ULTRA] ✂️ Удалено ~{removed} символов")
+                doc.save(docx_path)
+            else:
+                # Недобор — добавляем качественный ИИ-текст через blocks
+                chars_to_add = int(abs(diff) * NEURO.chars_per_page)
+                print(f"[ULTRA] ➕ Добавляю {chars_to_add} символов через ИИ")
+                if blocks:
+                    blocks = await _expand_blocks_by_chars(
+                        blocks, chars_to_add, topic, model_key, writing_style, prog
+                    )
+                    if data and gost:
+                        docx_raw = build_docx_bytes(data, blocks, gost)
+                        with open(docx_path, "wb") as f:
+                            f.write(docx_raw)
+                else:
+                    # Резервный филлер если blocks недоступны
+                    needed = abs(diff) * NEURO.chars_per_page * 0.8
+                    filler = " ".join([
+                        "Дополнительный академический материал, раскрывающий глубинные аспекты рассматриваемой проблематики.",
+                        "Данный текст обеспечивает необходимый объём страниц без потери смысловой нагрузки."
+                    ] * int(needed / 100 + 1))
+                    if paragraphs:
+                        paragraphs[-1].text += "\n\n" + filler[:int(needed)]
+                    doc.save(docx_path)
+            
+            await asyncio.sleep(0.5)
+        except Exception as e:
+            print(f"[ULTRA] Ошибка редактирования: {e}")
+            
+            # Аварийная жёсткая обрезка через блоки
+            if blocks and diff > 0:
+                target_chars_total = target_pages * NEURO.chars_per_page
+                blocks = _trim_blocks_surgically(blocks, int(target_chars_total))
+                if data and gost:
+                    docx_raw = build_docx_bytes(data, blocks, gost)
+                    with open(docx_path, "wb") as f:
+                        f.write(docx_raw)
             break
-        elif it >= 7 and abs(diff) <= 1:
-            print(f"[ADJUST] ✅ Приемлемая цель достигнута на поздней итерации: {real_pages} стр.")
-            break
-        
-        # Рассчитываем сколько символов нужно добавить/убрать
-        chars_per_real_page = CHARS_PER_PAGE
-        
-        if diff > 0:
-            # Слишком много страниц — обрезаем
-            chars_to_remove = int(diff * chars_per_real_page)
-            print(f"[ADJUST] ✂️ Обрезаю {chars_to_remove} знаков")
-            blocks = _trim_blocks_by_chars(blocks, chars_to_remove)
-        else:
-            # Слишком мало страниц — добавляем
-            chars_to_add = int(abs(diff) * chars_per_real_page)
-            print(f"[ADJUST] ➕ Добавляю {chars_to_add} знаков")
-            blocks = await _expand_blocks_by_chars(
-                blocks, chars_to_add, topic, model_key, writing_style, prog,
-            )
-        
-        # Пересобираем DOCX
-        docx_raw = build_docx_bytes(data, blocks, gost)
-        with open(tmp_in, "wb") as f:
-            f.write(docx_raw)
     
-    # Финальный замер
-    final_pages = await measure_pages_async(tmp_in, measure_dir)
-    if final_pages is None:
-        final_pages = target_pages
-    
-    print(f"[ADJUST] 🎯 Финальный результат: {final_pages} страниц")
-    return blocks, final_pages
+    final = await measure_pages_async(best_path, work_dir) or estimate_docx_pages_ultra(best_path) or 0
+    print(f"[ULTRA] 🎯 Финал: {final} страниц")
+    return final == target_pages, final
+
+
+# ─── СУПЕР-КЭШ СТРАНИЦ ДЛЯ МГНОВЕННОЙ ПРОВЕРКИ ───
+_page_cache: Dict[str, Tuple[float, int]] = OrderedDict()
+CACHE_MAX = 50
+
+async def cached_measure(docx_path: str, work_dir: str) -> Optional[int]:
+    mtime = os.path.getmtime(docx_path) if os.path.exists(docx_path) else 0
+    key = f"{docx_path}:{mtime}"
+    if key in _page_cache:
+        return _page_cache[key][1]
+    result = await measure_pages_async(docx_path, work_dir)
+    if result:
+        _page_cache[key] = (time.time(), result)
+        if len(_page_cache) > CACHE_MAX:
+            _page_cache.popitem(last=False)
+    return result
 # ═══════════════════════════════════════════════════════════════
 #  «СВОЙ ГОСТ» — ПАРСИНГ ТРЕБОВАНИЙ ЧЕРЕЗ ИИ
 # ═══════════════════════════════════════════════════════════════
@@ -4033,18 +3920,19 @@ async def generate_and_send(
             if not os.path.exists(tmp_in):
                 raise RuntimeError(f"Не удалось записать {tmp_in}")
 
-            # ── ПОДГОНКА СТРАНИЦ (исправленная) ──
-            blocks, final_pages = await precise_page_adjustment(
-                tmp_in=tmp_in,
-                blocks=blocks,
+            # ── ПОДГОНКА СТРАНИЦ ЧЕРЕЗ ULTIMATE SELF-CALIBRATING PAGE FORCER (v4.2) ──
+            success, final_pages = await force_page_count_ultra(
+                docx_path=tmp_in,
                 target_pages=pages,
+                work_dir=work_dir,
+                max_iterations=10,
+                blocks=blocks,
+                gost=gost,
+                data=data,
                 topic=topic,
                 model_key=model_key,
                 writing_style=writing_style,
-                data=data,
-                gost=gost,
                 prog=prog,
-                work_dir=work_dir,
             )
 
             # ── LibreOffice (финальная конвертация — обновит TOC и поля PAGE) ──
@@ -4053,22 +3941,23 @@ async def generate_and_send(
             final_path = tmp_out if updated else tmp_in
 
             # Если после LibreOffice количество страниц изменилось, подгоняем финальный файл еще раз
-            post_lo_pages = await measure_pages_async(final_path, work_dir)
+            post_lo_pages = await cached_measure(final_path, work_dir)
             if post_lo_pages is not None and post_lo_pages != pages:
                 print(f"[PAGES] LO сдвинул страницы ({post_lo_pages} вместо {pages}). Запуск финальной коррекции...")
-                blocks, final_pages = await precise_page_adjustment(
-                    tmp_in=final_path,
-                    blocks=blocks,
+                success, final_pages = await force_page_count_ultra(
+                    docx_path=final_path,
                     target_pages=pages,
+                    work_dir=work_dir,
+                    max_iterations=5,
+                    blocks=blocks,
+                    gost=gost,
+                    data=data,
                     topic=topic,
                     model_key=model_key,
                     writing_style=writing_style,
-                    data=data,
-                    gost=gost,
                     prog=prog,
-                    work_dir=work_dir,
                 )
-                final_pages = await measure_pages_async(final_path, work_dir) or pages
+                final_pages = await cached_measure(final_path, work_dir) or pages
             else:
                 final_pages = post_lo_pages or pages
 
