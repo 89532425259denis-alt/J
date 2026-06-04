@@ -888,8 +888,16 @@ async def generate_chapter_titles(
 
     try:
         result = json.loads(raw)
-        if isinstance(result, list) and all("title" in r for r in result):
-            return result
+        if isinstance(result, list):
+            # Фильтруем Введение, Заключение, Список литературы из списка глав, если ИИ их туда добавил
+            cleaned = []
+            for item in result:
+                title = str(item.get("title", "")).upper()
+                if any(x in title for x in ["ВВЕДЕНИЕ", "ЗАКЛЮЧЕНИЕ", "СПИСОК ЛИТЕРАТУРЫ", "БИБЛИОГРАФИЯ"]):
+                    continue
+                cleaned.append(item)
+            if cleaned and all("title" in r for r in cleaned):
+                return cleaned[:num_chapters]
     except Exception:
         pass
 
