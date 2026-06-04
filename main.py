@@ -734,7 +734,7 @@ async def call_openai_compat(
     max_tokens: int = 4096,
     timeout: int = 300,
 ) -> str:
-    """Вызов OpenAI-совместимого API."""
+    """Вызов OpenAI-совместимого API с поддержкой повторных попыток при лимитах (rate limit)."""
     if info.get("_fatal") or not info.get("api_key"):
         return ""
 
@@ -755,31 +755,46 @@ async def call_openai_compat(
         "max_tokens":  max_tokens,
     }
 
-    try:
-        async with aiohttp.ClientSession() as sess:
-            async with sess.post(
-                f"{base}/chat/completions",
-                headers=headers,
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=timeout),
-            ) as r:
-                txt = await r.text()
-                if r.status == 200:
-                    data = json.loads(txt)
-                    return data["choices"][0]["message"]["content"]
-                if r.status in (401, 402, 403):
-                    info["_fatal"] = True
-                    info["status"] = ModelStatus.FATAL
-                    print(f"[FATAL] {info['name']} — auth error {r.status}")
-                elif r.status == 429:
-                    info["status"] = ModelStatus.LIMIT
-                    print(f"[LIMIT] {info['name']} — rate limit")
-                else:
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            async with aiohttp.ClientSession() as sess:
+                async with sess.post(
+                    f"{base}/chat/completions",
+                    headers=headers,
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=timeout),
+                ) as r:
+                    txt = await r.text()
+                    if r.status == 200:
+                        data = json.loads(txt)
+                        return data["choices"][0]["message"]["content"]
+                    
+                    if r.status in (401, 402, 403):
+                        info["_fatal"] = True
+                        info["status"] = ModelStatus.FATAL
+                        print(f"[FATAL] {info['name']} — auth error {r.status}")
+                        return ""
+                        
+                    if r.status == 429:
+                        info["status"] = ModelStatus.LIMIT
+                        # Exponential backoff: wait 4, 8, 16, 32 seconds
+                        sleep_time = (2 ** attempt) * 4
+                        print(f"[LIMIT] {info['name']} — rate limit (попытка {attempt+1}/{max_retries}). Сон {sleep_time} сек...")
+                        await asyncio.sleep(sleep_time)
+                        continue
+                        
+                    # Other HTTP error
                     print(f"[ERROR] {info['name']} — HTTP {r.status}: {txt[:200]}")
-    except asyncio.TimeoutError:
-        print(f"[TIMEOUT] {info['name']}")
-    except Exception as e:
-        print(f"[ERR] {info['name']}: {e}")
+                    # Also wait a bit and retry
+                    await asyncio.sleep(2)
+                    
+        except asyncio.TimeoutError:
+            print(f"[TIMEOUT] {info['name']} (попытка {attempt+1})")
+            await asyncio.sleep(2)
+        except Exception as e:
+            print(f"[ERR] {info['name']}: {e} (попытка {attempt+1})")
+            await asyncio.sleep(2)
 
     return ""
 
@@ -2596,8 +2611,9 @@ async def _expand_blocks_by_chars(
     if not candidates:
         return [tuple(b) for b in blocks]
 
-    # Равномерно распределяем нагрузку + 30% запас
-    per_block = int((chars_to_add / max(1, len(candidates))) * 1.3) + 300
+    # Равномерно распределяем нагрузку + 10% запас
+    per_block = int((chars_to_add / max(1, len(candidates))) * 1.1)
+    per_block = max(300, per_block) # Но минимум 300 символов, чтобы ИИ мог развернуть мысль
     
     style_label = "высокоакадемический научный" if writing_style == "smart" else "деловой научный"
     style_sys = (
