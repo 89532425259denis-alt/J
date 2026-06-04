@@ -33,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import math
 import os
 import re
 import shutil
@@ -2454,44 +2455,51 @@ def estimate_docx_pages_ultra(docx_path: str) -> Optional[int]:
         return None
     if not doc.sections:
         return None
-    sec = doc.sections[0]
     
-    def emu2pt(emu):
-        try: return float(emu) / 12700.0
-        except: return 0.0
+    from docx.oxml.ns import qn
     
-    pw = emu2pt(sec.page_width) or 595.0
-    ph = emu2pt(sec.page_height) or 842.0
-    lm = emu2pt(sec.left_margin) or 85.0
-    rm = emu2pt(sec.right_margin) or 42.0
-    tm = emu2pt(sec.top_margin) or 56.0
-    bm = emu2pt(sec.bottom_margin) or 56.0
+    # Разбиваем параграфы на разделы.
+    # Новый раздел начинается при обнаружении Heading 1 или разрыва страницы.
+    sections_chars = []
+    current_chars = 0
     
-    tw = max(50, pw - lm - rm)
-    th = max(50, ph - tm - bm)
+    for p in doc.paragraphs:
+        is_h1 = p.style and p.style.name and p.style.name.startswith("Heading 1")
+        has_pb = False
+        for r in p.runs:
+            for br in r._element.iter(qn("w:br")):
+                if br.get(qn("w:type")) == "page":
+                    has_pb = True
+                    break
+            if has_pb:
+                break
+        
+        if is_h1 or has_pb:
+            if current_chars > 0:
+                sections_chars.append(current_chars)
+                current_chars = 0
+        
+        current_chars += len(p.text or "")
+        
+    if current_chars > 0:
+        sections_chars.append(current_chars)
+        
+    # Титульный лист и Содержание занимают ровно 2 страницы.
+    total_pages = 2
+    body_sections = sections_chars[2:] if len(sections_chars) > 2 else sections_chars
     
-    try: fs = float(doc.styles["Normal"].font.size.pt)
-    except: fs = 14.0
-    try: ls = float(doc.styles["Normal"].paragraph_format.line_spacing or 1.5)
-    except: ls = NEURO.line_spacing_override
+    # Базовое число символов на страницу по ГОСТ (Times New Roman 14pt, 1.5 интервал)
+    # С учетом абзацев, пустых строк после заголовков и полей реальная страница вмещает около 1400-1450 зн.
+    cpp = NEURO.chars_per_page
     
-    cpl = max(20, int(tw / (fs * NEURO.char_width_factor)))
-    lpp = max(10, int(th / (fs * ls)))
-    raw_chars = sum(len(p.text or "") for p in doc.paragraphs)
-    
-    # Слоговая компрессия (русский текст)
-    syllables = len(re.findall(r'[аеёиоуыэюя]', " ".join(p.text or "" for p in doc.paragraphs).lower()))
-    syllable_boost = 1.0 + (syllables / max(1, raw_chars)) * 0.3
-    
-    pages = max(1, int(raw_chars / (NEURO.chars_per_page * syllable_boost)))
-    if raw_chars > 500: pages += NEURO.non_text_penalty
-    
-    # Учёт таблиц и изображений
-    table_penalty = sum(1 for t in doc.tables for r in t.rows for c in r.cells if c.text) * 0.1
-    pages = int(pages + table_penalty)
-    
-    print(f"[ESTIM] {raw_chars} симв, {syllables} слогов → {pages} стр")
-    return max(1, pages)
+    for chars in body_sections:
+        # Каждый раздел начинается с новой страницы (разрыв раздела).
+        # Поэтому число страниц раздела равно округленному вверх делению символов на cpp.
+        sec_pages = math.ceil(chars / cpp)
+        total_pages += max(1, sec_pages)
+        
+    print(f"[ESTIM] Секции знаков: {sections_chars} → Итог: {total_pages} стр")
+    return total_pages
 
 
 # ─── ХИРУРГИЧЕСКАЯ ОБРЕЗКА ПО СЛОГАМ ───
