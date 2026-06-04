@@ -1,15 +1,15 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-"""ГОСТ-АССИСТЕНТ v2.8 — ПРОФЕССИОНАЛЬНЫЙ ПОДСЧЁТ СТРАНИЦ + ДИСЦИПЛИНА
+"""ГОСТ-АССИСТЕНТ v2.7 — ТОЧНЫЕ СТРАНИЦЫ + ДИСЦИПЛИНА
 
 Главные изменения v2.1 относительно v2.0:
 ────────────────────────────────────────────────────────────────
-1. ★ ТОЧНОЕ ЧИСЛО СТРАНИЦ (±1) — теперь ПРОФЕССИОНАЛЬНО.
-   Финальный DOCX → LibreOffice → PDF.
-   Страницы считаются ТРЕМЯ методами: PyMuPDF (fitz) + pypdf (PdfReader) + улучшенный fallback.
-   Самокалибрующаяся нейросеть обучается на реальных прогонах.
-   Если нет LibreOffice — продвинутый layout-эстиматор с учётом ГОСТ.
+1. ★ ТОЧНОЕ ЧИСЛО СТРАНИЦ (±1).
+   После генерации DOCX конвертируется в PDF через LibreOffice,
+   реально пересчитываются страницы (pypdf / pdfinfo). Если страниц
+   меньше цели — главы дозаполняются; если больше — обрезаются
+   по границам абзацев. Цикл до 3 итераций.
 
 2. ★ ПРАВИЛЬНАЯ НУМЕРАЦИЯ СТРАНИЦ ПО ГОСТ.
    Титульный лист включается в общую нумерацию, но цифра на нём
@@ -33,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import math
 import os
 import re
 import shutil
@@ -66,10 +67,6 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Cm, Mm, Pt, RGBColor
-
-# Professional PDF page counting (pypdf + pymupdf for ultimate reliability)
-from pypdf import PdfReader
-import fitz  # PyMuPDF
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -297,7 +294,7 @@ PAID_DAILY_LIMIT  = int(cfg("PAID_DAILY_LIMIT",       "0"))   # 0 = безлим
 PAID_COOLDOWN     = int(cfg("PAID_COOLDOWN_SECONDS",  "0"))   # 0 = нет кулдауна
 
 # Символов на страницу (ГОСТ: ~1800-2000 знаков с пробелами на стр A4 14pt 1.5 интервал)
-CHARS_PER_PAGE = int(cfg("CHARS_PER_PAGE", "1800"))
+CHARS_PER_PAGE = int(cfg("CHARS_PER_PAGE", "1850"))
 # Страниц без текста (титул + содержание)
 NON_TEXT_PAGES = int(cfg("NON_TEXT_PAGES", "2"))
 
@@ -1132,16 +1129,14 @@ def build_prompts(
             "main1":      strict_prompt(
                 f"Напиши первый аргумент в эссе «{topic}». "
                 f"Приведи конкретные факты, мнения учёных и доказательства. "
-                f"Пиши развёрнуто, минимум 6-8 полных абзацев (минимум 800 знаков реального содержания под аргументом, НЕ только название или коротко). "
-                f"Используй примеры, анализ, ссылки на источники.",
+                f"Пиши развёрнуто, минимум 3-4 абзаца.",
                 main_chars,
                 writing_style, doc_type,
             ),
             "main2":      strict_prompt(
                 f"Напиши второй аргумент в эссе «{topic}» с контраргументом. "
                 f"Рассмотри противоположную точку зрения и опровергни её. "
-                f"Пиши развёрнуто, минимум 6-8 полных абзацев (минимум 800 знаков реального содержания под аргументом, НЕ только название или коротко). "
-                f"Используй примеры, анализ, ссылки на источники.",
+                f"Пиши развёрнуто, минимум 3-4 абзаца.",
                 main_chars,
                 writing_style, doc_type,
             ),
@@ -1271,29 +1266,14 @@ def build_prompts(
             f"Тема всей работы: «{topic}».\n"
             f"Это отдельная подглава — пиши её как завершённый смысловой блок.\n"
             f"Начни с заголовка подглавы '{sub_title}' на отдельной строке, "
-            f"затем ОБЯЗАТЕЛЬНО идёт минимум 5–8 развёрнутых абзацев содержательного текста (минимум 700–900 знаков реального содержания, НЕ только заголовок).\n"
-            f"Пиши конкретно, с примерами, анализом и ссылками на источники в формате [1, с. 45] или [3] — минимум 3 ссылки.\n"
-            f"НЕ заканчивай текст заголовком или короткой фразой — закончи полной мыслью.",
+            f"затем идёт содержательный текст (минимум 3–4 развёрнутых абзаца).\n"
+            f"Используй ссылки на источники в формате [1, с. 45] или [3] — "
+            f"минимум 2–3 ссылки на источники в этой подглаве.",
             sub_chars,
             writing_style, doc_type,
         )
 
     # Заключение НЕ включаем в batch — оно генерируется ПОСЛЕ всех глав
-    # ═══════════════════════════════════════════════════════════
-    # ГАРАНТИЯ ТЕЛА ПОД ЗАГОЛОВКАМИ (исправление "только названия")
-    # Если подглава слишком короткая — дозаполняем минимальным содержимым
-    # ═══════════════════════════════════════════════════════════
-    MIN_SUB_BODY = 600  # минимум знаков реального текста под подглавой
-    for key in list(parts.keys()):
-        if key.startswith("ch") and key not in ("intro", "conclusion", "literature"):
-            txt = parts.get(key, "")
-            if len(txt.strip()) < MIN_SUB_BODY:
-                print(f"[WARN] Подглава {key} слишком короткая ({len(txt)} знаков) — добавляем минимальное тело")
-                filler = "Данный аспект рассматриваемой проблемы имеет важное значение для понимания общих закономерностей и требует дополнительного анализа с учётом современных подходов и практического опыта."
-                while len(txt) < MIN_SUB_BODY:
-                    txt += " " + filler
-                parts[key] = txt
-
     # (см. generate_text_blocks)
 
     # Библиография
@@ -1628,20 +1608,6 @@ async def generate_text_blocks(
         if prog:
             await prog.update(step_done=True)
 
-
-    # ═══════════════════════════════════════════════════════════
-    # ГАРАНТИЯ ТЕЛА ДЛЯ ЭССЕ (исправление "только названия" для аргументов)
-    # ═══════════════════════════════════════════════════════════
-    if doc_type == "esse":
-        MIN_ESSAY_BODY = 800
-        for k in ["main1", "main2"]:
-            if k in parts:
-                txt = parts[k].strip()
-                if len(txt) < MIN_ESSAY_BODY:
-                    print(f"[WARN] Аргумент {k} слишком короткий ({len(txt)} знаков) — добавляем минимум")
-                    filler = " Этот аргумент подкрепляется конкретными примерами и наблюдениями, которые подтверждают основную мысль и позволяют глубже понять проблему."
-                    while len(parts[k]) < MIN_ESSAY_BODY:
-                        parts[k] += filler
     # ═══════════════════════════════════════════════════════════
     # ГЕНЕРАЦИЯ ЗАКЛЮЧЕНИЯ ПОСЛЕ ВСЕХ ГЛАВ
     # (ключевое исправление: заключение видит реальное содержание)
@@ -2415,7 +2381,7 @@ _ESTIM_CALIBRATION = 1.00
 # ─── НЕЙРО-КАЛИБРОВКА (обучается на каждом прогоне) ───
 @dataclass
 class NeuroCalibration:
-    chars_per_page: float = 1750.0
+    chars_per_page: float = 1550.0
     char_width_factor: float = 0.45
     line_spacing_override: float = 1.5
     non_text_penalty: int = 2
@@ -2451,16 +2417,9 @@ except Exception:
 
 # ─── ВЫСОКОТОЧНЫЙ ЗАМЕР СТРАНИЦ ЧЕРЕЗ LIBREOFFICE ───
 async def measure_pages_async(docx_path: str, work_dir: str, timeout: int = 30) -> Optional[int]:
-    """Профессиональный подсчёт страниц: LibreOffice → PDF + тройной надёжный счётчик.
-
-    1. PyMuPDF (fitz) — лучший для реального рендеринга страниц (учитывает всё).
-    2. pypdf.PdfReader — стандартный, очень надёжный.
-    3. Улучшенный crude (только если оба выше упали).
-    Возвращает точное число страниц по финальному PDF.
-    """
     if not shutil.which("soffice"):
         return estimate_docx_pages_ultra(docx_path)
-
+        
     pdf_path = os.path.join(work_dir, f"_pagecheck_{hashlib.md5(docx_path.encode()).hexdigest()[:8]}.pdf")
     try:
         proc = await asyncio.wait_for(
@@ -2471,92 +2430,24 @@ async def measure_pages_async(docx_path: str, work_dir: str, timeout: int = 30) 
             ), timeout=timeout
         )
         await proc.wait()
-
         if not os.path.exists(pdf_path):
             alt = docx_path.replace(".docx", ".pdf")
-            if os.path.exists(alt):
-                pdf_path = alt
-            else:
-                return estimate_docx_pages_ultra(docx_path)
-
-        pages = _get_pdf_page_count(pdf_path)
-
-        # Cleanup
-        if os.path.exists(pdf_path):
-            try:
-                os.remove(pdf_path)
-            except Exception:
-                pass
-
-        if pages and pages > 0:
-            return pages
-        return estimate_docx_pages_ultra(docx_path)
-
-    except Exception as e:
-        print(f"[MEASURE] Ошибка конвертации/подсчёта: {e}")
-        return estimate_docx_pages_ultra(docx_path)
-
-
-def _get_pdf_page_count(pdf_path: str) -> Optional[int]:
-    """Профессиональный, отказоустойчивый подсчёт страниц PDF (идеально для ГОСТ-документов).
-
-    Приоритет:
-    1. PyMuPDF (fitz) — учитывает реальный layout, таблицы, изображения, шрифты.
-    2. pypdf — чистый подсчёт страниц по объектам.
-    3. Улучшенный crude count (редко используется).
-    """
-    if not pdf_path or not os.path.exists(pdf_path):
-        return None
-
-    # 1. PyMuPDF — самый точный (рекомендуется для production)
-    try:
-        doc = fitz.open(pdf_path)
-        n = len(doc)
-        doc.close()
-        if n > 0:
-            print(f"[PAGES] fitz: {n} стр.")
-            return n
-    except Exception as e:
-        print(f"[PAGES] PyMuPDF error: {e}")
-
-    # 2. pypdf — отличный fallback
-    try:
-        reader = PdfReader(pdf_path)
-        n = len(reader.pages)
-        if n > 0:
-            print(f"[PAGES] pypdf: {n} стр.")
-            return n
-    except Exception as e:
-        print(f"[PAGES] pypdf error: {e}")
-
-    # 3. Улучшенный crude (только если библиотеки не сработали)
-    try:
+            if os.path.exists(alt): pdf_path = alt
+            else: return estimate_docx_pages_ultra(docx_path)
         with open(pdf_path, "rb") as f:
             content = f.read()
-        # Более точный crude: считаем реальные страницы, игнорируя родительские /Pages
-        page_objs = content.count(b"/Type /Page")
-        pages_objs = content.count(b"/Type /Pages")
-        n = max(0, page_objs - pages_objs)
-        if n > 0:
-            print(f"[PAGES] crude: {n} стр.")
-            return n
-    except Exception:
-        pass
-
-    return None
+        pages = content.count(b"/Type /Page") - content.count(b"/Type /Pages")
+        if os.path.exists(pdf_path):
+            try: os.remove(pdf_path)
+            except: pass
+        return max(1, pages) if pages > 0 else estimate_docx_pages_ultra(docx_path)
+    except Exception as e:
+        print(f"[MEASURE] Ошибка: {e}")
+        return estimate_docx_pages_ultra(docx_path)
 
 
 # ─── УЛЬТРА-ТОЧНЫЙ ЭСТИМАТОР С УЧЁТОМ СЛОГОВ ───
 def estimate_docx_pages_ultra(docx_path: str) -> Optional[int]:
-    """Улучшенный fallback-эстиматор страниц для DOCX (когда нет LibreOffice).
-
-    Профессиональный подход:
-    - Точный расчёт доступной площади страницы по ГОСТ (поля, A4).
-    - Симуляция символов на строку и строк на страницу.
-    - Учёт слогов русского языка (более плотный текст).
-    - Калибровка NEURO + штрафы за таблицы/изображения/нетекстовые страницы.
-    - Используется только как fallback — основной счёт всегда через PDF.
-    """
     try:
         doc = Document(docx_path)
     except Exception as e:
@@ -2564,60 +2455,51 @@ def estimate_docx_pages_ultra(docx_path: str) -> Optional[int]:
         return None
     if not doc.sections:
         return None
-    sec = doc.sections[0]
     
-    def emu2pt(emu):
-        try: return float(emu) / 12700.0
-        except: return 0.0
+    from docx.oxml.ns import qn
     
-    pw = emu2pt(sec.page_width) or 595.0
-    ph = emu2pt(sec.page_height) or 842.0
-    lm = emu2pt(sec.left_margin) or 85.0
-    rm = emu2pt(sec.right_margin) or 42.0
-    tm = emu2pt(sec.top_margin) or 56.0
-    bm = emu2pt(sec.bottom_margin) or 56.0
+    # Разбиваем параграфы на разделы.
+    # Новый раздел начинается при обнаружении Heading 1 или разрыва страницы.
+    sections_chars = []
+    current_chars = 0
     
-    tw = max(50, pw - lm - rm)   # текстовая ширина в pt
-    th = max(50, ph - tm - bm)   # текстовая высота в pt
+    for p in doc.paragraphs:
+        is_h1 = p.style and p.style.name and p.style.name.startswith("Heading 1")
+        has_pb = False
+        for r in p.runs:
+            for br in r._element.iter(qn("w:br")):
+                if br.get(qn("w:type")) == "page":
+                    has_pb = True
+                    break
+            if has_pb:
+                break
+        
+        if is_h1 or has_pb:
+            if current_chars > 0:
+                sections_chars.append(current_chars)
+                current_chars = 0
+        
+        current_chars += len(p.text or "")
+        
+    if current_chars > 0:
+        sections_chars.append(current_chars)
+        
+    # Титульный лист и Содержание занимают ровно 2 страницы.
+    total_pages = 2
+    body_sections = sections_chars[2:] if len(sections_chars) > 2 else sections_chars
     
-    try:
-        fs = float(doc.styles["Normal"].font.size.pt)
-    except:
-        fs = 14.0
-    try:
-        ls = float(doc.styles["Normal"].paragraph_format.line_spacing or 1.5)
-    except:
-        ls = NEURO.line_spacing_override
+    # Базовое число символов на страницу по ГОСТ (Times New Roman 14pt, 1.5 интервал)
+    # С учетом абзацев, пустых строк после заголовков и полей реальная страница вмещает около 1400-1450 зн.
+    cpp = NEURO.chars_per_page
     
-    # Симуляция: символов на строку и строк на страницу (учёт межстрочного)
-    cpl = max(20, int(tw / (fs * NEURO.char_width_factor)))
-    lpp = max(10, int(th / (fs * ls * 1.1)))  # небольшой запас на абзацы
-    
-    raw_chars = sum(len(p.text or "") for p in doc.paragraphs)
-    
-    # Слоговая компрессия для русского (слоги делают текст "плотнее" визуально)
-    syllables = len(re.findall(r'[аеёиоуыэюя]', " ".join(p.text or "" for p in doc.paragraphs).lower()))
-    syllable_boost = 1.0 + min(0.4, (syllables / max(1, raw_chars)) * 0.35)
-    
-    # Базовый расчёт + калибровка
-    est_cpp = NEURO.chars_per_page * syllable_boost
-    pages = max(1, int(raw_chars / est_cpp))
-    
-    # Нетекстовые страницы (титул + содержание + возможные разрывы)
-    if raw_chars > 300:
-        pages += max(0, NEURO.non_text_penalty)
-    
-    # Учёт таблиц, изображений, списков (добавляют визуальный объём)
-    table_penalty = sum(1 for t in doc.tables for r in t.rows for c in r.cells if (c.text or "").strip()) * 0.12
-    image_penalty = 0.5 * len([r for r in doc.paragraphs if any("drawing" in str(r._element.xml).lower() for _ in [1])])  # rough
-    pages = int(pages + table_penalty + image_penalty)
-    
-    # Практический минимум для академических работ
-    if raw_chars > 1500:
-        pages = max(pages, 3)
-    
-    print(f"[ESTIM] {raw_chars} симв | cpl={cpl} lpp={lpp} | слогов={syllables} → ~{pages} стр (est_cpp={est_cpp:.0f})")
-    return max(1, pages)
+    for chars in body_sections:
+        # Каждый раздел начинается с новой страницы (разрыв раздела).
+        # Поэтому число страниц раздела равно округленному вверх делению символов на cpp.
+        sec_pages = math.ceil(chars / cpp)
+        total_pages += max(1, sec_pages)
+        
+    print(f"[ESTIM] Секции знаков: {sections_chars} → Итог: {total_pages} стр")
+    return total_pages
 
 
 # ─── ХИРУРГИЧЕСКАЯ ОБРЕЗКА ПО СЛОГАМ ───
@@ -4199,9 +4081,8 @@ async def generate_and_send(
 
 async def main() -> None:
     print("═" * 62)
-    print("  🤖  ГОСТ-АССИСТЕНТ v2.8 (профессиональный подсчёт страниц)")
+    print("  🤖  ГОСТ-АССИСТЕНТ v2.7")
     print("═" * 62)
-    print("  Page counter: PyMuPDF + pypdf (triple verification) + ultra estimator")
     print(f"  LibreOffice : {shutil.which('soffice') or '❌ не найден'}")
     print(f"  DeepSeek    : {'✅' if DEEPSEEK_KEY else '❌ нет ключа'}")
     print(f"  OpenRouter  : {'✅' if OPENROUTER_KEY else '❌ нет ключа'}")
