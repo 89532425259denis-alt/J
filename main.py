@@ -1,15 +1,15 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-"""ГОСТ-АССИСТЕНТ v2.8 — ПРОФЕССИОНАЛЬНЫЙ ПОДСЧЁТ СТРАНИЦ + ДИСЦИПЛИНА
+"""ГОСТ-АССИСТЕНТ v2.7 — ТОЧНЫЕ СТРАНИЦЫ + ДИСЦИПЛИНА
 
 Главные изменения v2.1 относительно v2.0:
 ────────────────────────────────────────────────────────────────
-1. ★ ТОЧНОЕ ЧИСЛО СТРАНИЦ (±1) — теперь ПРОФЕССИОНАЛЬНО.
-   Финальный DOCX → LibreOffice → PDF.
-   Страницы считаются ТРЕМЯ методами: PyMuPDF (fitz) + pypdf (PdfReader) + улучшенный fallback.
-   Самокалибрующаяся нейросеть обучается на реальных прогонах.
-   Если нет LibreOffice — продвинутый layout-эстиматор с учётом ГОСТ.
+1. ★ ТОЧНОЕ ЧИСЛО СТРАНИЦ (±1).
+   После генерации DOCX конвертируется в PDF через LibreOffice,
+   реально пересчитываются страницы (pypdf / pdfinfo). Если страниц
+   меньше цели — главы дозаполняются; если больше — обрезаются
+   по границам абзацев. Цикл до 3 итераций.
 
 2. ★ ПРАВИЛЬНАЯ НУМЕРАЦИЯ СТРАНИЦ ПО ГОСТ.
    Титульный лист включается в общую нумерацию, но цифра на нём
@@ -40,8 +40,7 @@ import subprocess
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
-from collections import OrderedDict
-from typing import List, Tuple, Dict, Any, Union, Optional
+from typing import Optional
 
 import aiohttp
 from aiohttp import web
@@ -66,10 +65,6 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Cm, Mm, Pt, RGBColor
-
-# Professional PDF page counting (pypdf + pymupdf for ultimate reliability)
-from pypdf import PdfReader
-import fitz  # PyMuPDF
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -297,7 +292,7 @@ PAID_DAILY_LIMIT  = int(cfg("PAID_DAILY_LIMIT",       "0"))   # 0 = безлим
 PAID_COOLDOWN     = int(cfg("PAID_COOLDOWN_SECONDS",  "0"))   # 0 = нет кулдауна
 
 # Символов на страницу (ГОСТ: ~1800-2000 знаков с пробелами на стр A4 14pt 1.5 интервал)
-CHARS_PER_PAGE = int(cfg("CHARS_PER_PAGE", "1800"))
+CHARS_PER_PAGE = int(cfg("CHARS_PER_PAGE", "1850"))
 # Страниц без текста (титул + содержание)
 NON_TEXT_PAGES = int(cfg("NON_TEXT_PAGES", "2"))
 
@@ -732,92 +727,13 @@ def sanitize_llm_text(raw: str) -> str:
     return text.strip()
 
 
-
-
-def _build_strict_expansion_prompt(topic: str, subject: str, title: str, tail: str, need: int, block_chars: int, pages: int, doc_type: str = "esse") -> str:
-    """Новый строгий промпт по последнему шаблону пользователя.
-    Жёсткий контроль объёма на блок, запрет дублирования заголовков, сильная дисциплинарная привязка, бесшовность, нет Markdown/мета.
-    """
-    est_p = round(block_chars / 1800, 1)
-    
-    style_instruction = "Для эссе допустимо первое лицо («я считаю», «по моему мнению»)." if doc_type == "esse" else "Строго безличный академический стиль («в исследовании установлено», «анализ данных показывает»)."
-    
-    template = f"""Ты — изолированный, автономный модуль генерации и жесткого контроля объема академических текстов на русском языке. Ты полностью отвечаешь за то, чтобы работа НЕ раздувалась и не содержала дубликатов.
-
-СТРОГИЕ ТЕХНИЧЕСКИЕ РАМКИ (ЗАЩИТА ОТ ПЕРЕГЕНЕРАЦИИ):
-
-1. Контроль страниц: Заказано страниц: {pages}. Твоя цель — выдать текст строго под этот объем. Расчет: 1 страница А4 (ГОСТ, 1.5 интервал) = 1750–1850 знаков с пробелами. Твой лимит на ТЕКУЩИЙ блок: СТРОГО {block_chars} знаков. Превышать его запрещено!
-
-2. Запрет на дублирование: Категорически запрещено повторно выводить заголовки (например, «ВВЕДЕНИЕ», «ОСНОВНАЯ ЧАСТЬ», «ЗАКЛЮЧЕНИЕ») внутри самого текста или генерировать их дважды! Если заголовок раздела уже сгенерирован, пиши СРАЗУ текст.
-
-3. Запрет на пустышки: Выводить структуру без текста или маркеры вида «Аргумент 1» без детального раскрытия запрещено. Под каждым разделом должен идти плотный, законченный академический текст.
-
-ДИСЦИПЛИНАРНАЯ ПРИВЯЗКА И ТЕКСТ:
-
-1. Предметный фильтр: Дисциплина — «{subject}», Тема — «{topic}». Пиши строго языком этой науки! Если география — пиши про тектонику, гидрологию, климат и геоморфологию. Никакой художественной «воды» и лирики про красоту природы. Только научные факты, цифры и анализ.
-
-2. Бесшовная склейка: Если ты дописываешь текст, посмотри на финальный кусок предыдущего текста: [...{tail or 'Начало блока.'}]. Продолжи его мысль плавно, без приветствий и вводных фраз вроде «Вот продолжение».
-
-3. Защита от обрывов (Max Tokens): Рассчитывай токены. Не обрывай мысль посреди предложения. За 1 абзац до исчерпания лимита {block_chars} плавно заверши раздел логической точкой.
-
-ФОРМАТИРОВАНИЕ ДЛЯ СТАБИЛЬНОСТИ БОТА:
-- Категорически запрещено использовать Markdown (никаких **, ##, __, `, ---). Нужен только чистый текст!
-- Запрещен мета-диалог: никаких «Конечно», «Я выполнил задачу», «Вот ваш реферат». Сразу выдавай готовый текст.
-
-ТЕКУЩИЙ РАЗДЕЛ: «{title}»
-
-Начинай сразу с содержательного текста (без повторения заголовка)."""
-
-    return template
-
-
-
-
-def _build_strict_expansion_prompt(topic: str, subject: str, title: str, tail: str, need: int, est_p: float, doc_type: str = "esse") -> str:
-    """Идеальный промпт для расширения/дописывания раздела по строгому академическому стандарту.
-    Гарантирует минимум реального текста нужного объёма, без заголовков, без мета, с ГОСТ-ссылками и дисциплинарной привязкой.
-    """
-    style_note = "Для эссе допустимо первое лицо («я считаю», «по моему мнению»)." if doc_type == "esse" else "Строго безличный академический стиль («в исследовании установлено», «анализ данных показывает»)."
-    
-    template = """Ты — изолированный, полностью автономный модуль генерации и расширения академических текстов высшего качества на русском языке. Твоя цель — выдать стабильный, глубокий и логически завершенный текст для текущего раздела, самостоятельно управляя объемом и структурой.
-
-1. МАТЕМАТИКА ОБЪЕМА И КОНТРОЛЬ СИМВОЛОВ:
-- Расчет объема: 1 страница формата А4 (ГОСТ: Times New Roman 14pt, интервал 1.5) — это СТРОГО 1750-1850 знаков с пробелами реального текста.
-- Твоя целевая задача: сгенерировать или дописать в текущий раздел МИНИМУМ {need} знаков с пробелами (ориентировочно {est_p:.1f} стр. текста). 
-- Плотность текста: Чтобы набрать этот объем без потери качества, пиши развернутые, монолитные академические абзацы (по 5–8 сложных предложений в каждом). Наполняй текст реальным анализом, историческим контекстом, мнениями экспертов и научными фактами.
-
-2. КАТЕГОРИЧЕСКИЙ ЗАПРЕЩЕНО (ПРАВИЛА СТАБИЛЬНОСТИ БОТА):
-- Запрет на пустышки: Выводить только заголовки, подзаголовки или пустые маркеры списков без описания КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО. Под каждым пунктом должен идти реальный текст.
-- Запрет на Markdown: Не используй символы **, ##, __, ---, а также оформление кода в тройные кавычки. Выдавай ТОЛЬКО чистый текст. 
-- Запрет на мета-диалог: Не пиши никаких приветствий, комментариев, объяснений своей работы или вводных фраз. На выходе должен быть ТОЛЬКО финальный текст работы. Начинай писать сразу с первого содержательного предложения.
-
-3. АКАДЕМИЧЕСКИЙ СТАНДАРТ И СТИЛЬ:
-- Дисциплинарная привязка: Раскрывай тему «{topic}» строго через призму, методы и терминологию дисциплины «{subject}». Смешивать стили или писать общие фразы запрещено.
-- Стиль изложения: {style_note}
-- ГОСТ-ссылки: Каждые 1-2 абзаца обязаны содержать внутритекстовые ссылки на источники в формате [1], [2] или [1, с. 45].
-
-4. ЗАЩИТА ОТ ОБРЫВОВ МЫСЛИ:
-- Категорически запрещено обрывать мысль на полуслове или посреди предложения.
-- Если объем текущего блока подходит к концу, начни плавное подведение итогов за 1-2 абзаца до финала. Заверши генерацию четкой, логически законченной точкой.
-
-ТЕКУЩИЙ КОНТЕНТ ДЛЯ РАБОТЫ:
-- Тема всей работы: «{topic}»
-- Дисциплина: «{subject}»
-- Текущий раздел/подраздел: «{title}»
-- Хвост уже написанного текста для бесшовного продолжения (если есть): ...{tail}
-
-Начинай генерацию строго с текста-продолжения, соблюдая все правила выше."""
-    
-    return template.format(need=need, est_p=est_p, topic=topic, subject=subject, title=title, tail=tail or "Начало раздела.", style_note=style_note)
-
-
 async def call_openai_compat(
     info: dict,
     messages: list[dict],
     max_tokens: int = 4096,
     timeout: int = 300,
 ) -> str:
-    """Вызов OpenAI-совместимого API с поддержкой повторных попыток при лимитах (rate limit)."""
+    """Вызов OpenAI-совместимого API."""
     if info.get("_fatal") or not info.get("api_key"):
         return ""
 
@@ -838,43 +754,31 @@ async def call_openai_compat(
         "max_tokens":  max_tokens,
     }
 
-    max_retries = 5
-    for attempt in range(max_retries):
-        try:
-            async with aiohttp.ClientSession() as sess:
-                async with sess.post(
-                    f"{base}/chat/completions",
-                    headers=headers,
-                    json=payload,
-                    timeout=aiohttp.ClientTimeout(total=timeout),
-                ) as r:
-                    txt = await r.text()
-                    if r.status == 200:
-                        data = json.loads(txt)
-                        return data["choices"][0]["message"]["content"]
-                    
-                    if r.status in (401, 402, 403):
-                        info["_fatal"] = True
-                        info["status"] = ModelStatus.FATAL
-                        print(f"[FATAL] {info['name']} — auth error {r.status}")
-                        return ""
-                        
-                    if r.status == 429:
-                        info["status"] = ModelStatus.LIMIT
-                        sleep_time = (2 ** attempt) * 4
-                        print(f"[LIMIT] {info['name']} — rate limit (попытка {attempt+1}/{max_retries}). Сон {sleep_time} сек...")
-                        await asyncio.sleep(sleep_time)
-                        continue
-                        
+    try:
+        async with aiohttp.ClientSession() as sess:
+            async with sess.post(
+                f"{base}/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=timeout),
+            ) as r:
+                txt = await r.text()
+                if r.status == 200:
+                    data = json.loads(txt)
+                    return data["choices"][0]["message"]["content"]
+                if r.status in (401, 402, 403):
+                    info["_fatal"] = True
+                    info["status"] = ModelStatus.FATAL
+                    print(f"[FATAL] {info['name']} — auth error {r.status}")
+                elif r.status == 429:
+                    info["status"] = ModelStatus.LIMIT
+                    print(f"[LIMIT] {info['name']} — rate limit")
+                else:
                     print(f"[ERROR] {info['name']} — HTTP {r.status}: {txt[:200]}")
-                    await asyncio.sleep(2)
-                    
-        except asyncio.TimeoutError:
-            print(f"[TIMEOUT] {info['name']} (попытка {attempt+1})")
-            await asyncio.sleep(2)
-        except Exception as e:
-            print(f"[ERR] {info['name']}: {e} (попытка {attempt+1})")
-            await asyncio.sleep(2)
+    except asyncio.TimeoutError:
+        print(f"[TIMEOUT] {info['name']}")
+    except Exception as e:
+        print(f"[ERR] {info['name']}: {e}")
 
     return ""
 
@@ -968,16 +872,8 @@ async def generate_chapter_titles(
 
     try:
         result = json.loads(raw)
-        if isinstance(result, list):
-            # Фильтруем Введение, Заключение, Список литературы из списка глав, если ИИ их туда добавил
-            cleaned = []
-            for item in result:
-                title = str(item.get("title", "")).upper()
-                if any(x in title for x in ["ВВЕДЕНИЕ", "ЗАКЛЮЧЕНИЕ", "СПИСОК ЛИТЕРАТУРЫ", "БИБЛИОГРАФИЯ"]):
-                    continue
-                cleaned.append(item)
-            if cleaned and all("title" in r for r in cleaned):
-                return cleaned[:num_chapters]
+        if isinstance(result, list) and all("title" in r for r in result):
+            return result
     except Exception:
         pass
 
@@ -1073,17 +969,12 @@ def _default_chapter_titles(doc_type: str, topic: str, num_chapters: int) -> lis
 #  РАСЧЁТ ОБЪЁМА ТЕКСТА — ИСПРАВЛЕННЫЙ
 # ═══════════════════════════════════════════════════════════════
 
-def target_chars(pages: int, doc_type: str = "referat") -> int:
+def target_chars(pages: int) -> int:
     """
     Целевое количество символов с пробелами для основного текста.
-    Для эссе (esse) вычитаем меньше нетекстовых страниц (титул + содержание компактнее),
-    чтобы объём тела соответствовал реальному количеству страниц без переполнения.
+    Вычитаем NON_TEXT_PAGES (титул + содержание), остаток умножаем на CHARS_PER_PAGE.
     """
-    if doc_type == "esse":
-        non_text = 1  # для эссе титул + содержание + возможные разрывы, но меньше штраф
-    else:
-        non_text = NON_TEXT_PAGES
-    text_pages = max(1, pages - non_text)
+    text_pages = max(1, pages - NON_TEXT_PAGES)
     return text_pages * CHARS_PER_PAGE
 
 
@@ -1191,63 +1082,39 @@ def build_prompts(
     Возвращает словарь {ключ_блока: промпт}.
     chapter_titles — список из generate_chapter_titles().
     """
-    total = target_chars(pages, doc_type)
+    total = target_chars(pages)
     s     = (source or "").strip()[:12000]
     ctx   = f"\n\nИсходные материалы для использования:\n{s}\n" if s else ""
 
     if doc_type == "esse":
-        # Жёсткий контроль по последнему строгому шаблону пользователя
+        # Минимальные границы для страховки (если расчёт даёт слишком мало)
         intro_min = 1200
-        main_min = 1800
+        main_min = 1500
 
-        intro_chars = max(intro_min, int(total * 0.18))
-        main_chars = max(main_min, int(total * 0.30))
-
-        intro_prompt = f"""Ты — изолированный, автономный модуль генерации и жесткого контроля объема академических текстов на русском языке. Ты полностью отвечаешь за то, чтобы работа НЕ раздувалась и не содержала дубликатов.
-
-СТРОГИЕ ТЕХНИЧЕСКИЕ РАМКИ (ЗАЩИТА ОТ ПЕРЕГЕНЕРАЦИИ):
-1. Заказано страниц: {pages}. Лимит на ВВЕДЕНИЕ: СТРОГО {intro_chars} знаков.
-2. Запрет на дублирование: НЕ выводи «ВВЕДЕНИЕ» внутри текста. Пиши СРАЗУ текст.
-3. Запрет на пустышки: Под заголовком — только плотный текст.
-
-ДИСЦИПЛИНАРНАЯ ПРИВЯЗКА: Дисциплина «{subject}», тема «{topic}». Пиши строго языком этой науки.
-
-Напиши вступление: обозначь проблему, актуальность, цель и подход. 
-Минимум 6-8 полных абзацев реального содержания с анализом и примерами.
-Начинай СРАЗУ с первого предложения. ГОСТ-ссылки [1], [2].
-НЕ заканчивай на полуслове. Только чистый текст, без Markdown, без мета."""
-
-        main1_prompt = f"""Ты — изолированный, автономный модуль генерации и жесткого контроля объема академических текстов на русском языке. Ты полностью отвечаешь за то, чтобы работа НЕ раздувалась и не содержала дубликатов.
-
-СТРОГИЕ ТЕХНИЧЕСКИЕ РАМКИ:
-1. Заказано страниц: {pages}. Лимит на ПЕРВЫЙ АРГУМЕНТ: СТРОГО {main_chars} знаков.
-2. Запрет на дублирование: НЕ выводи «Аргумент 1» или «ОСНОВНАЯ ЧАСТЬ» внутри текста. Пиши СРАЗУ текст.
-3. Запрет на пустышки: Только реальный плотный текст под заголовком.
-
-ДИСЦИПЛИНАРНАЯ ПРИВЯЗКА: Тема «{topic}», дисциплина «{subject}». Только научные факты и анализ этой дисциплины.
-
-Это ПЕРВЫЙ АРГУМЕНТ (в поддержку). Пиши от первого лица.
-Конкретные факты, мнения учёных, примеры, глубокий анализ.
-Минимум 8-10 развёрнутых абзацев. Начинай сразу с содержательного предложения.
-ГОСТ-ссылки каждые 1-2 абзаца. Не обрывай мысль. Только чистый текст."""
-
-        main2_prompt = f"""Ты — изолированный, автономный модуль генерации и жесткого контроля объема академических текстов на русском языке. Ты полностью отвечаешь за то, чтобы работа НЕ раздувалась и не содержала дубликатов.
-
-СТРОГИЕ ТЕХНИЧЕСКИЕ РАМКИ:
-1. Заказано страниц: {pages}. Лимит на ВТОРОЙ АРГУМЕНТ (контраргумент и опровержение): СТРОГО {main_chars} знаков.
-2. Запрет на дублирование: НЕ выводи «Аргумент 2» или заголовки внутри текста.
-3. Сразу начинай с реального текста контраргумента.
-
-ДИСЦИПЛИНАРНАЯ ПРИВЯЗКА: Тема «{topic}», дисциплина «{subject}».
-
-Это ВТОРОЙ АРГУМЕНТ С КОНТРАРГУМЕНТОМ И ОПРОВЕРЖЕНИЕМ.
-Сначала изложи противоположную точку зрения, затем опровергни её конкретными фактами, примерами, анализом.
-Минимум 8-10 абзацев. Начинай сразу с текста. Ссылки [1], [2]. Только чистый текст."""
+        intro_chars = max(intro_min, int(total * 0.20))
+        main_chars = max(main_min, int(total * 0.28))
 
         return {
-            "intro":      strict_prompt(intro_prompt, intro_chars, writing_style, doc_type),
-            "main1":      strict_prompt(main1_prompt, main_chars, writing_style, doc_type),
-            "main2":      strict_prompt(main2_prompt, main_chars, writing_style, doc_type),
+            "intro":      strict_prompt(
+                f"Напиши вступление эссе на тему «{topic}», предмет «{subject}».{ctx}"
+                f"Обозначь проблему, её актуальность, цель и подход автора.",
+                intro_chars,
+                writing_style, doc_type,
+            ),
+            "main1":      strict_prompt(
+                f"Напиши первый аргумент в эссе «{topic}». "
+                f"Приведи конкретные факты, мнения учёных и доказательства. "
+                f"Пиши развёрнуто, минимум 3-4 абзаца.",
+                main_chars,
+                writing_style, doc_type,
+            ),
+            "main2":      strict_prompt(
+                f"Напиши второй аргумент в эссе «{topic}» с контраргументом. "
+                f"Рассмотри противоположную точку зрения и опровергни её. "
+                f"Пиши развёрнуто, минимум 3-4 абзаца.",
+                main_chars,
+                writing_style, doc_type,
+            ),
             "literature": (
                 f"Составь список из 3–5 источников по теме «{topic}» "
                 f"строго по ГОСТ Р 7.0.5-2008. "
@@ -1372,17 +1239,17 @@ def build_prompts(
             f"Напиши ПОЛНЫЙ текст подглавы «{sub_title}».\n"
             f"Глава: «{ch_title}».\n"
             f"Тема всей работы: «{topic}».\n"
-            f"Это отдельная подглава — пиши её как ЗАВЕРШЁННЫЙ смысловой блок с реальным содержанием.\n"
-            f"ОБЯЗАТЕЛЬНО: минимум 6–9 развёрнутых абзацев (минимум 800–950 знаков РЕАЛЬНОГО оригинального текста ПОД этим заголовком — НЕ только название подглавы, НЕ заголовок внутри текста, НЕ общие фразы).\n"
-            f"Начинай текст СРАЗУ после заголовка подглавы содержательным абзацем с анализом, примерами, фактами, статистикой.\n"
-            f"Используй терминологию дисциплины, ссылки [1], [2, с. XX] (минимум 3).\n"
-            f"Закончи полной мыслью. Пиши конкретно и глубоко по теме.",
+            f"Это отдельная подглава — пиши её как завершённый смысловой блок.\n"
+            f"Начни с заголовка подглавы '{sub_title}' на отдельной строке, "
+            f"затем идёт содержательный текст (минимум 3–4 развёрнутых абзаца).\n"
+            f"Используй ссылки на источники в формате [1, с. 45] или [3] — "
+            f"минимум 2–3 ссылки на источники в этой подглаве.",
             sub_chars,
             writing_style, doc_type,
         )
 
     # Заключение НЕ включаем в batch — оно генерируется ПОСЛЕ всех глав
-    # Заключение НЕ включаем в batch — оно генерируется ПОСЛЕ всех глав
+    # (см. generate_text_blocks)
 
     # Библиография
     num_sources = 12 if pages <= 20 else 20
@@ -1511,16 +1378,13 @@ def _clean_ai_artifacts(text: str) -> str:
 
 
 PAGE_CALC_PROMPT = """
-ТЫ ДОЛЖЕН СЛЕДОВАТЬ ЭТИМ ПРАВИЛАМ СТРОГО:
+ТЫ ДОЛЖЕН СЛЕДОВАТЬ ЭТИМ ПРАВИЛАМ:
 
-1. 1 страница = ~1750-1850 знаков с пробелами реального текста.
-2. Для эссе на N страниц основной текст (без титула и содержания) должен быть ~ N*1700 знаков.
-3. КАЖДЫЙ АРГУМЕНТ (main1, main2) — минимум 900-1200 знаков РЕАЛЬНОГО СОДЕРЖАНИЯ: 7-10 развёрнутых абзацев с фактами, примерами, анализом. НЕ только заголовок! НЕ общие слова!
-4. Введение: 1200-1600 знаков реального текста.
-5. Заключение: 900-1200 знаков.
-6. ЗАПРЕЩЕНО: служебные фразы «Вступление к эссе», «Конечно. Вот второй аргумент», «Вот текст», «Объем текста строго выдержан», «Я как модель».
-7. Начинай СРАЗУ с содержательного абзаца. Пиши конкретно, с примерами по теме, анализом, ссылками [1], [2]. Никаких заголовков внутри текста.
-8. Если не хватает объёма — продолжай логично, добавляя новые мысли, факты, а не повторяя.
+1. 1 страница = 1850 знаков с пробелами.
+2. 5 страниц эссе = 7400 знаков основного текста (титул и содержание не в счёт).
+3. Аргумент 1: 2000 знаков. Аргумент 2: 2000 знаков. Введение: 1400 знаков. Заключение: 1000 знаков.
+4. ЗАПРЕЩЕНО писать: «Вступление к эссе», «Конечно. Вот второй аргумент», «Вот текст», «Объем текста строго выдержан».
+5. Начинай писать СРАЗУ содержательный текст, без служебных фраз и заголовков-пояснений.
 """
 async def generate_text_blocks(
     topic: str,
@@ -1538,7 +1402,7 @@ async def generate_text_blocks(
     Если текст получился короче цели — дозаполняет до нужного объёма.
     """
     prompts    = build_prompts(doc_type, topic, subject, pages, source, chapter_titles, writing_style)
-    total_chars = target_chars(pages, doc_type)
+    total_chars = target_chars(pages)
     # "conclusion" больше НЕ в prompts — генерируем его отдельно после глав
     num_blocks = max(1, len(prompts))
 
@@ -1612,22 +1476,16 @@ async def generate_text_blocks(
     for key, prompt in prompts.items():
         step += 1
 
-        # Рассчитываем целевой объём для блока (исправлено для эссе/доклад/статья, чтобы не было переполнения)
+        # Рассчитываем целевой объём для блока
         if key == "intro":
-            block_share = 0.15 if doc_type == "esse" else 0.12
-        elif key == "conclusion":
-            block_share = 0.12 if doc_type == "esse" else 0.10
-        elif key == "literature":
-            block_share = 0.03
-        elif key == "main1" or key == "main2":
-            block_share = 0.32  # для эссе, ~1/3 каждый
-        elif key == "part1" or key == "part2":
-            block_share = 0.35
-        elif key.startswith("ch"):
-            num_ch = max(1, len([k for k in prompts if k.startswith("ch")]))
-            block_share = 0.72 / num_ch
-        else:
             block_share = 0.10
+        elif key == "conclusion":
+            block_share = 0.08
+        elif key == "literature":
+            block_share = 0.0
+        else:
+            num_ch = max(1, len([k for k in prompts if k.startswith("ch")]))
+            block_share = 0.75 / num_ch
 
         block_chars = int(total_chars * block_share) if block_share > 0 else 0
         max_tok     = tokens_for_chars(block_chars) if block_chars > 0 else 1500
@@ -1663,31 +1521,6 @@ async def generate_text_blocks(
 
         text = _clean_ai_artifacts(text)
 
-        # ── ЖЁСТКАЯ ЗАЩИТА ОТ "ТОЛЬКО ШАБЛОН / ЗАГОЛОВКИ БЕЗ ТЕЛА" ──
-        # Если текст короткий, содержит заголовки или выглядит как шаблон — сразу перегенерируем по строгому шаблону
-        body_keys = ["intro", "main1", "main2", "part1", "part2", "conclusion"] + [k for k in prompts if k.startswith("ch")]
-        if key in body_keys:
-            # Strip any accidental headings from AI output
-            text = re.sub(r'^(ВВЕДЕНИЕ|ОСНОВНАЯ ЧАСТЬ|ЗАКЛЮЧЕНИЕ|Аргумент \d|Глава \d|Подглава).*?\n', '', text, flags=re.IGNORECASE | re.MULTILINE).strip()
-            min_for_key = 700 if key in ("intro", "conclusion") else 900
-            if len(text.strip()) < min_for_key or any(h in text.upper()[:100] for h in ["ВВЕДЕНИЕ", "АРГУМЕНТ", "ГЛАВА", "ПОДГЛАВА"]):
-                print(f"[FORCE BODY] {key} выглядит как шаблон или слишком коротко — применяем строгий промпт пользователя")
-                est = min_for_key / 1800.0
-                strict_p = _build_strict_expansion_prompt(
-                    topic=topic, subject=subject, title=key, tail=text[-400:],
-                    need=min_for_key, block_chars=min_for_key, pages=pages, doc_type=doc_type
-                )
-                try:
-                    forced, _ = await chat_with_fallback(model_key, [
-                        {"role": "system", "content": style_sys},
-                        {"role": "user", "content": strict_p}
-                    ], tokens_for_chars(min_for_key * 2))
-                    if forced and len(forced.strip()) > 200:
-                        text = _clean_ai_artifacts(forced)
-                        print(f"[FORCE BODY] Успешно перегенерировано для {key}")
-                except Exception as e:
-                    print(f"[FORCE BODY] Ошибка принудительной генерации для {key}: {e}")
-
         # ── ЗАЩИТА ОТ СЛУЖЕБНЫХ ФРАЗ И КОРОТКИХ ОТВЕТОВ ──
         forbidden_patterns = [
             "вступление к эссе",
@@ -1707,7 +1540,7 @@ async def generate_text_blocks(
             print(f"[WARN] Блок {key} содержит служебную фразу или слишком короткий ({len(text)} знаков). Перегенерация...")
             
             # Усиленный промпт для перегенерации
-            retry_prompt = prompt + f"\n\nВАЖНО: Напиши ПОЛНОЦЕННЫЙ текст по теме «{topic}» (дисциплина «{subject}»). Без служебных фраз, без заголовков внутри, начинай СРАЗУ с содержательного абзаца. Минимум 900-1200 знаков реального анализа, примеров и фактов (НЕ только название!). Пиши развёрнуто, конкретно."
+            retry_prompt = prompt + "\n\nВАЖНО: Напиши полноценный текст без служебных фраз. Не пиши «Вступление», «Конечно», «Вот текст». Начинай сразу с содержания. Минимум 800 знаков."
             retry_messages = [
                 {"role": "system", "content": style_sys},
                 {"role": "user", "content": retry_prompt},
@@ -1727,23 +1560,11 @@ async def generate_text_blocks(
             while len(text) < int(block_chars * 0.9) and refill_count < max_refills:
                 extra_chars = block_chars - len(text)
                 ext_tok     = tokens_for_chars(extra_chars)
-                # Усиленный дозаполняющий промпт с учётом жанра и блока
-                is_esse = (doc_type == "esse")
-                block_label = {
-                    "main1": "первый аргумент",
-                    "main2": "второй аргумент (с контраргументом)",
-                    "intro": "введение",
-                    "part1": "раздел 1",
-                    "part2": "раздел 2",
-                }.get(key, key)
                 extra_prompt = (
-                    f"Тема: «{topic}». Дисциплина: «{subject}». Блок: {block_label} (ключ {key}).\n"
-                    f"Продолжи и дополни текст. Добавь минимум {extra_chars} знаков реального содержания.\n"
-                    f"{'Пиши от первого лица, живо, с личной позицией, конкретными примерами по теме.' if is_esse else 'Пиши академически, с анализом, фактами, примерами, ссылками [1], [2].'}\n"
-                    f"Минимум 3-5 новых полных абзацев. Без заголовков, без markdown, без служебных фраз. "
-                    f"Начинай сразу с логического продолжения предыдущей мысли.\n\n"
-                    f"Хвост уже написанного:\n{text[-700:]}\n\n"
-                    f"Пиши только продолжение текста."
+                    f"Продолжи и дополни следующий академический текст по теме «{topic}». "
+                    f"Добавь ещё минимум {extra_chars} знаков. "
+                    f"Пиши плавно, без заголовков, без [1] [2], без **, без ##:\n\n"
+                    f"{text[-600:]}"
                 )
                 ext_messages = [
                     {"role": "system", "content": style_sys},
@@ -1762,65 +1583,7 @@ async def generate_text_blocks(
         if prog:
             await prog.update(step_done=True)
 
-
-    # (универсальная гарантия тела вызывается ниже через _enforce_real_body)
-    # Диагностика содержимого (чтобы отловить "только названия")
-    if doc_type == "esse":
-        for kk in ["main1", "main2", "intro", "conclusion"]:
-            ln = len(parts.get(kk, "").strip())
-            print(f"[DIAG] {kk} len={ln} chars" + (" ⚠️ коротко!" if ln < 600 else ""))
-    
     # ═══════════════════════════════════════════════════════════
-    # ЖЁСТКАЯ ГАРАНТИЯ РЕАЛЬНОГО ТЕЛА ДЛЯ ЭССЕ (чтобы не было "только сверху заголовки")
-    # Если после основной генерации main1/main2/intro/conclusion короткие или шаблонные — 
-    # принудительно генерируем по последнему строгому шаблону пользователя с реальным объёмом.
-    # ═══════════════════════════════════════════════════════════
-    if doc_type == "esse":
-        for k in ["intro", "main1", "main2", "conclusion"]:
-            if k not in parts:
-                continue
-            txt = parts[k].strip()
-            min_len = 900 if k in ["main1", "main2"] else 700
-            # Проверка на "шаблон": коротко или содержит слова-заголовки
-            is_template = len(txt) < min_len or any(h in txt.upper()[:150] for h in ["ВВЕДЕНИЕ", "ОСНОВНАЯ ЧАСТЬ", "ЗАКЛЮЧЕНИЕ", "АРГУМЕНТ 1", "АРГУМЕНТ 2"])
-            if is_template:
-                print(f"[FORCE REAL BODY] {k} = только шаблон/пусто ({len(txt)} знаков) — принудительная генерация по строгому промпту")
-                need = min_len
-                est_p = need / 1800.0
-                strict_user = _build_strict_expansion_prompt(
-                    topic=topic,
-                    subject=subject,
-                    title=k,
-                    tail=txt[-500:] if txt else "",
-                    need=need,
-                    block_chars=need,
-                    pages=pages,
-                    doc_type=doc_type
-                )
-                try:
-                    new_text, _ = await chat_with_fallback(
-                        model_key,
-                        [
-                            {"role": "system", "content": style_sys},
-                            {"role": "user", "content": strict_user}
-                        ],
-                        tokens_for_chars(need * 2)
-                    )
-                    if new_text and len(new_text.strip()) > 300:
-                        parts[k] = _clean_ai_artifacts(new_text)
-                        print(f"[FORCE REAL BODY] {k} успешно перегенерировано: {len(parts[k])} знаков")
-                    else:
-                        # Последний fallback — качественный контент
-                        parts[k] = txt + " " + f"В контексте темы «{topic}» и дисциплины «{subject}» этот раздел раскрывает ключевые аспекты проблемы через научный анализ и конкретные примеры."
-                        while len(parts[k]) < min_len:
-                            parts[k] += " Анализ показывает важность учёта данного фактора для понимания общей картины."
-                except Exception as e:
-                    print(f"[FORCE REAL BODY] Ошибка для {k}: {e}")
-                    parts[k] = "В рамках исследования темы «{topic}» в дисциплине «{subject}» данный аспект имеет существенное значение, подтверждённое анализом доступных данных и мнений специалистов.".replace("{topic}", topic).replace("{subject}", subject)
-                    while len(parts[k]) < min_len:
-                        parts[k] += " Конкретные наблюдения демонстрируют необходимость глубокого рассмотрения проблемы."
-
-# ═══════════════════════════════════════════════════════════
     # ГЕНЕРАЦИЯ ЗАКЛЮЧЕНИЯ ПОСЛЕ ВСЕХ ГЛАВ
     # (ключевое исправление: заключение видит реальное содержание)
     # ═══════════════════════════════════════════════════════════
@@ -1854,7 +1617,7 @@ async def generate_text_blocks(
         f"Текст по теме «{topic}» был сгенерирован."
     )
 
-    conc_chars = int(total_chars * (0.12 if doc_type == "esse" else 0.10))
+    conc_chars = int(total_chars * 0.10)
 
     # ── Жанрово-зависимый промпт заключения ──
     if doc_type == "esse":
@@ -1926,15 +1689,32 @@ async def generate_text_blocks(
     conc_text = _clean_ai_artifacts(conc_text)
     parts["conclusion"] = conc_text
 
-    # Гарантия тела для заключения (если короткое после генерации)
-    # (old conclusion enforcement removed - now in _enforce_real_body)
+    if prog:
+        await prog.update(step_done=True)
+
+    # ═══════════════════════════════════════════════════════════
+    # СВЯЗЫВАНИЕ ССЫЛОК СО СПИСКОМ ЛИТЕРАТУРЫ (приоритет 🔴)
+    # Приводим все внутритекстовые [N, с. X] к диапазону 1..кол-во источников,
+    # чтобы каждая ссылка указывала на реально существующий пункт списка.
+    # ═══════════════════════════════════════════════════════════
+    n_sources = _count_sources(parts.get("literature", ""))
+    if n_sources > 0:
+        for key in list(parts.keys()):
+            if key == "literature":
+                continue
+            parts[key] = _fix_citations(parts[key], n_sources)
+
+    return parts
 
 
-# ═══════════════════════════════════════════════════════════
-# УНИВЕРСАЛЬНАЯ ГАРАНТИЯ РЕАЛЬНОГО ТЕЛА ПОД КАЖДЫМ ЗАГОЛОВКОМ
-# (идеальная функция: для всех типов документов, всех блоков и подглав)
-# Использует ИИ-расширение в приоритете + качественный topic-specific контент
-# ═══════════════════════════════════════════════════════════
+def _stub_text(key: str, topic: str) -> str:
+    """Заглушка если ИИ не ответил."""
+    stubs = {
+        "intro":       f"Данная работа посвящена исследованию темы «{topic}». В современных условиях данная проблематика приобретает особую актуальность и практическую значимость для науки и общества.",
+        "conclusion":  f"Проведённое исследование по теме «{topic}» позволило сформулировать следующие выводы: изученная проблематика имеет важное теоретическое и практическое значение.",
+        "literature":  f"1. Иванов А.А. {topic} / А.А. Иванов. — М.: Наука, 2023. — 256 с.\n2. Петров Б.Б. Основы исследования. — СПб.: Питер, 2022. — 312 с.",
+    }
+    return stubs.get(key, f"Текст раздела по теме «{topic}» временно недоступен. Повторите генерацию.")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -2410,171 +2190,6 @@ def add_paragraphs_from_text(
             _set_run_font(r, font, size, False)
 
 
-
-
-async def _enforce_real_body(
-    parts: dict[str, str],
-    doc_type: str,
-    topic: str,
-    subject: str,
-    model_key: str,
-    style_sys: str,
-    chapter_titles: list[dict] = None,
-    pages: int = 10,
-) -> dict[str, str]:
-    """
-    Идеальная функция гарантии: под КАЖДЫМ заголовком (Введение, Аргумент, Глава, Подглава, Заключение)
-    будет минимум реального содержательного текста (700-950+ знаков, 5-8+ абзацев).
-    Никогда не оставляет "только название".
-    """
-    if not isinstance(parts, dict):
-        parts = {}
-    MIN_BODY = {
-        "intro": 750,
-        "conclusion": 750,
-        "main1": 950,
-        "main2": 950,
-        "part1": 900,
-        "part2": 900,
-        "default_ch": 800,   # для ch*_s* и обычных глав
-        "default": 700,
-    }
-
-    async def _expand_one(key: str, current: str, min_c: int, label: str) -> str:
-        if len(current.strip()) >= min_c:
-            return current
-        need = min_c - len(current.strip())
-        print(f"[ENFORCE] {key} ({label}) короткий ({len(current)} < {min_c}) — расширяем идеально")
-        expand_prompt = f"""Тема работы: «{topic}». Дисциплина: «{subject}».
-Это текст для блока «{label}» (ключ {key}).
-
-ЗАДАЧА (выполняй идеально):
-Напиши минимум {need} знаков РЕАЛЬНОГО оригинального содержательного текста.
-Минимум 5–8 полных развёрнутых абзацев с:
-- конкретными фактами, примерами, статистикой, случаями
-- анализом, рассуждениями, выводами
-- ссылками на источники в формате [1], [2, с. 45] (минимум 2-3 ссылки)
-- терминологией дисциплины «{subject}»
-
-Пиши строго по теме. Начинай текст СРАЗУ с первого абзаца содержания — без заголовков, без «Это текст для...», без служебных фраз.
-Продолжай логично от уже написанного (если есть).
-
-Уже написано (хвост для продолжения):
-{current[-600:] if current else 'Начало блока.'}
-
-Напиши только продолжение/новый текст, без повторов заголовка."""
-        try:
-            extra, _ = await chat_with_fallback(
-                model_key,
-                [
-                    {"role": "system", "content": style_sys},
-                    {"role": "user", "content": expand_prompt},
-                ],
-                tokens_for_chars(need * 2 + 800),
-            )
-            if extra and len(extra.strip()) > 100:
-                extra = _clean_ai_artifacts(extra)
-                return (current.rstrip() + "\n\n" + extra.strip()).strip()
-        except Exception as e:
-            print(f"[ENFORCE] ИИ-расширение не удалось для {key}: {e}")
-
-        # Качественный topic-specific filler (несколько осмысленных предложений, не одно слово)
-        base = f" В рамках темы «{topic}» и дисциплины «{subject}» данный аспект имеет ключевое значение. "
-        fillers = [
-            base + "Конкретные примеры из практики и исследований показывают, что проблема проявляется именно так, как описано в современных источниках.",
-            base + "Анализ доступных данных и мнений специалистов позволяет сделать вывод о необходимости более глубокого рассмотрения этого вопроса.",
-            base + "Реальные кейсы и статистические показатели подтверждают важность учёта данного фактора при изучении общей проблемы.",
-        ]
-        result = current
-        i = 0
-        while len(result) < min_c:
-            result += " " + fillers[i % len(fillers)]
-            i += 1
-        return result.strip()
-
-    # 1. Основные блоки
-    for key in list(parts.keys()):
-        if key == "literature":
-            continue
-        if key in ("intro", "conclusion", "main1", "main2", "part1", "part2"):
-            min_c = MIN_BODY.get(key, 700)
-            label = key.replace("main", "Аргумент ").replace("part", "Раздел ")
-            parts[key] = await _expand_one(key, parts.get(key, ""), min_c, label)
-        elif key.startswith("ch"):
-            min_c = MIN_BODY["default_ch"]
-            label = key.replace("ch", "Глава ").replace("_s", ", подглава ")
-            parts[key] = await _expand_one(key, parts.get(key, ""), min_c, label)
-
-    # 2. Подглавы из chapter_titles (если они не в parts как ch*_s*, но должны быть)
-    chapter_titles = chapter_titles or []
-    if chapter_titles:
-        for i, ch in enumerate(chapter_titles, 1):
-            if not isinstance(ch, dict):
-                continue
-            subs = ch.get("subs", []) or []
-            for j, sub_title in enumerate(subs, 1):
-                k = f"ch{i}_s{j}"
-                if k not in parts or not parts.get(k, "").strip():
-                    min_c = MIN_BODY["default_ch"]
-                    parts[k] = await _expand_one(k, "", min_c, f"Подглава «{sub_title}» главы {i}")
-
-    # 3. Для эссе — специально main1/main2 (уже покрыто выше, но на всякий случай)
-    if doc_type == "esse":
-        for k in ["main1", "main2"]:
-            if k in parts:
-                parts[k] = await _expand_one(k, parts[k], MIN_BODY[k], k)
-
-    # Финальная диагностика
-    for k, txt in parts.items():
-        if k == "literature":
-            continue
-        ln = len(txt.strip())
-        if ln < 500:
-            print(f"[ENFORCE FINAL] {k} всё ещё короткий ({ln} знаков) — возможно, проблема в модели")
-
-    return parts
-
-    if prog:
-        await prog.update(step_done=True)
-
-
-    # ═══════════════════════════════════════════════════════════
-    # ИДЕАЛЬНАЯ ГАРАНТИЯ: под каждым заголовком — реальное тело
-    # Вызываем универсальную функцию после всей генерации (включая заключение)
-    # ═══════════════════════════════════════════════════════════
-    chapter_titles = chapter_titles or []
-    if not isinstance(parts, dict):
-        parts = {}
-    chapter_titles = chapter_titles or []
-    parts = await _enforce_real_body(
-        parts, doc_type, topic, subject, model_key, style_sys, chapter_titles, pages=pages
-    )
-
-    # ═══════════════════════════════════════════════════════════
-    # СВЯЗЫВАНИЕ ССЫЛОК СО СПИСКОМ ЛИТЕРАТУРЫ (приоритет 🔴)
-    # Приводим все внутритекстовые [N, с. X] к диапазону 1..кол-во источников,
-    # чтобы каждая ссылка указывала на реально существующий пункт списка.
-    # ═══════════════════════════════════════════════════════════
-    n_sources = _count_sources(parts.get("literature", ""))
-    if n_sources > 0:
-        for key in list(parts.keys()):
-            if key == "literature":
-                continue
-            parts[key] = _fix_citations(parts[key], n_sources)
-
-    return parts
-
-
-def _stub_text(key: str, topic: str) -> str:
-    """Заглушка если ИИ не ответил."""
-    stubs = {
-        "intro":       f"Данная работа посвящена исследованию темы «{topic}». В современных условиях данная проблематика приобретает особую актуальность и практическую значимость для науки и общества.",
-        "conclusion":  f"Проведённое исследование по теме «{topic}» позволило сформулировать следующие выводы: изученная проблематика имеет важное теоретическое и практическое значение.",
-        "literature":  f"1. Иванов А.А. {topic} / А.А. Иванов. — М.: Наука, 2023. — 256 с.\n2. Петров Б.Б. Основы исследования. — СПб.: Питер, 2022. — 312 с.",
-    }
-    return stubs.get(key, f"Текст раздела по теме «{topic}» временно недоступен. Повторите генерацию.")
-
-
 def build_docx_bytes(
     data: dict,
     blocks: list[tuple],
@@ -2615,9 +2230,6 @@ def build_docx_bytes(
 
     # ── Тело документа ──
     last_idx = len(blocks) - 1
-    doc_type = (data or {}).get("doc_type", "referat")
-    target_p = int((data or {}).get("pages", 10))
-
     for idx, (title, level, text, subblocks) in enumerate(blocks):
         # Заголовок главы. Все заголовки 1-го уровня — единый размер (ошибка #4),
         # единые интервалы задаёт стиль Heading (ошибки #2, #8).
@@ -2634,8 +2246,6 @@ def build_docx_bytes(
         if subblocks:
             # Есть подблоки — выводим их с заголовком Heading 2 и текстом
             for sub_title, sub_text in subblocks:
-                if not sub_title or not sub_title.strip():
-                    continue  # защита от пустых заголовков подглав
                 shp = doc.add_paragraph(sub_title, style="Heading 2")
                 for run in shp.runs:
                     _set_run_font(run, fn, fs, True)
@@ -2672,15 +2282,8 @@ def build_docx_bytes(
             add_paragraphs_from_text(doc, clean_text, gost, is_bib=is_bib)
 
         # Разрыв страницы между главами/разделами (кроме последнего)
-        # Для эссе малого объёма (≤12 стр) — минимальные разрывы, чтобы не раздувать страницы
-        # (структура сохранена: титул, СОДЕРЖАНИЕ, ВВЕДЕНИЕ+ОСНОВНАЯ ЧАСТЬ вместе, ЗАКЛЮЧЕНИЕ, СПИСОК)
         if idx < last_idx:
-            add_pb = True
-            if doc_type == "esse" and target_p <= 12:
-                if "ВВЕДЕНИЕ" in (title or "").upper():
-                    add_pb = False  # не разрываем после введения — main продолжит на той же странице
-            if add_pb:
-                doc.add_page_break()
+            doc.add_page_break()
 
     buf = io.BytesIO()
     doc.save(buf)
@@ -2689,9 +2292,6 @@ def build_docx_bytes(
 
 def libreoffice_update_docx(in_path: str, out_path: str) -> bool:
     """Прогоняет через LibreOffice чтобы обновить TOC и поля страниц."""
-    if not in_path or not os.path.exists(in_path):
-        print("[LO] Входной файл не существует")
-        return False
     soffice = shutil.which("soffice")
     if not soffice:
         return False
@@ -2742,256 +2342,339 @@ def libreoffice_update_docx(in_path: str, out_path: str) -> bool:
 
 
 # ═══════════════════════════════════════════════════════════════
+#  ТОЧНЫЙ ПОДСЧЁТ СТРАНИЦ DOCX ЧЕРЕЗ LIBREOFFICE → PDF
 # ═══════════════════════════════════════════════════════════════
-#  ULTIMATE SELF-CALIBRATING PAGE FORCER (v4.2)
+
 # ═══════════════════════════════════════════════════════════════
-
-import hashlib
-
-# Символов на страницу (ГОСТ: ~1800 знаков с пробелами на стр A4 14pt 1.5 интервал)
-
-
-# ─── НЕЙРО-КАЛИБРОВКА (обучается на каждом прогоне) ───
-@dataclass
-class NeuroCalibration:
-    chars_per_page: float = 1750.0
-    char_width_factor: float = 0.45
-    line_spacing_override: float = 1.5
-    non_text_penalty: int = 2
-    learning_rate: float = 0.15
-    history: List[Tuple[int, int]] = field(default_factory=list)
-    
-    def learn(self, predicted_chars: int, actual_pages: int, target_pages: int):
-        error = actual_pages - target_pages
-        self.history.append((predicted_chars, actual_pages))
-        if len(self.history) > 20:
-            self.history.pop(0)
-        self.chars_per_page *= (1.0 - self.learning_rate * (error / max(1, target_pages)))
-        self.chars_per_page = max(1200, min(1900, self.chars_per_page))
-        try:
-            with open("neuro_calib.json", "w", encoding="utf-8") as f:
-                json.dump({"cpp": self.chars_per_page, "cwf": self.char_width_factor, 
-                           "ls": self.line_spacing_override, "ntp": self.non_text_penalty}, f)
-        except Exception as e:
-            print(f"[NEURO] Ошибка сохранения калибровки: {e}")
+#  УЛУЧШЕННЫЙ СЕРВИС ПОДСЧЁТА СТРАНИЦ ДЛЯ ГОСТ-АССИСТЕНТА
+# ═══════════════════════════════════════════════════════════════
 
 try:
-    with open("neuro_calib.json", "r", encoding="utf-8") as f:
-        cal_data = json.load(f)
-        NEURO = NeuroCalibration(
-            chars_per_page=cal_data.get("cpp", 1550.0),
-            char_width_factor=cal_data.get("cwf", 0.45),
-            line_spacing_override=cal_data.get("ls", 1.5),
-            non_text_penalty=cal_data.get("ntp", 2)
-        )
-except Exception:
-    NEURO = NeuroCalibration()
-
-
-# ─── ВЫСОКОТОЧНЫЙ ЗАМЕР СТРАНИЦ ЧЕРЕЗ LIBREOFFICE ───
-async def measure_pages_async(docx_path: str, work_dir: str, timeout: int = 30) -> Optional[int]:
-    """Профессиональный подсчёт страниц: LibreOffice → PDF + тройной надёжный счётчик.
-
-    1. PyMuPDF (fitz) — лучший для реального рендеринга страниц (учитывает всё).
-    2. pypdf.PdfReader — стандартный, очень надёжный.
-    3. Улучшенный crude (только если оба выше упали).
-    Возвращает точное число страниц по финальному PDF.
-    """
-    if not docx_path or not os.path.exists(docx_path):
-        print("[MEASURE] Входной DOCX не существует")
-        return None
-
-    if not shutil.which("soffice"):
-        return estimate_docx_pages_ultra(docx_path)
-
-    pdf_path = os.path.join(work_dir, f"_pagecheck_{hashlib.md5(docx_path.encode()).hexdigest()[:8]}.pdf")
+    from pypdf import PdfReader
+except ImportError:
     try:
-        proc = await asyncio.wait_for(
-            asyncio.create_subprocess_exec(
-                "soffice", "--headless", "--norestore", "--convert-to", "pdf",
-                "--outdir", work_dir, docx_path,
-                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
-            ), timeout=timeout
+        from PyPDF2 import PdfReader
+    except ImportError:
+        PdfReader = None
+
+try:
+    import fitz  # PyMuPDF — лучший парсер PDF
+except ImportError:
+    fitz = None
+
+
+# Символов на страницу (ГОСТ: ~1800 знаков с пробелами на стр A4 14pt 1.5 интервал)
+CHARS_PER_PAGE = int(cfg("CHARS_PER_PAGE", "1800"))  # ИСПРАВЛЕНО: 1850 → 1800
+
+# Страниц без текста (титул + содержание)
+NON_TEXT_PAGES = int(cfg("NON_TEXT_PAGES", "2"))
+
+# Калибровочный множитель (ИСПРАВЛЕНО: 1.10 → 1.00)
+_ESTIM_CALIBRATION = 1.00
+
+
+def target_chars(pages: int) -> int:
+    """
+    Целевое количество символов ДЛЯ ОСНОВНОГО ТЕКСТА (без титула и содержания)
+    """
+    text_pages = max(1, pages - NON_TEXT_PAGES)
+    return text_pages * CHARS_PER_PAGE
+
+
+def target_pages_from_chars(chars: int) -> int:
+    """Возвращает количество страниц по количеству символов"""
+    text_pages = max(1, chars // CHARS_PER_PAGE)
+    return text_pages + NON_TEXT_PAGES
+
+
+class ImprovedPageCounter:
+    pass
+
+class PageAdapter:
+    pass
+
+# ═══════════════════════════════════════════════════════════════
+#  ПОДСЧЁТ СТРАНИЦ ЧЕРЕЗ LIBREOFFICE → PDF
+# ═══════════════════════════════════════════════════════════════
+
+def libreoffice_docx_to_pdf(in_path: str, out_dir: str) -> Optional[str]:
+    """Конвертирует DOCX в PDF через LibreOffice. Возвращает путь к PDF или None."""
+    soffice = shutil.which("soffice")
+    if not soffice:
+        return None
+    os.makedirs(out_dir, exist_ok=True)
+    try:
+        p = subprocess.run(
+            [
+                soffice, "--headless", "--nologo", "--nolockcheck",
+                "--nodefault", "--nofirststartwizard",
+                "--convert-to", "pdf", "--outdir", out_dir, in_path,
+            ],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=180,
         )
-        await proc.wait()
-
-        if not os.path.exists(pdf_path):
-            alt = docx_path.replace(".docx", ".pdf")
-            if os.path.exists(alt):
-                pdf_path = alt
-            else:
-                return estimate_docx_pages_ultra(docx_path)
-
-        pages = _get_pdf_page_count(pdf_path)
-
-        # Cleanup
-        if os.path.exists(pdf_path):
-            try:
-                os.remove(pdf_path)
-            except Exception:
-                pass
-
-        if pages and pages > 0:
-            return pages
-        return estimate_docx_pages_ultra(docx_path)
-
-    except subprocess.TimeoutExpired:
-        print("[MEASURE] Таймаут конвертации в PDF")
-        return estimate_docx_pages_ultra(docx_path)
+        if p.returncode != 0:
+            print(f"[LO→PDF] Ошибка: {p.stdout[:500]}")
+            return None
+        pdf = os.path.join(out_dir, os.path.splitext(os.path.basename(in_path))[0] + ".pdf")
+        return pdf if os.path.exists(pdf) else None
     except Exception as e:
-        print(f"[MEASURE] Ошибка конвертации/подсчёта: {e}")
-        return estimate_docx_pages_ultra(docx_path)
-
-
-def _get_pdf_page_count(pdf_path: str) -> Optional[int]:
-    """Профессиональный, отказоустойчивый подсчёт страниц PDF (идеально для ГОСТ-документов).
-
-    Приоритет:
-    1. PyMuPDF (fitz) — учитывает реальный layout, таблицы, изображения, шрифты.
-    2. pypdf — чистый подсчёт страниц по объектам.
-    3. Улучшенный crude count (редко используется).
-    """
-    if not pdf_path or not os.path.exists(pdf_path):
+        print(f"[LO→PDF] Исключение: {e}")
         return None
 
-    # 1. PyMuPDF — самый точный (рекомендуется для production)
+
+def count_pdf_pages(pdf_path: str) -> Optional[int]:
+    """Считает страницы PDF. Приоритет: PyMuPDF → PyPDF2 → pdfinfo"""
+    # 1) PyMuPDF (лучший, если установлен)
     try:
+        import fitz
         doc = fitz.open(pdf_path)
-        n = len(doc)
+        pages = len(doc)
         doc.close()
-        if n > 0:
-            print(f"[PAGES] fitz: {n} стр.")
-            return n
+        return pages
+    except ImportError:
+        pass
     except Exception as e:
-        print(f"[PAGES] PyMuPDF error: {e}")
-
-    # 2. pypdf — отличный fallback
+        print(f"[PyMuPDF] Ошибка: {e}")
+    
+    # 2) PyPDF2 / pypdf
     try:
-        reader = PdfReader(pdf_path)
-        n = len(reader.pages)
-        if n > 0:
-            print(f"[PAGES] pypdf: {n} стр.")
-            return n
-    except Exception as e:
-        print(f"[PAGES] pypdf error: {e}")
-
-    # 3. Улучшенный crude (только если библиотеки не сработали)
-    try:
+        from pypdf import PdfReader
         with open(pdf_path, "rb") as f:
-            content = f.read()
-        # Более точный crude: считаем реальные страницы, игнорируя родительские /Pages
-        page_objs = content.count(b"/Type /Page")
-        pages_objs = content.count(b"/Type /Pages")
-        n = max(0, page_objs - pages_objs)
-        if n > 0:
-            print(f"[PAGES] crude: {n} стр.")
-            return n
+            return len(PdfReader(f).pages)
+    except ImportError:
+        pass
     except Exception:
         pass
+    
+    try:
+        from PyPDF2 import PdfReader
+        with open(pdf_path, "rb") as f:
+            return len(PdfReader(f).pages)
+    except ImportError:
+        pass
+    except Exception:
+        pass
+    
+    # 3) pdfinfo (poppler-utils)
+    pdfinfo = shutil.which("pdfinfo")
+    if pdfinfo:
+        try:
+            p = subprocess.run([pdfinfo, pdf_path],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               text=True, timeout=10)
+            for line in p.stdout.splitlines():
+                if line.lower().startswith("pages:"):
+                    return int(line.split(":", 1)[1].strip())
+        except Exception:
+            pass
+    
+    # 4) Грубый подсчёт /Type /Page в сыром PDF
+    try:
+        with open(pdf_path, "rb") as f:
+            blob = f.read()
+        return max(1, blob.count(b"/Type /Page") - blob.count(b"/Type /Pages"))
+    except Exception:
+        return None
 
-    return None
+
+def count_docx_pages(docx_path: str, work_dir: str) -> Optional[int]:
+    """Возвращает реальное число страниц DOCX (через LibreOffice→PDF)."""
+    pdf = libreoffice_docx_to_pdf(docx_path, work_dir)
+    if not pdf:
+        return None
+    try:
+        return count_pdf_pages(pdf)
+    finally:
+        try:
+            os.remove(pdf)
+        except Exception:
+            pass
 
 
-# ─── УЛЬТРА-ТОЧНЫЙ ЭСТИМАТОР С УЧЁТОМ СЛОГОВ ───
-def estimate_docx_pages_ultra(docx_path: str) -> Optional[int]:
-    """Улучшенный fallback-эстиматор страниц для DOCX (когда нет LibreOffice).
+# ═══════════════════════════════════════════════════════════════
+#  РАСЧЁТНЫЙ ЭСТИМАТОР СТРАНИЦ (без внешних зависимостей)
+# ═══════════════════════════════════════════════════════════════
 
-    Профессиональный подход:
-    - Точный расчёт доступной площади страницы по ГОСТ (поля, A4).
-    - Симуляция символов на строку и строк на страницу.
-    - Учёт слогов русского языка (более плотный текст).
-    - Калибровка NEURO + штрафы за таблицы/изображения/нетекстовые страницы.
-    - Используется только как fallback — основной счёт всегда через PDF.
+
+def estimate_docx_pages(docx_path: str) -> Optional[int]:
+    """
+    Эмулирует разбивку DOCX по страницам без внешних инструментов.
+    Учитывает: размер страницы A4, поля, шрифт, межстрочный интервал,
+    отступ красной строки, заголовки, ПРИНУДИТЕЛЬНЫЕ РАЗРЫВЫ СТРАНИЦ.
     """
     try:
-        doc = Document(docx_path)
+        from docx import Document as _D
+        doc = _D(docx_path)
     except Exception as e:
-        print(f"[ESTIM] Ошибка чтения docx: {e}")
+        print(f"[ESTIM] Ошибка чтения DOCX: {e}")
         return None
+
     if not doc.sections:
         return None
     sec = doc.sections[0]
-    
-    def emu2pt(emu):
-        try: return float(emu) / 12700.0
-        except: return 0.0
-    
-    pw = emu2pt(sec.page_width) or 595.0
-    ph = emu2pt(sec.page_height) or 842.0
-    lm = emu2pt(sec.left_margin) or 85.0
-    rm = emu2pt(sec.right_margin) or 42.0
-    tm = emu2pt(sec.top_margin) or 56.0
-    bm = emu2pt(sec.bottom_margin) or 56.0
-    
-    tw = max(50, pw - lm - rm)   # текстовая ширина в pt
-    th = max(50, ph - tm - bm)   # текстовая высота в pt
+
+    def _emu_to_pt(emu) -> float:
+        try:
+            return float(emu) / 12700.0
+        except:
+            return 0.0
+
+    page_w_pt = _emu_to_pt(sec.page_width) or 595.0
+    page_h_pt = _emu_to_pt(sec.page_height) or 842.0
+    left_pt = _emu_to_pt(sec.left_margin) or 85.0
+    right_pt = _emu_to_pt(sec.right_margin) or 42.0
+    top_pt = _emu_to_pt(sec.top_margin) or 56.0
+    bottom_pt = _emu_to_pt(sec.bottom_margin) or 56.0
+
+    text_w_pt = max(50.0, page_w_pt - left_pt - right_pt)
+    text_h_pt = max(50.0, page_h_pt - top_pt - bottom_pt)
+
+    try:
+        normal = doc.styles["Normal"]
+        base_size = float(normal.font.size.pt) if normal.font.size else 14.0
+    except Exception:
+        base_size = 14.0
     
     try:
-        fs = float(doc.styles["Normal"].font.size.pt)
-    except:
-        fs = 14.0
+        line_spacing = float(normal.paragraph_format.line_spacing or 1.5)
+    except Exception:
+        line_spacing = 1.5
+    
+    if line_spacing < 0.5:
+        line_spacing = 1.5
+
+    # Средняя ширина символа Times New Roman (в пунктах)
+    char_width_pt = base_size * 0.42
+    chars_per_line = max(20, int(text_w_pt / char_width_pt))
+    
+    line_height_pt = base_size * line_spacing
+    lines_per_page = max(10, int(text_h_pt / line_height_pt))
+
+    total_chars = 0
+    page_breaks = 0
+
+    for paragraph in doc.paragraphs:
+        text = paragraph.text or ""
+        total_chars += len(text)
+        
+        # Проверяем на page break
+        from docx.oxml.ns import qn
+        for run in paragraph.runs:
+            for br in run._element.iter(qn("w:br")):
+                if br.get(qn("w:type")) == "page":
+                    page_breaks += 1
+                    break
+
+    # Расчёт страниц по символам
+    estimated_by_chars = max(1, int(total_chars / CHARS_PER_PAGE) + NON_TEXT_PAGES)
+    
+    # Расчёт по строкам
+    estimated_lines = max(1, int(total_chars / max(1, chars_per_line)))
+    estimated_by_lines = max(1, (estimated_lines // max(1, lines_per_page)) + 1 + NON_TEXT_PAGES)
+    
+    # Комбинируем
+    estimated = max(estimated_by_chars, estimated_by_lines, page_breaks + NON_TEXT_PAGES)
+    
+    # Применяем калибровку
+    calibrated = int(estimated * _ESTIM_CALIBRATION)
+    
+    return max(1, calibrated)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  АСИНХРОННЫЙ ПОДСЧЁТ СТРАНИЦ (главная функция)
+# ═══════════════════════════════════════════════════════════════
+
+
+async def count_pages_via_aspose(docx_path: str) -> Optional[int]:
+    """Считает страницы DOCX через Aspose Words Counter API."""
+    ASPOSE_ENDPOINT = (
+        "https://api.products.aspose.app/words/wordscounter/api/getstatistics"
+    )
     try:
-        ls = float(doc.styles["Normal"].paragraph_format.line_spacing or 1.5)
-    except:
-        ls = NEURO.line_spacing_override
-    
-    # Симуляция: символов на строку и строк на страницу (учёт межстрочного)
-    cpl = max(20, int(tw / (fs * NEURO.char_width_factor)))
-    lpp = max(10, int(th / (fs * ls * 1.1)))  # небольшой запас на абзацы
-    
-    raw_chars = sum(len(p.text or "") for p in doc.paragraphs)
-    
-    # Слоговая компрессия для русского (слоги делают текст "плотнее" визуально)
-    syllables = len(re.findall(r'[аеёиоуыэюя]', " ".join(p.text or "" for p in doc.paragraphs).lower()))
-    syllable_boost = 1.0 + min(0.4, (syllables / max(1, raw_chars)) * 0.35)
-    
-    # Базовый расчёт + калибровка
-    est_cpp = NEURO.chars_per_page * syllable_boost
-    pages = max(1, int(raw_chars / est_cpp))
-    
-    # Нетекстовые страницы (титул + содержание + возможные разрывы)
-    if raw_chars > 300:
-        pages += max(0, NEURO.non_text_penalty)
-    
-    # Учёт таблиц, изображений, списков (добавляют визуальный объём)
-    table_penalty = sum(1 for t in doc.tables for r in t.rows for c in r.cells if (c.text or "").strip()) * 0.12
-    image_penalty = 0.5 * len([r for r in doc.paragraphs if any("drawing" in str(r._element.xml).lower() for _ in [1])])  # rough
-    pages = int(pages + table_penalty + image_penalty)
-    
-    # Практический минимум для академических работ
-    if raw_chars > 1500:
-        pages = max(pages, 3)
-    
-    print(f"[ESTIM] {raw_chars} симв | cpl={cpl} lpp={lpp} | слогов={syllables} → ~{pages} стр (est_cpp={est_cpp:.0f})")
-    return max(1, pages)
+        with open(docx_path, "rb") as fh:
+            file_bytes = fh.read()
+
+        form = aiohttp.FormData()
+        form.add_field(
+            "files[]",
+            file_bytes,
+            filename=os.path.basename(docx_path),
+            content_type=(
+                "application/vnd.openxmlformats-officedocument"
+                ".wordprocessingml.document"
+            ),
+        )
+        form.add_field("includeTextboxes", "false")
+
+        async with aiohttp.ClientSession() as sess:
+            async with sess.post(
+                ASPOSE_ENDPOINT,
+                data=form,
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if resp.status != 200:
+                    print(f"[ASPOSE] HTTP {resp.status}")
+                    return None
+                data = await resp.json(content_type=None)
+                pages = data.get("statistics", {}).get("pages")
+                if pages is not None:
+                    pages = int(pages)
+                    print(f"[ASPOSE] Страниц: {pages}")
+                    return pages
+    except asyncio.TimeoutError:
+        print("[ASPOSE] Таймаут запроса")
+    except Exception as e:
+        print(f"[ASPOSE] Ошибка: {e}")
+    return None
 
 
-# ─── ХИРУРГИЧЕСКАЯ ОБРЕЗКА ПО СЛОГАМ ───
-def _syllable_count(text: str) -> int:
-    return len(re.findall(r'[аеёиоуыэюяaeiouy]', text.lower()))
+async def measure_pages_async(docx_path: str, work_dir: str) -> Optional[int]:
+    """
+    Главная функция подсчёта страниц (async).
+    
+    Порядок приоритетов:
+    1. Aspose Words Counter API — точный, не требует LibreOffice
+    2. LibreOffice → PDF + PyMuPDF/PyPDF2 — точный, требует soffice
+    3. estimate_docx_pages — расчётный, без внешних зависимостей
+    """
+    # 1) Aspose
+    n = await count_pages_via_aspose(docx_path)
+    if n is not None:
+        return n
+
+    # 2) LibreOffice
+    n = count_docx_pages(docx_path, work_dir)
+    if n is not None:
+        print(f"[LO] Страниц: {n}")
+        return n
+
+    # 3) Расчётный эстиматор
+    n = estimate_docx_pages(docx_path)
+    if n is not None:
+        print(f"[ESTIM] Страниц (расчётно): {n}")
+    return n
 
 
-def _trim_text_surgically(txt: str, need: int) -> Tuple[str, int]:
-    """Откусывает предложения/абзацы с конца. Возвращает (новый_текст, сколько_ушло)."""
-    paras = [p for p in txt.split("\n\n") if p.strip()]
-    removed_total = 0
-    while paras and need > 0 and len(paras) > 1:
-        last_para = paras[-1]
-        sentences = re.split(r'(?<=[.!?])\s+', last_para)
-        if len(sentences) > 1 and len(sentences[-1]) < need:
-            removed_total += len(sentences[-1]) + 1
-            need -= len(sentences[-1]) + 1
-            sentences.pop()
-            paras[-1] = " ".join(sentences)
-        else:
-            removed_total += len(paras[-1]) + 2
-            need -= len(paras[-1]) + 2
-            paras.pop()
-    return "\n\n".join(paras), removed_total
+# ═══════════════════════════════════════════════════════════════
+#  ФУНКЦИИ ДЛЯ ПОДГОНКИ ОБЪЁМА ТЕКСТА
+# ═══════════════════════════════════════════════════════════════
+
+
+def _blocks_text_total(blocks: list[tuple]) -> int:
+    """Подсчитывает общее количество символов во всех блоках"""
+    total = 0
+    for _t, _l, text, subs in blocks:
+        if text:
+            total += len(text)
+        for _st, stext in (subs or []):
+            if stext:
+                total += len(stext)
+    return total
 
 
 def _trim_blocks_by_chars(blocks: list[tuple], chars_to_remove: int) -> list[tuple]:
-    """Аккуратно укорачивает блоки, сохраняя целостность предложений."""
+    """Аккуратно укорачивает блоки, сохраняя последний абзац целым."""
     if chars_to_remove <= 0:
         return blocks
     
@@ -3000,6 +2683,17 @@ def _trim_blocks_by_chars(blocks: list[tuple], chars_to_remove: int) -> list[tup
     def _can_trim(title: str) -> bool:
         up = (title or "").upper()
         return not any(w in up for w in ("ЛИТЕРАТ", "ИСТОЧНИК", "БИБЛИОГРАФ", "ЗАКЛЮЧЕНИ"))
+
+    def _trim_text(txt: str, need: int) -> tuple[str, int]:
+        """Откусывает абзацы с конца. Возвращает (новый_текст, сколько_ушло)."""
+        paras = [p for p in txt.split("\n\n") if p.strip()]
+        removed_total = 0
+        while paras and need > 0 and len(paras) > 1:
+            removed = len(paras[-1]) + 2
+            paras.pop()
+            need -= removed
+            removed_total += removed
+        return "\n\n".join(paras), removed_total
 
     # Сортируем кандидатов по размеру (самые большие первые)
     def _block_total(i: int) -> int:
@@ -3029,7 +2723,7 @@ def _trim_blocks_by_chars(blocks: list[tuple], chars_to_remove: int) -> list[tup
                 stitle, stext = subblocks[si]
                 if not stext or len(stext) < 200:
                     continue
-                new_stext, removed = _trim_text_surgically(stext, chars_to_remove)
+                new_stext, removed = _trim_text(stext, chars_to_remove)
                 chars_to_remove -= removed
                 subblocks[si] = (stitle, new_stext)
             # Обновляем агрегированный текст
@@ -3037,33 +2731,11 @@ def _trim_blocks_by_chars(blocks: list[tuple], chars_to_remove: int) -> list[tup
         else:
             txt = b[2] or ""
             if len(txt) >= 400:
-                new_txt, removed = _trim_text_surgically(txt, chars_to_remove)
+                new_txt, removed = _trim_text(txt, chars_to_remove)
                 chars_to_remove -= removed
                 b[2] = new_txt
 
     return [tuple(b) for b in blocks]
-
-
-def _trim_blocks_surgically(blocks: list[tuple], target_chars: int) -> list[tuple]:
-    """Обрезает блоки (list[tuple]), сохраняя целостность предложений."""
-    current_total = _blocks_text_total(blocks)
-    if current_total <= target_chars:
-        return blocks
-    chars_to_remove = current_total - target_chars
-    return _trim_blocks_by_chars(blocks, chars_to_remove)
-
-
-# ─── ФУНКЦИИ ДЛЯ ДОПОЛНЕНИЯ ОБЪЁМА ───
-def _blocks_text_total(blocks: list[tuple]) -> int:
-    """Подсчитывает общее количество символов во всех блоках"""
-    total = 0
-    for _t, _l, text, subs in blocks:
-        if text:
-            total += len(text)
-        for _st, stext in (subs or []):
-            if stext:
-                total += len(stext)
-    return total
 
 
 async def _expand_blocks_by_chars(
@@ -3073,7 +2745,6 @@ async def _expand_blocks_by_chars(
     model_key: str,
     writing_style: str,
     prog: Optional["Progress"] = None,
-    pages: int = 10,
 ) -> list[tuple]:
     """Дозаписывает текст в основные главы, чтобы добрать chars_to_add символов."""
     if chars_to_add <= 0:
@@ -3092,9 +2763,8 @@ async def _expand_blocks_by_chars(
     if not candidates:
         return [tuple(b) for b in blocks]
 
-    # Равномерно распределяем нагрузку + 10% запас
-    per_block = int((chars_to_add / max(1, len(candidates))) * 1.1)
-    per_block = max(300, per_block) # Но минимум 300 символов, чтобы ИИ мог развернуть мысль
+    # Равномерно распределяем нагрузку + 30% запас
+    per_block = int((chars_to_add / max(1, len(candidates))) * 1.3) + 300
     
     style_label = "высокоакадемический научный" if writing_style == "smart" else "деловой научный"
     style_sys = (
@@ -3119,17 +2789,33 @@ async def _expand_blocks_by_chars(
         while need > 100 and attempts < max_attempts:
             attempts += 1
             tail = text[-800:] if text else ""
-            block_chars = need
-            user_prompt = _build_strict_expansion_prompt(
-                topic=topic,
-                subject="академическая дисциплина",
-                title=title,
-                tail=tail,
-                need=need,
-                block_chars=block_chars,
-                pages=pages,
-                doc_type="referat"
+            user_prompt = (
+                f"Тема всей работы: «{topic}».\n"
+                f"Текущий раздел: «{title}».\n\n"
+                f"ЗАДАЧА: продолжи и РАЗВЕРНИ этот раздел, "
+                f"добавь МИНИМУМ {need} знаков с пробелами.\n\n"
+                f"⚠️ ВНИМАНИЕ: Пользователь просил написать строго заданный объем страниц. "
+                f"Ты должен четко понимать лимит страниц и НЕ ОБРЫВАТЬ мысль на полуслове! "
+                f"Заканчивай свои мысли логично, последовательно, но при этом кратко и лаконично. "
+                f"Каждое предложение должно быть полностью завершено.\n\n"
+                f"Правила:\n"
+                f"— Не повторяй то, что уже сказано.\n"
+                f"— Развивай мысль: новые аргументы, примеры.\n"
+                f"— Минимум 3 полноценных абзаца.\n"
+                f"— Никаких заголовков, списков.\n\n"
+                f"Хвост уже написанного раздела:\n...{tail}"
             )
+            
+            try:
+                extra, _used = await chat_with_fallback(
+                    model_key,
+                    [{"role": "system", "content": style_sys},
+                     {"role": "user",   "content": user_prompt}],
+                    tokens_for_chars(int(need * 1.5)),
+                )
+            except Exception as e:
+                print(f"[EXPAND] Ошибка ИИ: {e}")
+                break
 
             if not extra or len(extra.strip()) < 100:
                 continue
@@ -3153,142 +2839,88 @@ async def _expand_blocks_by_chars(
     return [tuple(b) for b in blocks]
 
 
-# ─── ГЛАВНАЯ ФУНКЦИЯ ПРИНУДИТЕЛЬНОЙ ПОДГОНКИ ───
-async def force_page_count_ultra(
-    docx_path: str,
+# ═══════════════════════════════════════════════════════════════
+#  ФУНКЦИЯ ДЛЯ ТОЧНОЙ ПОДГОНКИ СТРАНИЦ (НОВАЯ)
+# ═══════════════════════════════════════════════════════════════
+
+
+async def precise_page_adjustment(
+    tmp_in: str,
+    blocks: list[tuple],
     target_pages: int,
-    work_dir: str,
-    max_iterations: int = 10,
-    blocks: Optional[List[tuple]] = None,
-    gost: Any = None,
-    data: Any = None,
-    topic: str = "",
-    model_key: str = "",
-    writing_style: str = "classic",
+    topic: str,
+    model_key: str,
+    writing_style: str,
+    data: dict,
+    gost: dict,
     prog: Optional["Progress"] = None,
-) -> Tuple[bool, int]:
-    """Ultra-умная подгонка с нейро-калибровкой."""
+    work_dir: str = None,
+) -> tuple[list[tuple], int]:
+    """
+    Точная подгонка количества страниц.
+    Возвращает (блоки, финальное_количество_страниц)
+    """
+    if work_dir is None:
+        work_dir = os.path.dirname(tmp_in)
     
-    best_path = docx_path
-    best_diff = float('inf')
+    measure_dir = os.path.join(work_dir, "_measure")
+    os.makedirs(measure_dir, exist_ok=True)
     
-    for i in range(max_iterations):
-        current = await measure_pages_async(docx_path, work_dir)
-        if current is None:
-            current = estimate_docx_pages_ultra(docx_path)
-        if current is None:
-            print("[ULTRA] Невозможно измерить страницы")
-            break
+    max_iters = 10
+    
+    for it in range(max_iters):
+        # Измеряем текущее количество страниц
+        real_pages = await measure_pages_async(tmp_in, measure_dir)
         
-        diff = current - target_pages
-        print(f"[ULTRA] Итерация {i+1}: {current} стр, разница {diff}")
+        if real_pages is None:
+            total_chars = _blocks_text_total(blocks)
+            real_pages = target_pages_from_chars(total_chars)
+        
+        diff = real_pages - target_pages
+        print(f"[ADJUST] Итерация {it+1}: цель={target_pages}, факт={real_pages}, разница={diff:+d}")
         
         if prog:
             await prog.update(
-                label=f"📏 Подгонка: {current}/{target_pages} стр (попытка {i+1})",
+                label=f"📏 Подгонка: {real_pages}/{target_pages} стр (попытка {it+1})",
                 force=True,
             )
         
+        # Достигли цели?
         if diff == 0:
-            print(f"[ULTRA] ✅ ИДЕАЛЬНО: {current} == {target_pages}")
-            try:
-                raw_len = sum(len(p.text) for p in Document(docx_path).paragraphs)
-                NEURO.learn(raw_len, current, target_pages)
-            except: pass
-            return True, current
-        
-        if abs(diff) <= 1 and i >= 7:
-            print(f"[ULTRA] ✅ Приемлемо: {current}")
-            try:
-                raw_len = sum(len(p.text) for p in Document(docx_path).paragraphs)
-                NEURO.learn(raw_len, current, target_pages)
-            except: pass
-            return True, current
-        
-        if abs(diff) < best_diff:
-            best_diff = abs(diff)
-            best_path = docx_path
-        
-        # Модификация документа
-        try:
-            doc = Document(docx_path)
-            paragraphs = [p for p in doc.paragraphs if p.text and len(p.text) > 30]
-            
-            # Никогда не трогаем список литературы для подсчета paragraphs
-            paragraphs = [p for p in paragraphs if not any(x in p.text.upper() for x in ["ЛИТЕРАТ", "ИСТОЧНИК", "БИБЛИОГРАФ"])]
-            
-            if diff > 0:
-                # Перебор — удаляем по слогам
-                target_removal = int(diff * NEURO.chars_per_page)
-                removed = 0
-                for p in reversed(paragraphs):
-                    if removed >= target_removal: break
-                    syllables = _syllable_count(p.text)
-                    if syllables > 10:
-                        sentences = re.split(r'(?<=[.!?])\s+', p.text)
-                        while sentences and removed < target_removal:
-                            removed += len(sentences[-1])
-                            sentences.pop()
-                        p.text = " ".join(sentences)
-                print(f"[ULTRA] ✂️ Удалено ~{removed} символов")
-                doc.save(docx_path)
-            else:
-                # Недобор — добавляем качественный ИИ-текст через blocks
-                chars_to_add = int(abs(diff) * NEURO.chars_per_page)
-                print(f"[ULTRA] ➕ Добавляю {chars_to_add} символов через ИИ")
-                if blocks:
-                    blocks = await _expand_blocks_by_chars(
-                        blocks, chars_to_add, topic, model_key, writing_style, prog, pages=target_pages
-                    )
-                    if data and gost:
-                        docx_raw = build_docx_bytes(data, blocks, gost)
-                        with open(docx_path, "wb") as f:
-                            f.write(docx_raw)
-                else:
-                    # Резервный филлер если blocks недоступны
-                    needed = abs(diff) * NEURO.chars_per_page * 0.8
-                    filler = " ".join([
-                        "Дополнительный академический материал, раскрывающий глубинные аспекты рассматриваемой проблематики.",
-                        "Данный текст обеспечивает необходимый объём страниц без потери смысловой нагрузки."
-                    ] * int(needed / 100 + 1))
-                    if paragraphs:
-                        paragraphs[-1].text += "\n\n" + filler[:int(needed)]
-                    doc.save(docx_path)
-            
-            await asyncio.sleep(0.5)
-        except Exception as e:
-            print(f"[ULTRA] Ошибка редактирования: {e}")
-            
-            # Аварийная жёсткая обрезка через блоки
-            if blocks and diff > 0:
-                target_chars_total = target_pages * NEURO.chars_per_page
-                blocks = _trim_blocks_surgically(blocks, int(target_chars_total))
-                if data and gost:
-                    docx_raw = build_docx_bytes(data, blocks, gost)
-                    with open(docx_path, "wb") as f:
-                        f.write(docx_raw)
+            print(f"[ADJUST] ✅ Цель достигнута!")
             break
+        elif it >= 7 and abs(diff) <= 1:
+            print(f"[ADJUST] ✅ Приемлемая цель достигнута на поздней итерации: {real_pages} стр.")
+            break
+        
+        # Рассчитываем сколько символов нужно добавить/убрать
+        chars_per_real_page = CHARS_PER_PAGE
+        
+        if diff > 0:
+            # Слишком много страниц — обрезаем
+            chars_to_remove = int(diff * chars_per_real_page)
+            print(f"[ADJUST] ✂️ Обрезаю {chars_to_remove} знаков")
+            blocks = _trim_blocks_by_chars(blocks, chars_to_remove)
+        else:
+            # Слишком мало страниц — добавляем
+            chars_to_add = int(abs(diff) * chars_per_real_page)
+            print(f"[ADJUST] ➕ Добавляю {chars_to_add} знаков")
+            blocks = await _expand_blocks_by_chars(
+                blocks, chars_to_add, topic, model_key, writing_style, prog,
+            )
+        
+        # Пересобираем DOCX
+        docx_raw = build_docx_bytes(data, blocks, gost)
+        with open(tmp_in, "wb") as f:
+            f.write(docx_raw)
     
-    final = await measure_pages_async(best_path, work_dir) or estimate_docx_pages_ultra(best_path) or 0
-    print(f"[ULTRA] 🎯 Финал: {final} страниц")
-    return final == target_pages, final
-
-
-# ─── СУПЕР-КЭШ СТРАНИЦ ДЛЯ МГНОВЕННОЙ ПРОВЕРКИ ───
-_page_cache: Dict[str, Tuple[float, int]] = OrderedDict()
-CACHE_MAX = 50
-
-async def cached_measure(docx_path: str, work_dir: str) -> Optional[int]:
-    mtime = os.path.getmtime(docx_path) if os.path.exists(docx_path) else 0
-    key = f"{docx_path}:{mtime}"
-    if key in _page_cache:
-        return _page_cache[key][1]
-    result = await measure_pages_async(docx_path, work_dir)
-    if result:
-        _page_cache[key] = (time.time(), result)
-        if len(_page_cache) > CACHE_MAX:
-            _page_cache.popitem(last=False)
-    return result
+    # Финальный замер
+    final_pages = await measure_pages_async(tmp_in, measure_dir)
+    if final_pages is None:
+        final_pages = target_pages
+    
+    print(f"[ADJUST] 🎯 Финальный результат: {final_pages} страниц")
+    return blocks, final_pages
 # ═══════════════════════════════════════════════════════════════
 #  «СВОЙ ГОСТ» — ПАРСИНГ ТРЕБОВАНИЙ ЧЕРЕЗ ИИ
 # ═══════════════════════════════════════════════════════════════
@@ -4291,7 +3923,7 @@ async def generate_and_send(
     генерирует текст блоками, собирает DOCX, отправляет.
     """
     async with GEN_SEMAPHORE:
-        data = await state.get_data() or {}
+        data = await state.get_data()
 
         doc_type = data.get("doc_type", "referat")
         dt       = DOC_TYPES.get(doc_type, DOC_TYPES["referat"])
@@ -4370,8 +4002,6 @@ async def generate_and_send(
                 writing_style=writing_style,
                 prog=prog,
             )
-            if not isinstance(parts, dict):
-                parts = {}
 
             # ── Проверка соответствия дисциплине (приоритет 🔴) ──
             await prog.update(label="🔎 Проверяю соответствие дисциплине...")
@@ -4385,16 +4015,6 @@ async def generate_and_send(
             if not relevance_ok:
                 print(f"[RELEVANCE] ⚠️ Текст может не соответствовать дисциплине "
                       f"«{subject}»: {relevance_reason}")
-
-            # ── Финальная идеальная гарантия тела под всеми заголовками ──
-            # (на случай если adjustment или предыдущие шаги что-то обрезали)
-            chapter_titles = chapter_titles or []
-            parts = await _enforce_real_body(
-                parts, doc_type, topic, subject, model_key, 
-                "Ты пишешь тексты на русском языке. НЕ используй markdown. Пиши развёрнуто, с примерами и анализом.",
-                chapter_titles,
-                pages=pages
-            )
 
             # ── Сборка структуры ──
             blocks = generate_structure(doc_type, parts, chapter_titles)
@@ -4413,19 +4033,18 @@ async def generate_and_send(
             if not os.path.exists(tmp_in):
                 raise RuntimeError(f"Не удалось записать {tmp_in}")
 
-            # ── ПОДГОНКА СТРАНИЦ ЧЕРЕЗ ULTIMATE SELF-CALIBRATING PAGE FORCER (v4.2) ──
-            success, final_pages = await force_page_count_ultra(
-                docx_path=tmp_in,
-                target_pages=pages,
-                work_dir=work_dir,
-                max_iterations=10,
+            # ── ПОДГОНКА СТРАНИЦ (исправленная) ──
+            blocks, final_pages = await precise_page_adjustment(
+                tmp_in=tmp_in,
                 blocks=blocks,
-                gost=gost,
-                data=data,
+                target_pages=pages,
                 topic=topic,
                 model_key=model_key,
                 writing_style=writing_style,
+                data=data,
+                gost=gost,
                 prog=prog,
+                work_dir=work_dir,
             )
 
             # ── LibreOffice (финальная конвертация — обновит TOC и поля PAGE) ──
@@ -4434,23 +4053,22 @@ async def generate_and_send(
             final_path = tmp_out if updated else tmp_in
 
             # Если после LibreOffice количество страниц изменилось, подгоняем финальный файл еще раз
-            post_lo_pages = await cached_measure(final_path, work_dir)
+            post_lo_pages = await measure_pages_async(final_path, work_dir)
             if post_lo_pages is not None and post_lo_pages != pages:
                 print(f"[PAGES] LO сдвинул страницы ({post_lo_pages} вместо {pages}). Запуск финальной коррекции...")
-                success, final_pages = await force_page_count_ultra(
-                    docx_path=final_path,
-                    target_pages=pages,
-                    work_dir=work_dir,
-                    max_iterations=5,
+                blocks, final_pages = await precise_page_adjustment(
+                    tmp_in=final_path,
                     blocks=blocks,
-                    gost=gost,
-                    data=data,
+                    target_pages=pages,
                     topic=topic,
                     model_key=model_key,
                     writing_style=writing_style,
+                    data=data,
+                    gost=gost,
                     prog=prog,
+                    work_dir=work_dir,
                 )
-                final_pages = await cached_measure(final_path, work_dir) or pages
+                final_pages = await measure_pages_async(final_path, work_dir) or pages
             else:
                 final_pages = post_lo_pages or pages
 
@@ -4542,9 +4160,8 @@ async def generate_and_send(
 
 async def main() -> None:
     print("═" * 62)
-    print("  🤖  ГОСТ-АССИСТЕНТ v2.8 (профессиональный подсчёт страниц)")
+    print("  🤖  ГОСТ-АССИСТЕНТ v2.7")
     print("═" * 62)
-    print("  Page counter: PyMuPDF + pypdf (triple verification) + ultra estimator")
     print(f"  LibreOffice : {shutil.which('soffice') or '❌ не найден'}")
     print(f"  DeepSeek    : {'✅' if DEEPSEEK_KEY else '❌ нет ключа'}")
     print(f"  OpenRouter  : {'✅' if OPENROUTER_KEY else '❌ нет ключа'}")
