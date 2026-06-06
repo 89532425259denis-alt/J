@@ -1281,7 +1281,7 @@ def build_prompts(
         prompts[key] = strict_prompt(
             f"Напиши ПОЛНЫЙ текст подглавы «{sub_title}».\n"
             f"Глава: «{ch_title}».\n"
-            f"Тема всей работы: «{topic}». Дисциплина: «{subject}».\n"
+            f"Тема всей работы: «{topic}».\n"
             f"Это отдельная подглава — пиши её как ЗАВЕРШЁННЫЙ смысловой блок с реальным содержанием.\n"
             f"ОБЯЗАТЕЛЬНО: минимум 6–9 развёрнутых абзацев (минимум 800–950 знаков РЕАЛЬНОГО оригинального текста ПОД этим заголовком — НЕ только название подглавы, НЕ заголовок внутри текста, НЕ общие фразы).\n"
             f"Начинай текст СРАЗУ после заголовка подглавы содержательным абзацем с анализом, примерами, фактами, статистикой.\n"
@@ -2260,6 +2260,8 @@ async def _enforce_real_body(
     будет минимум реального содержательного текста (700-950+ знаков, 5-8+ абзацев).
     Никогда не оставляет "только название".
     """
+    if not isinstance(parts, dict):
+        parts = {}
     MIN_BODY = {
         "intro": 750,
         "conclusion": 750,
@@ -2337,12 +2339,15 @@ async def _enforce_real_body(
             parts[key] = await _expand_one(key, parts.get(key, ""), min_c, label)
 
     # 2. Подглавы из chapter_titles (если они не в parts как ch*_s*, но должны быть)
+    chapter_titles = chapter_titles or []
     if chapter_titles:
         for i, ch in enumerate(chapter_titles, 1):
-            subs = ch.get("subs", [])
+            if not isinstance(ch, dict):
+                continue
+            subs = ch.get("subs", []) or []
             for j, sub_title in enumerate(subs, 1):
                 k = f"ch{i}_s{j}"
-                if k not in parts or not parts[k].strip():
+                if k not in parts or not parts.get(k, "").strip():
                     min_c = MIN_BODY["default_ch"]
                     parts[k] = await _expand_one(k, "", min_c, f"Подглава «{sub_title}» главы {i}")
 
@@ -2370,6 +2375,10 @@ async def _enforce_real_body(
     # ИДЕАЛЬНАЯ ГАРАНТИЯ: под каждым заголовком — реальное тело
     # Вызываем универсальную функцию после всей генерации (включая заключение)
     # ═══════════════════════════════════════════════════════════
+    chapter_titles = chapter_titles or []
+    if not isinstance(parts, dict):
+        parts = {}
+    chapter_titles = chapter_titles or []
     parts = await _enforce_real_body(
         parts, doc_type, topic, subject, model_key, style_sys, chapter_titles
     )
@@ -2935,7 +2944,7 @@ async def _expand_blocks_by_chars(
             attempts += 1
             tail = text[-800:] if text else ""
             user_prompt = (
-                f"Тема всей работы: «{topic}». Дисциплина: «{subject}».\n"
+                f"Тема всей работы: «{topic}».\n"
                 f"Текущий раздел/подраздел: «{title}».\n\n"
                 f"ЗАДАЧА (выполняй ИДЕАЛЬНО): продолжи и РАЗВЕРНИ этот раздел реальным содержанием. "
                 f"Добавь МИНИМУМ {need} знаков (цель — качественный, не пустой текст).\n\n"
@@ -4120,7 +4129,7 @@ async def generate_and_send(
     генерирует текст блоками, собирает DOCX, отправляет.
     """
     async with GEN_SEMAPHORE:
-        data = await state.get_data()
+        data = await state.get_data() or {}
 
         doc_type = data.get("doc_type", "referat")
         dt       = DOC_TYPES.get(doc_type, DOC_TYPES["referat"])
@@ -4199,6 +4208,8 @@ async def generate_and_send(
                 writing_style=writing_style,
                 prog=prog,
             )
+            if not isinstance(parts, dict):
+                parts = {}
 
             # ── Проверка соответствия дисциплине (приоритет 🔴) ──
             await prog.update(label="🔎 Проверяю соответствие дисциплине...")
@@ -4215,6 +4226,7 @@ async def generate_and_send(
 
             # ── Финальная идеальная гарантия тела под всеми заголовками ──
             # (на случай если adjustment или предыдущие шаги что-то обрезали)
+            chapter_titles = chapter_titles or []
             parts = await _enforce_real_body(
                 parts, doc_type, topic, subject, model_key, 
                 "Ты пишешь тексты на русском языке. НЕ используй markdown. Пиши развёрнуто, с примерами и анализом.",
