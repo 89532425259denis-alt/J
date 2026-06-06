@@ -1,15 +1,15 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-"""ГОСТ-АССИСТЕНТ v2.8 — ПРОФЕССИОНАЛЬНЫЙ ПОДСЧЁТ СТРАНИЦ + ДИСЦИПЛИНА
+"""ГОСТ-АССИСТЕНТ v2.7 — ТОЧНЫЕ СТРАНИЦЫ + ДИСЦИПЛИНА
 
 Главные изменения v2.1 относительно v2.0:
 ────────────────────────────────────────────────────────────────
-1. ★ ТОЧНОЕ ЧИСЛО СТРАНИЦ (±1) — теперь ПРОФЕССИОНАЛЬНО.
-   Финальный DOCX → LibreOffice → PDF.
-   Страницы считаются ТРЕМЯ методами: PyMuPDF (fitz) + pypdf (PdfReader) + улучшенный fallback.
-   Самокалибрующаяся нейросеть обучается на реальных прогонах.
-   Если нет LibreOffice — продвинутый layout-эстиматор с учётом ГОСТ.
+1. ★ ТОЧНОЕ ЧИСЛО СТРАНИЦ (±1).
+   После генерации DOCX конвертируется в PDF через LibreOffice,
+   реально пересчитываются страницы (pypdf / pdfinfo). Если страниц
+   меньше цели — главы дозаполняются; если больше — обрезаются
+   по границам абзацев. Цикл до 3 итераций.
 
 2. ★ ПРАВИЛЬНАЯ НУМЕРАЦИЯ СТРАНИЦ ПО ГОСТ.
    Титульный лист включается в общую нумерацию, но цифра на нём
@@ -66,10 +66,6 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Cm, Mm, Pt, RGBColor
-
-# Professional PDF page counting (pypdf + pymupdf for ultimate reliability)
-from pypdf import PdfReader
-import fitz  # PyMuPDF
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -297,7 +293,7 @@ PAID_DAILY_LIMIT  = int(cfg("PAID_DAILY_LIMIT",       "0"))   # 0 = безлим
 PAID_COOLDOWN     = int(cfg("PAID_COOLDOWN_SECONDS",  "0"))   # 0 = нет кулдауна
 
 # Символов на страницу (ГОСТ: ~1800-2000 знаков с пробелами на стр A4 14pt 1.5 интервал)
-CHARS_PER_PAGE = int(cfg("CHARS_PER_PAGE", "1800"))
+CHARS_PER_PAGE = int(cfg("CHARS_PER_PAGE", "1850"))
 # Страниц без текста (титул + содержание)
 NON_TEXT_PAGES = int(cfg("NON_TEXT_PAGES", "2"))
 
@@ -738,7 +734,7 @@ async def call_openai_compat(
     max_tokens: int = 4096,
     timeout: int = 300,
 ) -> str:
-    """Вызов OpenAI-совместимого API с поддержкой повторных попыток при лимитах (rate limit)."""
+    """Вызов OpenAI-совместимого API."""
     if info.get("_fatal") or not info.get("api_key"):
         return ""
 
@@ -759,46 +755,31 @@ async def call_openai_compat(
         "max_tokens":  max_tokens,
     }
 
-    max_retries = 5
-    for attempt in range(max_retries):
-        try:
-            async with aiohttp.ClientSession() as sess:
-                async with sess.post(
-                    f"{base}/chat/completions",
-                    headers=headers,
-                    json=payload,
-                    timeout=aiohttp.ClientTimeout(total=timeout),
-                ) as r:
-                    txt = await r.text()
-                    if r.status == 200:
-                        data = json.loads(txt)
-                        return data["choices"][0]["message"]["content"]
-                    
-                    if r.status in (401, 402, 403):
-                        info["_fatal"] = True
-                        info["status"] = ModelStatus.FATAL
-                        print(f"[FATAL] {info['name']} — auth error {r.status}")
-                        return ""
-                        
-                    if r.status == 429:
-                        info["status"] = ModelStatus.LIMIT
-                        # Exponential backoff: wait 4, 8, 16, 32 seconds
-                        sleep_time = (2 ** attempt) * 4
-                        print(f"[LIMIT] {info['name']} — rate limit (попытка {attempt+1}/{max_retries}). Сон {sleep_time} сек...")
-                        await asyncio.sleep(sleep_time)
-                        continue
-                        
-                    # Other HTTP error
+    try:
+        async with aiohttp.ClientSession() as sess:
+            async with sess.post(
+                f"{base}/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=timeout),
+            ) as r:
+                txt = await r.text()
+                if r.status == 200:
+                    data = json.loads(txt)
+                    return data["choices"][0]["message"]["content"]
+                if r.status in (401, 402, 403):
+                    info["_fatal"] = True
+                    info["status"] = ModelStatus.FATAL
+                    print(f"[FATAL] {info['name']} — auth error {r.status}")
+                elif r.status == 429:
+                    info["status"] = ModelStatus.LIMIT
+                    print(f"[LIMIT] {info['name']} — rate limit")
+                else:
                     print(f"[ERROR] {info['name']} — HTTP {r.status}: {txt[:200]}")
-                    # Also wait a bit and retry
-                    await asyncio.sleep(2)
-                    
-        except asyncio.TimeoutError:
-            print(f"[TIMEOUT] {info['name']} (попытка {attempt+1})")
-            await asyncio.sleep(2)
-        except Exception as e:
-            print(f"[ERR] {info['name']}: {e} (попытка {attempt+1})")
-            await asyncio.sleep(2)
+    except asyncio.TimeoutError:
+        print(f"[TIMEOUT] {info['name']}")
+    except Exception as e:
+        print(f"[ERR] {info['name']}: {e}")
 
     return ""
 
@@ -892,16 +873,8 @@ async def generate_chapter_titles(
 
     try:
         result = json.loads(raw)
-        if isinstance(result, list):
-            # Фильтруем Введение, Заключение, Список литературы из списка глав, если ИИ их туда добавил
-            cleaned = []
-            for item in result:
-                title = str(item.get("title", "")).upper()
-                if any(x in title for x in ["ВВЕДЕНИЕ", "ЗАКЛЮЧЕНИЕ", "СПИСОК ЛИТЕРАТУРЫ", "БИБЛИОГРАФИЯ"]):
-                    continue
-                cleaned.append(item)
-            if cleaned and all("title" in r for r in cleaned):
-                return cleaned[:num_chapters]
+        if isinstance(result, list) and all("title" in r for r in result):
+            return result
     except Exception:
         pass
 
@@ -2384,7 +2357,7 @@ _ESTIM_CALIBRATION = 1.00
 # ─── НЕЙРО-КАЛИБРОВКА (обучается на каждом прогоне) ───
 @dataclass
 class NeuroCalibration:
-    chars_per_page: float = 1750.0
+    chars_per_page: float = 1550.0
     char_width_factor: float = 0.45
     line_spacing_override: float = 1.5
     non_text_penalty: int = 2
@@ -2420,16 +2393,9 @@ except Exception:
 
 # ─── ВЫСОКОТОЧНЫЙ ЗАМЕР СТРАНИЦ ЧЕРЕЗ LIBREOFFICE ───
 async def measure_pages_async(docx_path: str, work_dir: str, timeout: int = 30) -> Optional[int]:
-    """Профессиональный подсчёт страниц: LibreOffice → PDF + тройной надёжный счётчик.
-
-    1. PyMuPDF (fitz) — лучший для реального рендеринга страниц (учитывает всё).
-    2. pypdf.PdfReader — стандартный, очень надёжный.
-    3. Улучшенный crude (только если оба выше упали).
-    Возвращает точное число страниц по финальному PDF.
-    """
     if not shutil.which("soffice"):
         return estimate_docx_pages_ultra(docx_path)
-
+        
     pdf_path = os.path.join(work_dir, f"_pagecheck_{hashlib.md5(docx_path.encode()).hexdigest()[:8]}.pdf")
     try:
         proc = await asyncio.wait_for(
@@ -2440,92 +2406,24 @@ async def measure_pages_async(docx_path: str, work_dir: str, timeout: int = 30) 
             ), timeout=timeout
         )
         await proc.wait()
-
         if not os.path.exists(pdf_path):
             alt = docx_path.replace(".docx", ".pdf")
-            if os.path.exists(alt):
-                pdf_path = alt
-            else:
-                return estimate_docx_pages_ultra(docx_path)
-
-        pages = _get_pdf_page_count(pdf_path)
-
-        # Cleanup
-        if os.path.exists(pdf_path):
-            try:
-                os.remove(pdf_path)
-            except Exception:
-                pass
-
-        if pages and pages > 0:
-            return pages
-        return estimate_docx_pages_ultra(docx_path)
-
-    except Exception as e:
-        print(f"[MEASURE] Ошибка конвертации/подсчёта: {e}")
-        return estimate_docx_pages_ultra(docx_path)
-
-
-def _get_pdf_page_count(pdf_path: str) -> Optional[int]:
-    """Профессиональный, отказоустойчивый подсчёт страниц PDF (идеально для ГОСТ-документов).
-
-    Приоритет:
-    1. PyMuPDF (fitz) — учитывает реальный layout, таблицы, изображения, шрифты.
-    2. pypdf — чистый подсчёт страниц по объектам.
-    3. Улучшенный crude count (редко используется).
-    """
-    if not pdf_path or not os.path.exists(pdf_path):
-        return None
-
-    # 1. PyMuPDF — самый точный (рекомендуется для production)
-    try:
-        doc = fitz.open(pdf_path)
-        n = len(doc)
-        doc.close()
-        if n > 0:
-            print(f"[PAGES] fitz: {n} стр.")
-            return n
-    except Exception as e:
-        print(f"[PAGES] PyMuPDF error: {e}")
-
-    # 2. pypdf — отличный fallback
-    try:
-        reader = PdfReader(pdf_path)
-        n = len(reader.pages)
-        if n > 0:
-            print(f"[PAGES] pypdf: {n} стр.")
-            return n
-    except Exception as e:
-        print(f"[PAGES] pypdf error: {e}")
-
-    # 3. Улучшенный crude (только если библиотеки не сработали)
-    try:
+            if os.path.exists(alt): pdf_path = alt
+            else: return estimate_docx_pages_ultra(docx_path)
         with open(pdf_path, "rb") as f:
             content = f.read()
-        # Более точный crude: считаем реальные страницы, игнорируя родительские /Pages
-        page_objs = content.count(b"/Type /Page")
-        pages_objs = content.count(b"/Type /Pages")
-        n = max(0, page_objs - pages_objs)
-        if n > 0:
-            print(f"[PAGES] crude: {n} стр.")
-            return n
-    except Exception:
-        pass
-
-    return None
+        pages = content.count(b"/Type /Page") - content.count(b"/Type /Pages")
+        if os.path.exists(pdf_path):
+            try: os.remove(pdf_path)
+            except: pass
+        return max(1, pages) if pages > 0 else estimate_docx_pages_ultra(docx_path)
+    except Exception as e:
+        print(f"[MEASURE] Ошибка: {e}")
+        return estimate_docx_pages_ultra(docx_path)
 
 
 # ─── УЛЬТРА-ТОЧНЫЙ ЭСТИМАТОР С УЧЁТОМ СЛОГОВ ───
 def estimate_docx_pages_ultra(docx_path: str) -> Optional[int]:
-    """Улучшенный fallback-эстиматор страниц для DOCX (когда нет LibreOffice).
-
-    Профессиональный подход:
-    - Точный расчёт доступной площади страницы по ГОСТ (поля, A4).
-    - Симуляция символов на строку и строк на страницу.
-    - Учёт слогов русского языка (более плотный текст).
-    - Калибровка NEURO + штрафы за таблицы/изображения/нетекстовые страницы.
-    - Используется только как fallback — основной счёт всегда через PDF.
-    """
     try:
         doc = Document(docx_path)
     except Exception as e:
@@ -2546,46 +2444,30 @@ def estimate_docx_pages_ultra(docx_path: str) -> Optional[int]:
     tm = emu2pt(sec.top_margin) or 56.0
     bm = emu2pt(sec.bottom_margin) or 56.0
     
-    tw = max(50, pw - lm - rm)   # текстовая ширина в pt
-    th = max(50, ph - tm - bm)   # текстовая высота в pt
+    tw = max(50, pw - lm - rm)
+    th = max(50, ph - tm - bm)
     
-    try:
-        fs = float(doc.styles["Normal"].font.size.pt)
-    except:
-        fs = 14.0
-    try:
-        ls = float(doc.styles["Normal"].paragraph_format.line_spacing or 1.5)
-    except:
-        ls = NEURO.line_spacing_override
+    try: fs = float(doc.styles["Normal"].font.size.pt)
+    except: fs = 14.0
+    try: ls = float(doc.styles["Normal"].paragraph_format.line_spacing or 1.5)
+    except: ls = NEURO.line_spacing_override
     
-    # Симуляция: символов на строку и строк на страницу (учёт межстрочного)
     cpl = max(20, int(tw / (fs * NEURO.char_width_factor)))
-    lpp = max(10, int(th / (fs * ls * 1.1)))  # небольшой запас на абзацы
-    
+    lpp = max(10, int(th / (fs * ls)))
     raw_chars = sum(len(p.text or "") for p in doc.paragraphs)
     
-    # Слоговая компрессия для русского (слоги делают текст "плотнее" визуально)
+    # Слоговая компрессия (русский текст)
     syllables = len(re.findall(r'[аеёиоуыэюя]', " ".join(p.text or "" for p in doc.paragraphs).lower()))
-    syllable_boost = 1.0 + min(0.4, (syllables / max(1, raw_chars)) * 0.35)
+    syllable_boost = 1.0 + (syllables / max(1, raw_chars)) * 0.3
     
-    # Базовый расчёт + калибровка
-    est_cpp = NEURO.chars_per_page * syllable_boost
-    pages = max(1, int(raw_chars / est_cpp))
+    pages = max(1, int(raw_chars / (NEURO.chars_per_page * syllable_boost)))
+    if raw_chars > 500: pages += NEURO.non_text_penalty
     
-    # Нетекстовые страницы (титул + содержание + возможные разрывы)
-    if raw_chars > 300:
-        pages += max(0, NEURO.non_text_penalty)
+    # Учёт таблиц и изображений
+    table_penalty = sum(1 for t in doc.tables for r in t.rows for c in r.cells if c.text) * 0.1
+    pages = int(pages + table_penalty)
     
-    # Учёт таблиц, изображений, списков (добавляют визуальный объём)
-    table_penalty = sum(1 for t in doc.tables for r in t.rows for c in r.cells if (c.text or "").strip()) * 0.12
-    image_penalty = 0.5 * len([r for r in doc.paragraphs if any("drawing" in str(r._element.xml).lower() for _ in [1])])  # rough
-    pages = int(pages + table_penalty + image_penalty)
-    
-    # Практический минимум для академических работ
-    if raw_chars > 1500:
-        pages = max(pages, 3)
-    
-    print(f"[ESTIM] {raw_chars} симв | cpl={cpl} lpp={lpp} | слогов={syllables} → ~{pages} стр (est_cpp={est_cpp:.0f})")
+    print(f"[ESTIM] {raw_chars} симв, {syllables} слогов → {pages} стр")
     return max(1, pages)
 
 
@@ -2714,9 +2596,8 @@ async def _expand_blocks_by_chars(
     if not candidates:
         return [tuple(b) for b in blocks]
 
-    # Равномерно распределяем нагрузку + 10% запас
-    per_block = int((chars_to_add / max(1, len(candidates))) * 1.1)
-    per_block = max(300, per_block) # Но минимум 300 символов, чтобы ИИ мог развернуть мысль
+    # Равномерно распределяем нагрузку + 30% запас
+    per_block = int((chars_to_add / max(1, len(candidates))) * 1.3) + 300
     
     style_label = "высокоакадемический научный" if writing_style == "smart" else "деловой научный"
     style_sys = (
@@ -4168,9 +4049,8 @@ async def generate_and_send(
 
 async def main() -> None:
     print("═" * 62)
-    print("  🤖  ГОСТ-АССИСТЕНТ v2.8 (профессиональный подсчёт страниц)")
+    print("  🤖  ГОСТ-АССИСТЕНТ v2.7")
     print("═" * 62)
-    print("  Page counter: PyMuPDF + pypdf (triple verification) + ultra estimator")
     print(f"  LibreOffice : {shutil.which('soffice') or '❌ не найден'}")
     print(f"  DeepSeek    : {'✅' if DEEPSEEK_KEY else '❌ нет ключа'}")
     print(f"  OpenRouter  : {'✅' if OPENROUTER_KEY else '❌ нет ключа'}")
