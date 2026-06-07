@@ -840,8 +840,10 @@ async def chat_with_model(info: dict, messages: list[dict], max_tokens: int = 40
 
 
 def fallback_chain(primary: str) -> list[str]:
-    """Цепочка фоллбэков: сначала primary, потом остальные доступные."""
-    preferred = [primary, "deepseek", "deepseek_r1", "gemini_or", "groq"]
+    """Цепочка фоллбэков: primary + только OpenRouter (один API-ключ приоритет). Не использует все ключи одновременно."""
+    preferred = [primary]
+    if primary not in ["deepseek_r1", "gemini_or"]:
+        preferred.extend(["deepseek_r1", "gemini_or"])
     out: list[str] = []
     for k in preferred:
         if k not in AI_MODELS or k in out:
@@ -1375,8 +1377,8 @@ def generate_structure(
         chapter_text_parts = []
         for j, sub_title in enumerate(subs, start=1):
             key = f"ch{i}_s{j}"
-            sub_text = parts.get(key, "")
-            if sub_text:
+            sub_text = parts.get(key, "").strip()
+            if sub_text and len(sub_text) >= 120:
                 sub_blocks.append((sub_title, sub_text))
                 chapter_text_parts.append(sub_text)
 
@@ -2306,8 +2308,7 @@ def build_docx_bytes(
                     _set_run_font(run, fn, fs, True)
                 shp.paragraph_format.first_line_indent = Cm(0)
                 if sub_text:
-                    # СТРИПАЕМ продублированный заголовок из начала текста,
-                    # чтобы не было «1.1. Название» дважды подряд
+                    # УЛУЧШЕННАЯ СТРИПАЕМ продублированный заголовок подглавы (усиленная дедупликация в build_docx_bytes)
                     clean_text = sub_text
                     # Паттерн: "1.1. Остальной заголовок" в начале текста
                     first_line = sub_text.split('\n')[0].strip()
@@ -2921,7 +2922,7 @@ async def precise_page_adjustment(
     measure_dir = os.path.join(work_dir, "_measure")
     os.makedirs(measure_dir, exist_ok=True)
     
-    max_iters = 15  # Увеличено для более точной подгонки
+    max_iters = 30
     
     for it in range(max_iters):
         # Измеряем текущее количество страниц
@@ -2944,7 +2945,10 @@ async def precise_page_adjustment(
         if diff == 0:
             print(f"[ADJUST] ✅ Цель достигнута!")
             break
-        elif it >= 7 and abs(diff) <= 1:
+        elif diff > 0:
+            # Всегда обрезаем если перебор (даже +1), чтобы не было +1 над целью
+            pass  # continue to trim
+        elif it >= 10 and abs(diff) <= 1:
             print(f"[ADJUST] ✅ Приемлемая цель достигнута на поздней итерации: {real_pages} стр.")
             break
         
