@@ -2182,33 +2182,39 @@ def add_paragraphs_from_text(
     text: str,
     gost: dict,
     is_bib: bool = False,
+    skip_first_heading: Optional[str] = None,
 ) -> None:
     """
     Разбивает текст на абзацы и добавляет их в документ.
-    Строки вида '1.1. Название подглавы' оформляются как Heading 2.
+    skip_first_heading - если передан, удаляет первую строку, совпадающую с этим заголовком
     """
     font   = gost.get("font_name", "Times New Roman")
     size   = int(gost.get("font_size", 14))
-    indent = Cm(float(gost.get("first_line_indent_cm", 1.25)))  # ошибка #7
+    indent = Cm(float(gost.get("first_line_indent_cm", 1.25)))
 
-    # Список литературы: единый формат нумерации (ошибка #9)
     if is_bib:
         text = _normalize_bibliography(text)
     else:
-        text = _normalize_punctuation(text)  # ошибка #5
+        text = _normalize_punctuation(text)
+
+    if skip_first_heading and not is_bib:
+        lines = text.split('\n')
+        if lines:
+            first_line = lines[0].strip()
+            norm_first = re.sub(r'\s+', ' ', first_line.lower())
+            norm_heading = re.sub(r'\s+', ' ', skip_first_heading.lower())
+            if norm_first == norm_heading or norm_first.startswith(norm_heading[:20]):
+                text = '\n'.join(lines[1:]).strip()
 
     def _apply_body_format(p) -> None:
-        """Единое оформление абзаца основного текста (ошибки #6, #7)."""
         p.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
         p.paragraph_format.first_line_indent = indent
         p.paragraph_format.space_before = Pt(0)
         p.paragraph_format.space_after  = Pt(0)
 
-    # Паттерн для подглав: "1.1. Текст" или "2.3. Текст"
     subheading_pat = re.compile(r"^(\d+\.\d+\.?\s+.{5,80})$")
 
     if is_bib:
-        # Каждая позиция списка — отдельный абзац с висячим отступом
         for line in [l for l in text.split("\n") if l.strip()]:
             p = doc.add_paragraph()
             p.paragraph_format.alignment         = WD_ALIGN_PARAGRAPH.JUSTIFY
@@ -2226,19 +2232,15 @@ def add_paragraphs_from_text(
         first_line = ch.split("\n")[0].strip()
 
         if subheading_pat.match(first_line):
-            # Это подзаголовок — Heading 2
-            hp = doc.add_paragraph(first_line, style="Heading 2")
-            for run in hp.runs:
-                _set_run_font(run, font, size, True)
-            hp.paragraph_format.first_line_indent = Cm(0)
-            # Остаток как обычный текст
+            p = doc.add_paragraph()
+            _apply_body_format(p)
+            run1 = p.add_run(first_line)
+            _set_run_font(run1, font, size, True)
             rest = ch[len(first_line):].strip()
             if rest:
-                p = doc.add_paragraph()
-                _apply_body_format(p)
                 clean_rest = re.sub(r'\s*\n\s*', ' ', rest)
-                r = p.add_run(clean_rest)
-                _set_run_font(r, font, size, False)
+                run2 = p.add_run(clean_rest)
+                _set_run_font(run2, font, size, False)
         else:
             p = doc.add_paragraph()
             _apply_body_format(p)
