@@ -282,7 +282,7 @@ FREE_MAX_PAGES    = int(cfg("FREE_MAX_PAGES",         "15"))
 # Кулдаун между бесплатными генерациями: по умолчанию 5 суток (432000 сек).
 # Лимит "1 генерация в 5 дней" реализован именно через кулдаун, а не дневной счётчик —
 # это даёт точное окно 5×24 ч от момента предыдущей генерации.
-FREE_COOLDOWN     = int(cfg("FREE_COOLDOWN_SECONDS",  str(5 * 24 * 60 * 60)))
+FREE_COOLDOWN     = int(cfg("FREE_COOLDOWN_SECONDS",  str(7 * 24 * 60 * 60)))
 # FREE_DAILY_LIMIT оставлен для совместимости; основной фильтр — кулдаун.
 FREE_DAILY_LIMIT  = int(cfg("FREE_DAILY_LIMIT",       "0"))   # 0 = без дневного лимита
 
@@ -2921,7 +2921,7 @@ async def precise_page_adjustment(
     measure_dir = os.path.join(work_dir, "_measure")
     os.makedirs(measure_dir, exist_ok=True)
     
-    max_iters = 10
+    max_iters = 15  # Увеличено для более точной подгонки
     
     for it in range(max_iters):
         # Измеряем текущее количество страниц
