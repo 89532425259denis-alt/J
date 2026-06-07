@@ -292,6 +292,36 @@ PAID_DAILY_LIMIT  = int(cfg("PAID_DAILY_LIMIT",       "0"))   # 0 = безлим
 PAID_COOLDOWN     = int(cfg("PAID_COOLDOWN_SECONDS",  "0"))   # 0 = нет кулдауна
 
 # Символов на страницу (ГОСТ: ~1800-2000 знаков с пробелами на стр A4 14pt 1.5 интервал)
+def calculate_chars_per_page(gost: dict) -> int:
+    """Рассчитывает точное количество символов на страницу по параметрам ГОСТа."""
+    font_size = int(gost.get("font_size", 14))
+    line_spacing = float(gost.get("line_spacing", 1.5))
+    left_mm = int(gost.get("left_margin_mm", 30))
+    right_mm = int(gost.get("right_margin_mm", 15))
+    top_mm = int(gost.get("top_margin_mm", 20))
+    bottom_mm = int(gost.get("bottom_margin_mm", 20))
+
+    page_width_mm = 210
+    page_height_mm = 297
+
+    text_width_mm = page_width_mm - left_mm - right_mm
+    text_height_mm = page_height_mm - top_mm - bottom_mm
+
+    char_width_mm = font_size * 0.42 * 0.3528
+    chars_per_line = max(25, int(text_width_mm / char_width_mm))
+
+    line_height_mm = font_size * line_spacing * 0.3528
+    lines_per_page = max(18, int(text_height_mm / line_height_mm))
+
+    base = chars_per_line * lines_per_page
+
+    if line_spacing >= 1.5:
+        base = int(base * 0.95)
+    if font_size >= 14:
+        base = int(base * 0.97)
+
+    return max(1450, min(2100, base))
+
 CHARS_PER_PAGE = int(cfg("CHARS_PER_PAGE", "1850"))
 # Страниц без текста (титул + содержание)
 NON_TEXT_PAGES = int(cfg("NON_TEXT_PAGES", "2"))
@@ -969,13 +999,17 @@ def _default_chapter_titles(doc_type: str, topic: str, num_chapters: int) -> lis
 #  РАСЧЁТ ОБЪЁМА ТЕКСТА — ИСПРАВЛЕННЫЙ
 # ═══════════════════════════════════════════════════════════════
 
-def target_chars(pages: int) -> int:
+def target_chars(pages: int, gost: dict = None) -> int:
     """
     Целевое количество символов с пробелами для основного текста.
-    Вычитаем NON_TEXT_PAGES (титул + содержание), остаток умножаем на CHARS_PER_PAGE.
+    Использует динамический расчёт из ГОСТа, если gost передан.
     """
+    if gost:
+        chars = calculate_chars_per_page(gost)
+    else:
+        chars = CHARS_PER_PAGE
     text_pages = max(1, pages - NON_TEXT_PAGES)
-    return text_pages * CHARS_PER_PAGE
+    return text_pages * chars
 
 
 def tokens_for_chars(chars: int) -> int:
