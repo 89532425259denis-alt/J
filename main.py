@@ -2300,18 +2300,21 @@ def add_toc(doc: Document, blocks: list[tuple], gost: dict) -> None:
     run._r.append(fld_begin)
     run._r.append(instr)
     run._r.append(fld_sep)
+
+    # Текстовая заглушка внутри TOC-поля (между separate и end).
+    # При обновлении в Word/LO она ЗАМЕНИТСЯ реальным содержанием.
+    # Каждый пункт — через <w:br/> (перенос строки), чтобы DOCX
+    # отображал их на отдельных строках даже без обновления поля.
+    toc_entries = _toc_entries(blocks)
+    for i, (entry_title, entry_level) in enumerate(toc_entries):
+        prefix = "    " if entry_level == 2 else ""
+        run.add_text(f"{prefix}{entry_title}")
+        # Добавляем перенос строки (w:br) после каждого пункта кроме последнего
+        if i < len(toc_entries) - 1:
+            br_el = OxmlElement("w:br")
+            run._r.append(br_el)
+
     run._r.append(fld_end)
-
-    # Текстовая структура (уровни 1 и 2) — без номеров страниц
-    for title, level in _toc_entries(blocks):
-        p = doc.add_paragraph()
-        p.paragraph_format.first_line_indent = Cm(0)
-        p.paragraph_format.space_before = Pt(0)
-        p.paragraph_format.space_after  = Pt(2)
-        p.paragraph_format.left_indent  = Cm(0) if level == 1 else Cm(1.0)
-
-        run_t = p.add_run(title)
-        _set_run_font(run_t, fn, fs if level == 1 else fs - 1, level == 1)
 
 
 def add_title_page(doc: Document, data: dict, gost: dict) -> None:
@@ -2495,7 +2498,10 @@ def build_docx_bytes(
 
     add_toc(doc, blocks, gost)
 
-    doc.add_page_break()
+    # НЕ добавляем doc.add_page_break() после содержания!
+    # Разрыв страницы будет установлен через page_break_before
+    # на первом заголовке Heading 1 тела документа (см. цикл ниже).
+    # Это предотвращает пустые страницы после содержания.
 
     # ── Нумерация страниц ──
     add_page_number_field(
@@ -2515,11 +2521,35 @@ def build_docx_bytes(
             _set_run_font(run, fn, h_sz, True)
         hp.paragraph_format.first_line_indent = Cm(0)
 
+        # ══ Разрыв страницы ПЕРЕД каждым заголовком 1-го уровня ══
+        # Используем page_break_before на самом параграфе заголовка,
+        # а НЕ doc.add_page_break() после предыдущего блока.
+        # Это исключает создание пустого параграфа-разрыва, который
+        # вызывает «пустые страницы» между разделами.
+        # Первый блок тоже получает page_break_before (отделяет от содержания).
+        if level == 1:
+            hp.paragraph_format.page_break_before = True
+
         # Основной текст главы
         is_bib = any(w in title.upper() for w in ("ИСТОЧНИК", "ЛИТЕРАТ", "БИБЛИОГРАФ"))
 
         if subblocks:
             # Есть подблоки — выводим их с заголовком Heading 2 и текстом
+            # Предварительно проверяем: если все подглавы пусты, а общий текст есть —
+            # распределяем общий текст между подглавами
+            all_empty = all(not st for _, st in subblocks)
+            if all_empty and text:
+                # Делим общий текст на примерно равные части
+                paragraphs_all = [p.strip() for p in re.split(r'\n\s*\n', text) if p.strip()]
+                chunk_size = max(1, len(paragraphs_all) // max(1, len(subblocks)))
+                chunks = []
+                for ci in range(len(subblocks)):
+                    start = ci * chunk_size
+                    end = start + chunk_size if ci < len(subblocks) - 1 else len(paragraphs_all)
+                    chunks.append("\n\n".join(paragraphs_all[start:end]))
+                subblocks = [(st, chunks[ci] if ci < len(chunks) else "") for ci, (st, _) in enumerate(subblocks)]
+                print(f"[FIX] Распределили общий текст главы «{title}» по {len(subblocks)} подглавам")
+
             for sub_title, sub_text in subblocks:
                 shp = doc.add_paragraph(sub_title, style="Heading 2")
                 for run in shp.runs:
@@ -2528,6 +2558,9 @@ def build_docx_bytes(
                 if sub_text:
                     # Убираем продублированный заголовок подглавы из текста
                     add_paragraphs_from_text(doc, sub_text, gost, skip_first_heading=sub_title)
+                else:
+                    # ═══ Подглава без текста — предупреждение ═══
+                    print(f"[WARN] Подглава «{sub_title}» без текста в build_docx_bytes")
         elif text:
             # Нет подблоков — выводим основной текст
             clean_text = text
@@ -2541,10 +2574,9 @@ def build_docx_bytes(
                 rest = text[len(first_line):].lstrip('\n').lstrip('\r')
                 clean_text = rest if rest else text
             add_paragraphs_from_text(doc, clean_text, gost, is_bib=is_bib, skip_first_heading=title if is_bib else None)
-
-        # Разрыв страницы между главами/разделами (кроме последнего)
-        if idx < last_idx:
-            doc.add_page_break()
+        else:
+            # ═══ Блок без текста — предотвращаем пустую страницу ═══
+            print(f"[WARN] Блок «{title}» полностью пуст в build_docx_bytes")
 
     buf = io.BytesIO()
     doc.save(buf)
@@ -2818,8 +2850,15 @@ def estimate_docx_pages(docx_path: str) -> Optional[int]:
         text = paragraph.text or ""
         total_chars += len(text)
         
-        # Проверяем на page break
+        # Проверяем на page break (включая w:br и pageBreakBefore)
         from docx.oxml.ns import qn
+        # Проверяем page_break_before в свойствах параграфа
+        pPr = paragraph._element.find(qn("w:pPr"))
+        if pPr is not None:
+            pbb = pPr.find(qn("w:pageBreakBefore"))
+            if pbb is not None and pbb.get(qn("w:val"), "true") != "false":
+                page_breaks += 1
+        # Проверяем явные разрывы w:br в run-ах
         for run in paragraph.runs:
             for br in run._element.iter(qn("w:br")):
                 if br.get(qn("w:type")) == "page":
