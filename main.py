@@ -1878,6 +1878,8 @@ def _normalize_bibliography(text: str) -> str:
     if not text:
         return ""
     raw = text.replace("\r\n", "\n").replace("\r", "\n")
+    # Убираем markdown-разделители
+    raw = re.sub(r'^[-*=]{3,}\s*$', '', raw, flags=re.MULTILINE)
     # Разбиваем по новым строкам и по началам пунктов вида "12. "
     candidates = re.split(r"\n+|(?<=\S)\s+(?=\d{1,3}\s*[.)]\s)", raw)
     items: list[str] = []
@@ -1885,6 +1887,11 @@ def _normalize_bibliography(text: str) -> str:
         c = c.strip()
         if not c:
             continue
+        # Пропускаем явные заголовки библиографии (не начинаются с цифры)
+        if not re.match(r'^\d', c):
+            up = c.upper()
+            if any(w in up for w in ("СПИСОК ЛИТЕРАТУРЫ", "СПИСОК ИСПОЛЬЗОВАННЫХ", "БИБЛИОГРАФ", "ИСТОЧНИК", "ЛИТЕРАТУРА")):
+                continue
         # Снимаем существующую нумерацию "1. ", "1) ", "1 )", "1 " в начале
         c = re.sub(r"^\d{1,3}\s*[.)]\s*", "", c).strip()
         c = _normalize_punctuation(c)
@@ -2177,6 +2184,16 @@ def add_title_page(doc: Document, data: dict, gost: dict) -> None:
     _add_centered(f"{data.get('city', 'Москва')}  {datetime.now().year}", 14, False)
 
 
+def _norm_heading(text: str) -> str:
+    """Нормализует заголовок для сравнения: lower, убирает пробелы, точки после номеров."""
+    t = re.sub(r'\s+', ' ', text.lower().strip())
+    # убираем точки после цифр в конце номеров: 1.1. -> 1.1, 1. -> 1
+    t = re.sub(r'(\d)\.(\s|$)', r'\1\2', t)
+    # убираем все точки для ещё большей толерантности
+    t = t.replace('.', '')
+    return t
+
+
 def add_paragraphs_from_text(
     doc: Document,
     text: str,
@@ -2197,13 +2214,16 @@ def add_paragraphs_from_text(
     else:
         text = _normalize_punctuation(text)
 
-    if skip_first_heading and not is_bib:
+    if skip_first_heading:
         lines = text.split('\n')
         if lines:
             first_line = lines[0].strip()
-            norm_first = re.sub(r'\s+', ' ', first_line.lower())
-            norm_heading = re.sub(r'\s+', ' ', skip_first_heading.lower())
-            if norm_first == norm_heading or norm_first.startswith(norm_heading[:20]):
+            norm_first = _norm_heading(first_line)
+            norm_heading = _norm_heading(skip_first_heading)
+            # Проверяем полное совпадение или существенное начальное совпадение
+            if (norm_first == norm_heading or 
+                (len(norm_heading) > 5 and norm_first.startswith(norm_heading[:min(len(norm_heading), 30)])) or
+                (len(norm_first) > 5 and norm_heading.startswith(norm_first[:min(len(norm_first), 30)]))):
                 text = '\n'.join(lines[1:]).strip()
 
     def _apply_body_format(p) -> None:
@@ -2310,34 +2330,21 @@ def build_docx_bytes(
                     _set_run_font(run, fn, fs, True)
                 shp.paragraph_format.first_line_indent = Cm(0)
                 if sub_text:
-                    # УЛУЧШЕННАЯ СТРИПАЕМ продублированный заголовок подглавы (усиленная дедупликация в build_docx_bytes)
-                    clean_text = sub_text
-                    # Паттерн: "1.1. Остальной заголовок" в начале текста
-                    first_line = sub_text.split('\n')[0].strip()
-                    # Нормализуем для сравнения (убираем лишние пробелы)
-                    norm_sub_title = re.sub(r'\s+', ' ', sub_title.strip())
-                    norm_first = re.sub(r'\s+', ' ', first_line)
-                    # Если первая строка совпадает с sub_title (полностью или по номеру)
-                    if (norm_first == norm_sub_title or
-                        (re.match(r'^\d+\.\d+\.?\s', first_line) and
-                         first_line[:20] == sub_title.strip()[:20])):
-                        # Убираем первую строку (продублированный заголовок)
-                        rest = sub_text[len(first_line):].lstrip('\n').lstrip('\r')
-                        clean_text = rest if rest else sub_text
-                    add_paragraphs_from_text(doc, clean_text, gost)
+                    # Убираем продублированный заголовок подглавы из текста
+                    add_paragraphs_from_text(doc, sub_text, gost, skip_first_heading=sub_title)
         elif text:
             # Нет подблоков — выводим основной текст
             clean_text = text
             # Стрипаем продублированный заголовок из начала текста
             first_line = text.split('\n')[0].strip()
-            norm_title = re.sub(r'\s+', ' ', title.strip().upper())
-            norm_first = re.sub(r'\s+', ' ', first_line.upper())
+            norm_title = _norm_heading(title)
+            norm_first = _norm_heading(first_line)
             if (norm_first == norm_title or 
-                (norm_first.startswith("ГЛАВА") and norm_title.startswith("ГЛАВА") and 
+                (norm_first.startswith("глава") and norm_title.startswith("глава") and 
                  norm_first[:15] == norm_title[:15])):
                 rest = text[len(first_line):].lstrip('\n').lstrip('\r')
                 clean_text = rest if rest else text
-            add_paragraphs_from_text(doc, clean_text, gost, is_bib=is_bib)
+            add_paragraphs_from_text(doc, clean_text, gost, is_bib=is_bib, skip_first_heading=title if is_bib else None)
 
         # Разрыв страницы между главами/разделами (кроме последнего)
         if idx < last_idx:
