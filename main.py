@@ -34,6 +34,7 @@ import asyncio
 import io
 import json
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -1173,12 +1174,12 @@ def build_prompts(
                 writing_style, doc_type,
             ),
             "literature": (
-                f"Составь список из 3–5 источников по теме «{topic}» "
-                f"строго по ГОСТ Р 7.0.5-2008. "
-                f"Включи ТОЛЬКО источники, соответствующие дисциплине «{subject}». "
-                f"Если тема не совпадает с дисциплиной — подбери источники "
-                f"по дисциплине, связанные с темой. "
-                f"Формат: 1. Автор А.А. Название. — М.: Издательство, год. — N с.\n"
+                f"Составь список из 3–5 источников по теме «{topic}», дисциплина «{subject}». "
+                f"Используй ТОЛЬКО реальные, проверяемые источники: учебники, законы, "
+                f"статьи из реальных журналов, известные монографии. "
+                f"НЕ выдумывай фамилии, названия издательств или журналов. "
+                f"Если точный источник неизвестен — опусти его, не фантазируй. "
+                f"Формат ГОСТ Р 7.0.5-2008: 1. Автор А.А. Название. — М.: Изд-во, год. — N с.\n"
                 f"Только список, без заголовков и пояснений."
             ),
         }
@@ -1205,8 +1206,12 @@ def build_prompts(
                 doc_type,
             ),
             "literature": (
-                f"Составь список из 8–12 источников по теме «{topic}» по ГОСТ. "
-                f"Только нумерованный список."
+                f"Составь список из 8–12 источников по теме «{topic}», дисциплина «{subject}». "
+                f"Используй ТОЛЬКО реальные, проверяемые источники: учебники, законы, "
+                f"статьи из реальных журналов, известные монографии. "
+                f"НЕ выдумывай фамилии, названия издательств или журналов. "
+                f"Если точный источник неизвестен — опусти его, не фантазируй. "
+                f"Формат ГОСТ Р 7.0.5-2008. Только нумерованный список."
             ),
         }
         # Заключение для доклада генерируется ПОСЛЕ разделов (см. generate_text_blocks)
@@ -1251,9 +1256,12 @@ def build_prompts(
                 writing_style, doc_type,
             ),
             "literature": (
-                f"Составь список литературы (References) из 10–15 авторитетных источников по теме «{topic}» "
-                f"в соответствии с ГОСТ Р 7.0.5-2008 / ГОСТ Р 7.0.7-2021. "
-                f"Только нумерованный список."
+                f"Составь список литературы (References) из 10–15 реальных, проверяемых источников "
+                f"по теме «{topic}», дисциплина «{subject}». "
+                f"Используй ТОЛЬКО реальные источники: учебники, законы, статьи из реальных журналов, "
+                f"известные монографии. НЕ выдумывай фамилии, названия издательств или DOI. "
+                f"Если точный источник неизвестен — опусти его, не фантазируй. "
+                f"Формат ГОСТ Р 7.0.5-2008 / ГОСТ Р 7.0.7-2021. Только нумерованный список."
             ),
         }
 
@@ -1311,10 +1319,12 @@ def build_prompts(
     # Библиография
     num_sources = 12 if pages <= 20 else 20
     prompts["literature"] = (
-        f"Составь список из {num_sources}–{num_sources + 5} источников по теме «{topic}» "
-        f"строго по ГОСТ Р 7.0.5-2008. Включи: монографии, учебники, статьи из журналов, "
-        f"нормативные документы (если уместно), интернет-ресурсы. "
-        f"Формат: 1. Автор А.А. Название / А.А. Автор. — М.: Изд-во, год. — N с.\n"
+        f"Составь список из {num_sources}–{num_sources + 5} источников по теме «{topic}», дисциплина «{subject}». "
+        f"Используй ТОЛЬКО реальные, проверяемые источники: учебники, законы, "
+        f"статьи из реальных журналов, известные монографии. "
+        f"НЕ выдумывай фамилии, названия издательств или журналов. "
+        f"Если точный источник неизвестен — опусти его, не фантазируй. "
+        f"Формат ГОСТ Р 7.0.5-2008: 1. Автор А.А. Название / А.А. Автор. — М.: Изд-во, год. — N с.\n"
         f"Только нумерованный список без заголовков."
     )
 
@@ -1338,12 +1348,11 @@ def generate_structure(
     список_подглав = [] или [(название_подглавы, текст), ...]
     """
     if doc_type == "esse":
+        # Эссе — без подзаголовков, плавный текст
+        main_text = parts.get("main1", "") + "\n\n" + parts.get("main2", "")
         return [
             ("ВВЕДЕНИЕ", 1, parts.get("intro", ""), []),
-            ("ОСНОВНАЯ ЧАСТЬ", 1, "", [
-                ("Аргумент 1", parts.get("main1", "")),
-                ("Аргумент 2. Контраргумент и опровержение", parts.get("main2", "")),
-            ]),
+            ("ОСНОВНАЯ ЧАСТЬ", 1, main_text, []),
             ("ЗАКЛЮЧЕНИЕ", 1, parts.get("conclusion", ""), []),
             ("СПИСОК ИСПОЛЬЗОВАННЫХ ИСТОЧНИКОВ", 1, parts.get("literature", ""), []),
         ]
@@ -1453,6 +1462,7 @@ async def generate_text_blocks(
     chapter_titles: list[dict],
     writing_style: str = "classic",
     prog: Optional["Progress"] = None,
+    humanize: bool = False,
 ) -> dict[str, str]:
     """
     Генерирует все текстовые блоки.
@@ -1577,6 +1587,14 @@ async def generate_text_blocks(
             text = _stub_text(key, topic)
 
         text = _clean_ai_artifacts(text)
+        text = _replace_ai_cliches(text)
+        if humanize and key not in ("literature",):
+            text = _add_human_touch(text)
+        # Внутренний "детектор" ИИ: если много шаблонов — ещё проход замены
+        if _ai_detector_score(text) > 30 and key not in ("literature",):
+            text = _replace_ai_cliches(text)
+            if humanize:
+                text = _add_human_touch(text)
 
         # ── ЗАЩИТА ОТ СЛУЖЕБНЫХ ФРАЗ И КОРОТКИХ ОТВЕТОВ ──
         forbidden_patterns = [
@@ -1686,7 +1704,8 @@ async def generate_text_blocks(
             f"2. Опирайся ТОЛЬКО на аргументы выше, не выдумывай новые факты.\n"
             f"3. Выскажи авторскую позицию и возможный прогноз.\n"
             f"4. НЕ упоминай «главы», «разделы» — это эссе, а не реферат.\n"
-            f"5. НЕ используй канцеляризмы («практическая значимость», «систематизация»)."
+            f"5. НЕ используй канцеляризмы («практическая значимость», «систематизация»).\n"
+            f"6. Максимум 5–7 предложений. Пиши просто, без канцеляризма."
         )
     elif doc_type == "doklad":
         conc_prompt = (
@@ -1694,7 +1713,8 @@ async def generate_text_blocks(
             f"Содержание разделов:\n{content_context}\n\n"
             f"Задача: подведи итог, сформулируй ключевые выводы и практическое значение.\n"
             f"НЕ упоминай «главы» — это доклад с разделами 1 и 2.\n"
-            f"Стиль — устный, чёткий, без излишней сложности."
+            f"Стиль — устный, чёткий, без излишней сложности.\n"
+            f"Максимум 5–7 предложений. Пиши просто, без канцеляризма."
         )
     elif doc_type == "article":
         conc_prompt = (
@@ -1704,7 +1724,8 @@ async def generate_text_blocks(
             f"1. Опираясь на содержание выше, сформулируй основные научные выводы исследования.\n"
             f"2. Подчеркни научную новизну и теоретическую/практическую значимость работы.\n"
             f"3. Опиши возможные направления дальнейших исследований в этой научной области.\n"
-            f"4. Стиль изложения — строго академический, безличный."
+            f"4. Стиль изложения — строго академический, безличный.\n"
+            f"5. Максимум 5–7 предложений. Без канцелярита и шаблонов."
         )
     else:
         conc_prompt = (
@@ -1716,7 +1737,8 @@ async def generate_text_blocks(
             f"3. Сформулируй общие выводы и практическую значимость.\n"
             f"4. Укажи перспективы дальнейшего исследования.\n"
             f"5. Используй сноски [1], [2] на источники.\n"
-            f"ЗАПРЕЩЕНО: выдумывать необсуждённые темы."
+            f"ЗАПРЕЩЕНО: выдумывать необсуждённые темы.\n"
+            f"6. Максимум 5–7 предложений. Пиши просто, без канцеляризма."
         )
 
     conc_messages = [
@@ -1744,6 +1766,13 @@ async def generate_text_blocks(
         conc_text = _stub_text("conclusion", topic)
 
     conc_text = _clean_ai_artifacts(conc_text)
+    conc_text = _replace_ai_cliches(conc_text)
+    if humanize:
+        conc_text = _add_human_touch(conc_text)
+    if _ai_detector_score(conc_text) > 30:
+        conc_text = _replace_ai_cliches(conc_text)
+        if humanize:
+            conc_text = _add_human_touch(conc_text)
     parts["conclusion"] = conc_text
 
     if prog:
@@ -1900,6 +1929,126 @@ def _normalize_bibliography(text: str) -> str:
     if not items:
         return _normalize_punctuation(text)
     return "\n".join(f"{i}. {it}" for i, it in enumerate(items, start=1))
+
+
+def _replace_ai_cliches(text: str) -> str:
+    """Заменяет типичные ИИ-шаблоны на более простые, живые формулировки."""
+    if not text:
+        return ""
+    replacements = [
+        (r'(?i)\bактуальность (данной |этой )?(работы|темы|проблемы|проблематики) обусловлена\b',
+         'эта тема важна сейчас, потому что'),
+        (r'(?i)\bстепень (её|ее|их|её) разработанности (в настоящее время|в данный момент|сегодня)\b',
+         'об этом уже много писали'),
+        (r'(?i)\bв современных условиях\b', 'сегодня'),
+        (r'(?i)\bтаким образом,?\b', 'итак'),
+        (r'(?i)\bв заключение следует отметить\b', 'подведём итоги'),
+        (r'(?i)\bв ходе проведённого исследования\b', 'в ходе работы'),
+        (r'(?i)\bцель (данной |этой )?работы заключается в\b', 'я хотел(а) понять'),
+        (r'(?i)\bобъектом исследования выступает\b', 'я изучал(а)'),
+        (r'(?i)\bпредметом исследования является\b', 'меня интересовало'),
+        (r'(?i)\bнеобходимо отметить\b', 'стоит сказать'),
+        (r'(?i)\bследует подчеркнуть\b', 'важно'),
+        (r'(?i)\bбыло установлено, что\b', 'оказалось, что'),
+        (r'(?i)\bможно сделать вывод\b', 'вывод такой'),
+        (r'(?i)\bпрактическая значимость работы\b', 'это может пригодиться'),
+        (r'(?i)\bтеоретическая значимость\b', 'это важно для науки'),
+        (r'(?i)\bв силу вышеизложенного\b', 'поэтому'),
+        (r'(?i)\bданная работа посвящена\b', 'эта работа про'),
+        (r'(?i)\bв контексте\b', 'в рамках'),
+        (r'(?i)\bочевидно,?\b', 'понятно'),
+        (r'(?i)\bследует отметить\b', 'стоит отметить'),
+        (r'(?i)\bбезусловно\b', 'бесспорно'),
+        (r'(?i)\bнесомненно\b', 'конечно'),
+        (r'(?i)\bв целом ряде\b', 'во многих'),
+        (r'(?i)\bна протяжении\b', 'в течение'),
+    ]
+    for pattern, repl in replacements:
+        text = re.sub(pattern, repl, text)
+    return text
+
+
+def _add_human_touch(text: str) -> str:
+    """Добавляет мелкие естественные неточности, чтобы текст не выглядел идеально гладким."""
+    if not text or len(text) < 300:
+        return text
+
+    paragraphs = text.split('\n\n')
+    if len(paragraphs) > 2:
+        # Сделаем один абзац немного короче — обрежем последнее предложение
+        idx = random.randint(0, len(paragraphs) - 2)
+        para = paragraphs[idx]
+        sentences = re.split(r'(?<=[.!?])\s+', para)
+        if len(sentences) > 3:
+            paragraphs[idx] = ' '.join(sentences[:-1]) + '.'
+            text = '\n\n'.join(paragraphs)
+
+    # 1-2 случайные опечатки (перестановка соседних букв)
+    words = text.split()
+    candidates = [i for i, w in enumerate(words) if len(w) > 5 and w.isalpha() and not w.isupper()]
+    if candidates:
+        for idx in random.sample(candidates, min(2, len(candidates))):
+            w = words[idx]
+            pos = random.randint(1, len(w) - 2)
+            words[idx] = w[:pos] + w[pos+1] + w[pos] + w[pos+2:]
+    text = ' '.join(words)
+
+    # Случайный двойной пробел в одном месте
+    if random.random() < 0.4:
+        text = text.replace(' ', '  ', 1)
+
+    return text
+
+
+def _ai_detector_score(text: str) -> float:
+    """Внутренняя эвристика: оценка 'ИИ-шности' текста (0–100%)."""
+    if not text or len(text) < 200:
+        return 0.0
+    ai_markers = [
+        r'актуальность.*обусловлена',
+        r'степень разработанности',
+        r'в современных условиях',
+        r'таким образом',
+        r'в заключение',
+        r'в ходе проведённого',
+        r'практическая значимость',
+        r'теоретическая значимость',
+        r'объектом исследования',
+        r'предметом исследования',
+        r'цель работы заключается',
+        r'было установлено',
+        r'можно сделать вывод',
+        r'необходимо отметить',
+        r'следует подчеркнуть',
+        r'в силу вышеизложенного',
+        r'данная работа посвящена',
+        r'в целом ряде',
+        r'на протяжении',
+        r'очевидно',
+        r'следует отметить',
+        r'безусловно',
+        r'несомненно',
+    ]
+    text_lower = text.lower()
+    score = 0.0
+    for marker in ai_markers:
+        if re.search(marker, text_lower):
+            score += 3.0
+    # Однообразие абзацев
+    paras = [p for p in text.split('\n\n') if p.strip()]
+    if len(paras) >= 3:
+        lengths = [len(p) for p in paras]
+        avg = sum(lengths) / len(lengths)
+        variance = sum((l - avg) ** 2 for l in lengths) / len(lengths)
+        if variance < 500:
+            score += 15.0
+    # Однообразие начала абзацев
+    starts = [p.strip()[:12].lower() for p in paras if p.strip()]
+    if len(starts) > 2:
+        unique = len(set(starts))
+        if unique / len(starts) < 0.5:
+            score += 10.0
+    return min(100.0, score)
 
 
 def _set_run_font(run, font_name: str, size_pt: int, bold: bool = False) -> None:
@@ -3145,6 +3294,15 @@ def kb_page_number() -> InlineKeyboardMarkup:
     )
 
 
+def kb_humanize() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🤖 Да — добавить естественные неточности (опечатки, разные абзацы)", callback_data="humanize_yes")],
+            [InlineKeyboardButton(text="📝 Нет — оставить чистый текст", callback_data="humanize_no")],
+        ]
+    )
+
+
 def kb_final() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -3199,6 +3357,7 @@ class WorkState(StatesGroup):
     page_number_position = State()
     model              = State()
     payment            = State()
+    humanize           = State()
     gost_free_text     = State()
 
 
@@ -3833,11 +3992,14 @@ async def h_pagepos(cb: CallbackQuery, state: FSMContext) -> None:
             return
 
         await cb.message.edit_text(
-            "🚀 <b>Запускаю генерацию...</b>\n\nПодождите, это займёт несколько минут.",
+            "🤖 <b>Добавить естественные неточности?</b>\n\n"
+            "Бот может внести 1–2 мелкие опечатки и неравные абзацы, "
+            "чтобы текст выглядел менее «машинным».",
+            reply_markup=kb_humanize(),
             parse_mode="HTML",
         )
+        await state.set_state(WorkState.humanize)
         await cb.answer()
-        await generate_and_send(cb.message, state, model_key=FREE_MODEL_KEY, pay_mode="free")
         return
 
     # ── Платный режим ──
@@ -3846,6 +4008,34 @@ async def h_pagepos(cb: CallbackQuery, state: FSMContext) -> None:
         await cb.message.edit_text(reason, parse_mode="HTML")
         await state.clear()
         await cb.answer()
+        return
+
+    await cb.message.edit_text(
+        "🤖 <b>Добавить естественные неточности?</b>\n\n"
+        "Бот может внести 1–2 мелкие опечатки и неравные абзацы, "
+        "чтобы текст выглядел менее «машинным».",
+        reply_markup=kb_humanize(),
+        parse_mode="HTML",
+    )
+    await state.set_state(WorkState.humanize)
+    await cb.answer()
+
+
+@dp.callback_query(F.data.in_(["humanize_yes", "humanize_no"]))
+async def h_humanize(cb: CallbackQuery, state: FSMContext) -> None:
+    humanize = cb.data == "humanize_yes"
+    await state.update_data(humanize=humanize)
+
+    data = await state.get_data()
+    mode = data.get("mode", "free")
+
+    if mode == "free":
+        await cb.message.edit_text(
+            "🚀 <b>Запускаю генерацию...</b>\n\nПодождите, это займёт несколько минут.",
+            parse_mode="HTML",
+        )
+        await cb.answer()
+        await generate_and_send(cb.message, state, model_key=FREE_MODEL_KEY, pay_mode="free")
         return
 
     await cb.message.edit_text(
@@ -4069,6 +4259,7 @@ async def generate_and_send(
                 chapter_titles=chapter_titles,
                 writing_style=writing_style,
                 prog=prog,
+                humanize=data.get("humanize", False),
             )
 
             # ── Проверка соответствия дисциплине (приоритет 🔴) ──
