@@ -2416,18 +2416,10 @@ def add_toc(doc: Document, blocks: list[tuple], gost: dict) -> None:
     run._r.append(instr)
     run._r.append(fld_sep)
 
-    # Текстовая заглушка внутри TOC-поля (между separate и end).
-    # При обновлении в Word/LO она ЗАМЕНИТСЯ реальным содержанием.
-    # Каждый пункт — через <w:br/> (перенос строки), чтобы DOCX
-    # отображал их на отдельных строках даже без обновления поля.
-    toc_entries = _toc_entries(blocks)
-    for i, (entry_title, entry_level) in enumerate(toc_entries):
-        prefix = "    " if entry_level == 2 else ""
-        run.add_text(f"{prefix}{entry_title}")
-        # Добавляем перенос строки (w:br) после каждого пункта кроме последнего
-        if i < len(toc_entries) - 1:
-            br_el = OxmlElement("w:br")
-            run._r.append(br_el)
+    # Минимальная заглушка внутри TOC-поля.
+    # При открытии в Word нужно нажать Ctrl+A → F9 для обновления.
+    # НЕ вставляем полный список — иначе он дублируется и занимает лишние страницы.
+    run.add_text("Обновите содержание: Ctrl+A, затем F9")
 
     run._r.append(fld_end)
 
@@ -3162,24 +3154,40 @@ def _trim_blocks_by_chars(blocks: list[tuple], chars_to_remove: int) -> list[tup
         subblocks = b[3]
 
         if subblocks:
-            # Обрезаем с последней подглавы
+            # Обрезаем с последней подглавы, но НЕ ниже 400 символов
+            MIN_SUB_CHARS = 400
             for si in range(len(subblocks) - 1, -1, -1):
                 if chars_to_remove <= 0:
                     break
                 stitle, stext = subblocks[si]
-                if not stext or len(stext) < 200:
+                if not stext or len(stext) <= MIN_SUB_CHARS:
                     continue
-                new_stext, removed = _trim_text(stext, chars_to_remove)
+                # Обрезаем но не ниже минимума
+                can_remove = max(0, len(stext) - MIN_SUB_CHARS)
+                actual_need = min(chars_to_remove, can_remove)
+                if actual_need <= 0:
+                    continue
+                new_stext, removed = _trim_text(stext, actual_need)
+                if len(new_stext) < MIN_SUB_CHARS:
+                    new_stext = stext[:MIN_SUB_CHARS]
+                    removed = len(stext) - MIN_SUB_CHARS
                 chars_to_remove -= removed
                 subblocks[si] = (stitle, new_stext)
             # Обновляем агрегированный текст
             b[2] = "\n\n".join(st for _, st in subblocks if st)
         else:
             txt = b[2] or ""
-            if len(txt) >= 400:
-                new_txt, removed = _trim_text(txt, chars_to_remove)
-                chars_to_remove -= removed
-                b[2] = new_txt
+            MIN_BLOCK_CHARS = 400
+            if len(txt) > MIN_BLOCK_CHARS:
+                can_remove = max(0, len(txt) - MIN_BLOCK_CHARS)
+                actual_need = min(chars_to_remove, can_remove)
+                if actual_need > 0:
+                    new_txt, removed = _trim_text(txt, actual_need)
+                    if len(new_txt) < MIN_BLOCK_CHARS:
+                        new_txt = txt[:MIN_BLOCK_CHARS]
+                        removed = len(txt) - MIN_BLOCK_CHARS
+                    chars_to_remove -= removed
+                    b[2] = new_txt
 
     # Логируем состояние после обрезки
     for b in blocks:
@@ -3320,7 +3328,7 @@ async def precise_page_adjustment(
     measure_dir = os.path.join(work_dir, "_measure")
     os.makedirs(measure_dir, exist_ok=True)
     
-    max_iters = 30
+    max_iters = 5  # Не больше 5 итераций, чтобы не обрезать текст до нуля
     
     for it in range(max_iters):
         # Измеряем текущее количество страниц
@@ -4630,30 +4638,18 @@ async def generate_and_send(
                 work_dir=work_dir,
             )
 
-            # ── LibreOffice (финальная конвертация — обновит TOC и поля PAGE) ──
-            await prog.update(label="🔄 Обновляю содержание (LibreOffice)...", step_done=True)
-            updated    = libreoffice_update_docx(tmp_in, tmp_out)
-            final_path = tmp_out if updated else tmp_in
+            # ── LibreOffice — ТОЛЬКО для подсчёта страниц, НЕ для финального файла ──
+            # LO при конвертации docx→docx раскрывает TOC-поле и создаёт
+            # отдельные параграфы для каждого пункта содержания, что раздувает
+            # документ на 2-3 лишних страницы. Поэтому пользователю отправляем
+            # оригинальный DOCX (python-docx), а LO используем только для замера.
+            await prog.update(label="🔄 Финальная проверка...", step_done=True)
+            final_path = tmp_in  # Отправляем ОРИГИНАЛЬНЫЙ docx без LO-конвертации
 
-            # Если после LibreOffice количество страниц изменилось, подгоняем финальный файл еще раз
-            post_lo_pages = await measure_pages_async(final_path, work_dir)
-            if post_lo_pages is not None and post_lo_pages != pages:
-                print(f"[PAGES] LO сдвинул страницы ({post_lo_pages} вместо {pages}). Запуск финальной коррекции...")
-                blocks, final_pages = await precise_page_adjustment(
-                    tmp_in=final_path,
-                    blocks=blocks,
-                    target_pages=pages,
-                    topic=topic,
-                    model_key=model_key,
-                    writing_style=writing_style,
-                    data=data,
-                    gost=gost,
-                    prog=prog,
-                    work_dir=work_dir,
-                )
-                final_pages = await measure_pages_async(final_path, work_dir) or pages
-            else:
-                final_pages = post_lo_pages or pages
+            # Замеряем страницы через LO→PDF (без перезаписи docx)
+            final_pages = await measure_pages_async(tmp_in, work_dir)
+            if final_pages is None:
+                final_pages = pages
 
             print(f"[PAGES] 📤 Итог в caption: {final_pages} страниц")
 
