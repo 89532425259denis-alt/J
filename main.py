@@ -1395,8 +1395,8 @@ def generate_structure(
             # ЗАЩИТА ОТ ПУСТЫХ ПОДГЛАВ — генерируем заглушку если текст пустой
             # ═══════════════════════════════════════════════════════════
             if not sub_text or len(sub_text) < 100:
-                sub_text = _stub_text(key, parts.get("topic", ""))
-                print(f"[WARN] Подглава {sub_title} была пустой, добавлена заглушка")
+                sub_text = _stub_text_for_subchapter(sub_title, topic)
+                print(f"[WARN] Подглава «{sub_title}» была пустой, добавлена заглушка")
 
             if sub_text:
                 sub_blocks.append((sub_title, sub_text))
@@ -1824,6 +1824,21 @@ def _stub_text(key: str, topic: str) -> str:
         f"современное состояние изучаемого вопроса. Дальнейшее развитие темы "
         f"требует более глубокого исследования с привлечением дополнительных "
         f"источников и эмпирических данных. [1, с. 45]"
+    )
+
+
+def _stub_text_for_subchapter(title: str, topic: str) -> str:
+    """Заглушка для пустой подглавы"""
+    if not topic:
+        topic = "теме"
+    return (
+        f"{title}\n\n"
+        f"В рамках данной подглавы проводится анализ ключевых аспектов, "
+        f"связанных с темой «{topic}». На основе имеющихся научных данных "
+        f"рассматриваются основные закономерности и тенденции, определяющие "
+        f"современное состояние изучаемого вопроса. Дальнейшее развитие темы "
+        f"требует более глубокого исследования с привлечением дополнительных "
+        f"источников. [1, с. 45]"
     )
 
 
@@ -2395,16 +2410,15 @@ def add_paragraphs_from_text(
     else:
         text = _normalize_punctuation(text)
 
-    if skip_first_heading:
+    # Удаляем первый заголовок если нужно
+    if skip_first_heading and not is_bib and text:
         lines = text.split('\n')
         if lines:
             first_line = lines[0].strip()
-            norm_first = _norm_heading(first_line)
-            norm_heading = _norm_heading(skip_first_heading)
-            # Проверяем полное совпадение или существенное начальное совпадение
-            if (norm_first == norm_heading or 
-                (len(norm_heading) > 5 and norm_first.startswith(norm_heading[:min(len(norm_heading), 30)])) or
-                (len(norm_first) > 5 and norm_heading.startswith(norm_first[:min(len(norm_first), 30)]))):
+            # Нормализуем для сравнения
+            norm_first = re.sub(r'\s+', ' ', first_line.lower().replace('.', ''))
+            norm_heading = re.sub(r'\s+', ' ', skip_first_heading.lower().replace('.', ''))
+            if norm_first == norm_heading or norm_first.startswith(norm_heading[:20]):
                 text = '\n'.join(lines[1:]).strip()
 
     def _apply_body_format(p) -> None:
@@ -2433,6 +2447,7 @@ def add_paragraphs_from_text(
         first_line = ch.split("\n")[0].strip()
 
         if subheading_pat.match(first_line):
+            # Подзаголовок — жирным в обычном абзаце (не Heading 2)
             p = doc.add_paragraph()
             _apply_body_format(p)
             run1 = p.add_run(first_line)
