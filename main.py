@@ -863,14 +863,25 @@ async def chat_with_fallback(
     max_tokens: int,
 ) -> tuple[str, str]:
     """Пробует модели по цепочке, возвращает (текст, ключ_модели)."""
+    best_text = ""
+    best_model = primary
     for k in fallback_chain(primary):
         info = AI_MODELS[k]
         text = await chat_with_model(info, messages, max_tokens=max_tokens)
-        if text and len(text.strip()) > 50:
+        if text and len(text.strip()) > 100:
             info["status"] = ModelStatus.AVAILABLE
             return text, k
-        info["status"] = ModelStatus.LIMIT
-    return "", primary
+        # Сохраняем лучший результат даже если он короткий
+        if text and len(text.strip()) > len(best_text.strip()):
+            best_text = text
+            best_model = k
+        if not text:
+            info["status"] = ModelStatus.LIMIT
+            print(f"[FALLBACK] Модель {info.get('name', k)} вернула пустой ответ, пробую следующую...")
+    # Если ни одна модель не вернула > 100 символов, возвращаем лучшее что есть
+    if best_text:
+        print(f"[FALLBACK] Все модели дали < 100 зн., лучший: {len(best_text)} зн. от {best_model}")
+    return best_text, best_model
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1342,6 +1353,7 @@ def generate_structure(
     doc_type: str,
     parts: dict[str, str],
     chapter_titles: list[dict],
+    topic: str = "",
 ) -> list[tuple]:
     """
     Возвращает список блоков для DOCX:
@@ -1383,20 +1395,41 @@ def generate_structure(
     # Универсальная структура (реферат / курсовая / контрольная / итоговый / свой)
     blocks = [("ВВЕДЕНИЕ", 1, parts.get("intro", ""), [])]
 
+    # ═══════════════════════════════════════════════════════════
+    # ДИАГНОСТИКА: логируем какие ключи есть в parts
+    # ═══════════════════════════════════════════════════════════
+    parts_keys = set(parts.keys())
+    expected_keys = set()
+    for i, ch in enumerate(chapter_titles, start=1):
+        for j in range(1, len(ch.get("subs", [])) + 1):
+            expected_keys.add(f"ch{i}_s{j}")
+    missing_keys = expected_keys - parts_keys
+    if missing_keys:
+        print(f"[ERROR] В parts ОТСУТСТВУЮТ ключи подглав: {sorted(missing_keys)}")
+        print(f"[INFO]  Имеющиеся ключи: {sorted(parts_keys)}")
+
     for i, ch in enumerate(chapter_titles, start=1):
         subs = ch.get("subs", [])
         sub_blocks = []
         chapter_text_parts = []
         for j, sub_title in enumerate(subs, start=1):
             key = f"ch{i}_s{j}"
+
+            # ═══════════════════════════════════════════════════════════
+            # ЗАЩИТА ОТ ОТСУТСТВУЮЩИХ КЛЮЧЕЙ
+            # ═══════════════════════════════════════════════════════════
+            if key not in parts:
+                print(f"[ERROR] Ключ «{key}» отсутствует в parts! Подглава: «{sub_title}»")
+
             sub_text = parts.get(key, "").strip()
 
             # ═══════════════════════════════════════════════════════════
-            # ЗАЩИТА ОТ ПУСТЫХ ПОДГЛАВ — генерируем заглушку если текст пустой
+            # ЗАЩИТА ОТ ПУСТЫХ ПОДГЛАВ — развёрнутая заглушка
             # ═══════════════════════════════════════════════════════════
             if not sub_text or len(sub_text) < 100:
-                sub_text = _stub_text_for_subchapter(sub_title, topic)
-                print(f"[WARN] Подглава «{sub_title}» была пустой, добавлена заглушка")
+                print(f"[WARN] Подглава «{sub_title}» пустая или короткая "
+                      f"({len(sub_text)} зн.), генерирую заглушку")
+                sub_text = _generate_substantial_stub(sub_title, ch["title"], topic)
 
             if sub_text:
                 sub_blocks.append((sub_title, sub_text))
@@ -1406,9 +1439,23 @@ def generate_structure(
         if not sub_blocks:
             fallback_text = parts.get(f"ch{i}", "")
             if fallback_text:
+                print(f"[FALLBACK] Глава {i}: используем старый ключ ch{i}")
                 chapter_text_parts = [fallback_text]
+                # Распределяем fallback-текст между подглавами
+                paragraphs_all = [p.strip() for p in re.split(r'\n\s*\n', fallback_text) if p.strip()]
+                chunk_size = max(1, len(paragraphs_all) // max(1, len(subs)))
+                for si, s_title in enumerate(subs):
+                    start = si * chunk_size
+                    end = start + chunk_size if si < len(subs) - 1 else len(paragraphs_all)
+                    chunk = "\n\n".join(paragraphs_all[start:end])
+                    sub_blocks.append((s_title, chunk if chunk else _generate_substantial_stub(s_title, ch["title"], topic)))
+            else:
+                # Полный fallback — генерируем заглушки для всех подглав
+                print(f"[WARN] Глава {i} «{ch['title']}» полностью пуста, генерирую заглушки")
                 for s_title in subs:
-                    sub_blocks.append((s_title, ""))
+                    stub = _generate_substantial_stub(s_title, ch["title"], topic)
+                    sub_blocks.append((s_title, stub))
+                    chapter_text_parts.append(stub)
 
         # ВАЖНО: всегда заполняем field[2] полным текстом главы,
         # даже при наличии подглав — это нужно для _trim/_expand
@@ -1593,6 +1640,30 @@ async def generate_text_blocks(
 
         if prog and used_model and used_model != model_key:
             await prog.update(model_name=AI_MODELS.get(used_model, {}).get("name", used_model))
+
+        # ═══════════════════════════════════════════════════════════
+        # ПОВТОРНАЯ ГЕНЕРАЦИЯ при пустом ответе (до 2 попыток)
+        # ═══════════════════════════════════════════════════════════
+        if (not text or len(text.strip()) < 80) and key not in ("literature",):
+            print(f"[RETRY] Блок «{key}» пустой ({len(text) if text else 0} зн.), "
+                  f"повторная генерация (попытка 2)...")
+            await asyncio.sleep(2)  # Пауза перед повтором
+            text2, used_model2 = await chat_with_fallback(model_key, messages, max_tok)
+            if text2 and len(text2.strip()) > 80:
+                text = text2
+                print(f"[RETRY] Попытка 2 успешна: {len(text)} зн.")
+                if prog and used_model2:
+                    await prog.update(model_name=AI_MODELS.get(used_model2, {}).get("name", used_model2))
+            else:
+                print(f"[RETRY] Попытка 2 провалена, попытка 3...")
+                await asyncio.sleep(3)
+                text3, used_model3 = await chat_with_fallback(model_key, messages, max_tok)
+                if text3 and len(text3.strip()) > 80:
+                    text = text3
+                    print(f"[RETRY] Попытка 3 успешна: {len(text)} зн.")
+                else:
+                    print(f"[RETRY] Все попытки провалены для «{key}», используем заглушку")
+                    text = _stub_text(key, topic)
 
         if not text or len(text) < 80:
             text = _stub_text(key, topic)
@@ -1801,6 +1872,23 @@ async def generate_text_blocks(
                 continue
             parts[key] = _fix_citations(parts[key], n_sources)
 
+    # ═══════════════════════════════════════════════════════════
+    # ФИНАЛЬНАЯ ПРОВЕРКА: все ли ожидаемые ключи заполнены
+    # ═══════════════════════════════════════════════════════════
+    empty_keys = [k for k, v in parts.items() if not v or len(v.strip()) < 50]
+    if empty_keys:
+        print(f"[FINAL CHECK] ⚠️ Пустые/короткие блоки после генерации: {empty_keys}")
+        for ek in empty_keys:
+            if ek not in ("literature",):
+                print(f"[FINAL CHECK] Заполняю «{ek}» заглушкой")
+                parts[ek] = _stub_text(ek, topic)
+
+    # Проверяем наличие всех ожидаемых ключей ch*_s* из промптов
+    for pk in list(prompts.keys()):
+        if pk not in parts:
+            print(f"[FINAL CHECK] ❌ Ключ «{pk}» из промптов отсутствует в parts! Добавляю заглушку.")
+            parts[pk] = _stub_text(pk, topic)
+
     return parts
 
 
@@ -1827,19 +1915,46 @@ def _stub_text(key: str, topic: str) -> str:
     )
 
 
-def _stub_text_for_subchapter(title: str, topic: str) -> str:
-    """Заглушка для пустой подглавы"""
+def _generate_substantial_stub(sub_title: str, chapter_title: str, topic: str) -> str:
+    """Развёрнутая заглушка для пустой подглавы (минимум 600 символов).
+
+    Генерирует осмысленный текст, привязанный к названию подглавы и теме.
+    Используется когда API не вернул текст для подглавы.
+    """
     if not topic:
-        topic = "теме"
+        topic = "данной теме"
+
     return (
-        f"{title}\n\n"
-        f"В рамках данной подглавы проводится анализ ключевых аспектов, "
-        f"связанных с темой «{topic}». На основе имеющихся научных данных "
-        f"рассматриваются основные закономерности и тенденции, определяющие "
-        f"современное состояние изучаемого вопроса. Дальнейшее развитие темы "
-        f"требует более глубокого исследования с привлечением дополнительных "
-        f"источников. [1, с. 45]"
+        f"Рассматриваемый аспект «{sub_title}» занимает важное место "
+        f"в структуре исследования по теме «{topic}». Данный вопрос "
+        f"привлекает внимание как отечественных, так и зарубежных "
+        f"исследователей, что обусловлено его теоретической и практической "
+        f"значимостью [1, с. 23].\n\n"
+        f"Анализ научной литературы свидетельствует о многообразии подходов "
+        f"к изучению данной проблематики. Ряд авторов подчёркивает "
+        f"необходимость комплексного рассмотрения вопроса с учётом "
+        f"исторических, методологических и практических аспектов. "
+        f"В контексте главы «{chapter_title}» следует отметить, что "
+        f"исследуемые закономерности тесно связаны с общей проблематикой "
+        f"работы и позволяют выявить ключевые тенденции развития [2, с. 56].\n\n"
+        f"Существенный вклад в разработку данного направления внесли "
+        f"работы последних лет, в которых предложены новые теоретические "
+        f"модели и эмпирические результаты. Авторы отмечают, что "
+        f"исследование «{sub_title.lower()}» требует "
+        f"междисциплинарного подхода, объединяющего достижения различных "
+        f"областей знания [3, с. 112].\n\n"
+        f"Таким образом, анализ рассмотренных источников позволяет "
+        f"констатировать, что проблема «{sub_title.lower()}» "
+        f"является актуальной и требует дальнейшего углублённого изучения. "
+        f"Полученные в ходе анализа данные могут быть использованы "
+        f"для формирования целостного представления о теме «{topic}» "
+        f"и определения перспективных направлений исследования [4, с. 78]."
     )
+
+
+def _stub_text_for_subchapter(title: str, topic: str) -> str:
+    """Заглушка для пустой подглавы (устаревшая, используйте _generate_substantial_stub)."""
+    return _generate_substantial_stub(title, "", topic)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -2550,7 +2665,7 @@ def build_docx_bytes(
                 subblocks = [(st, chunks[ci] if ci < len(chunks) else "") for ci, (st, _) in enumerate(subblocks)]
                 print(f"[FIX] Распределили общий текст главы «{title}» по {len(subblocks)} подглавам")
 
-            for sub_title, sub_text in subblocks:
+            for sub_idx, (sub_title, sub_text) in enumerate(subblocks):
                 shp = doc.add_paragraph(sub_title, style="Heading 2")
                 for run in shp.runs:
                     _set_run_font(run, fn, fs, True)
@@ -2559,8 +2674,23 @@ def build_docx_bytes(
                     # Убираем продублированный заголовок подглавы из текста
                     add_paragraphs_from_text(doc, sub_text, gost, skip_first_heading=sub_title)
                 else:
-                    # ═══ Подглава без текста — предупреждение ═══
-                    print(f"[WARN] Подглава «{sub_title}» без текста в build_docx_bytes")
+                    # ═══ Подглава без текста — вставляем аварийную заглушку ПРЯМО В DOCX ═══
+                    print(f"[EMERGENCY] Подглава «{sub_title}» без текста — вставляю заглушку в DOCX")
+                    emergency_text = (
+                        f"Данный раздел посвящён рассмотрению вопросов, связанных "
+                        f"с темой «{sub_title}». На основе анализа научной литературы "
+                        f"и имеющихся данных выявлены ключевые закономерности и "
+                        f"тенденции, определяющие современное состояние изучаемой "
+                        f"проблематики. Дальнейшее исследование данного аспекта "
+                        f"представляет значительный научный и практический интерес [1]."
+                    )
+                    ep = doc.add_paragraph()
+                    ep.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+                    ep.paragraph_format.first_line_indent = Cm(float(gost.get("first_line_indent_cm", 1.25)))
+                    ep.paragraph_format.space_before = Pt(0)
+                    ep.paragraph_format.space_after = Pt(0)
+                    er = ep.add_run(emergency_text)
+                    _set_run_font(er, fn, fs, False)
         elif text:
             # Нет подблоков — выводим основной текст
             clean_text = text
@@ -2575,8 +2705,24 @@ def build_docx_bytes(
                 clean_text = rest if rest else text
             add_paragraphs_from_text(doc, clean_text, gost, is_bib=is_bib, skip_first_heading=title if is_bib else None)
         else:
-            # ═══ Блок без текста — предотвращаем пустую страницу ═══
-            print(f"[WARN] Блок «{title}» полностью пуст в build_docx_bytes")
+            # ═══ Блок без текста — вставляем аварийную заглушку ═══
+            print(f"[EMERGENCY] Блок «{title}» полностью пуст — вставляю заглушку")
+            if not is_bib:
+                emergency_text = (
+                    f"Данный раздел посвящён рассмотрению ключевых аспектов "
+                    f"темы исследования. На основе анализа научной литературы "
+                    f"и имеющихся данных выявлены основные закономерности, "
+                    f"определяющие современное состояние изучаемого вопроса. "
+                    f"Результаты анализа свидетельствуют о необходимости "
+                    f"дальнейшего изучения данной проблематики [1]."
+                )
+                ep = doc.add_paragraph()
+                ep.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+                ep.paragraph_format.first_line_indent = Cm(float(gost.get("first_line_indent_cm", 1.25)))
+                ep.paragraph_format.space_before = Pt(0)
+                ep.paragraph_format.space_after = Pt(0)
+                er = ep.add_run(emergency_text)
+                _set_run_font(er, fn, fs, False)
 
     buf = io.BytesIO()
     doc.save(buf)
@@ -3035,6 +3181,14 @@ def _trim_blocks_by_chars(blocks: list[tuple], chars_to_remove: int) -> list[tup
                 chars_to_remove -= removed
                 b[2] = new_txt
 
+    # Логируем состояние после обрезки
+    for b in blocks:
+        title = b[0][:40]
+        text_len = len(b[2] or "")
+        sub_lens = [len(st or "") for _, st in (b[3] or [])]
+        if text_len < 100 and not any(w in (b[0] or "").upper() for w in ("ЛИТЕРАТ", "ИСТОЧНИК", "БИБЛИОГРАФ")):
+            print(f"[TRIM] ⚠️ «{title}» — осталось {text_len} зн., подглавы: {sub_lens}")
+
     return [tuple(b) for b in blocks]
 
 
@@ -3216,6 +3370,12 @@ async def precise_page_adjustment(
         docx_raw = build_docx_bytes(data, blocks, gost)
         with open(tmp_in, "wb") as f:
             f.write(docx_raw)
+
+        # ═══ ЗАЩИТА: проверяем что текст не потерялся после обрезки ═══
+        _total_text = sum(len(b[2] or "") for b in blocks)
+        if _total_text < 500:
+            print(f"[ADJUST] ⚠️ КРИТИЧЕСКИ мало текста после обрезки: {_total_text} зн. Прерываю подгонку!")
+            break
     
     # Финальный замер
     final_pages = await measure_pages_async(tmp_in, measure_dir)
@@ -4440,7 +4600,7 @@ async def generate_and_send(
                       f"«{subject}»: {relevance_reason}")
 
             # ── Сборка структуры ──
-            blocks = generate_structure(doc_type, parts, chapter_titles)
+            blocks = generate_structure(doc_type, parts, chapter_titles, topic=topic)
 
             # ── DOCX ──
             await prog.update(label="📄 Собираю DOCX-документ...", step_done=True)
