@@ -293,6 +293,9 @@ PAID_DAILY_LIMIT  = int(cfg("PAID_DAILY_LIMIT",       "0"))   # 0 = безлим
 PAID_COOLDOWN     = int(cfg("PAID_COOLDOWN_SECONDS",  "0"))   # 0 = нет кулдауна
 
 # Символов на страницу (ГОСТ: ~1800-2000 знаков с пробелами на стр A4 14pt 1.5 интервал)
+# Глобальное значение по умолчанию, если ГОСТ не передан
+CHARS_PER_PAGE = int(cfg("CHARS_PER_PAGE", "1850"))
+
 def calculate_chars_per_page(gost: dict) -> int:
     """Рассчитывает точное количество символов на страницу по параметрам ГОСТа."""
     font_size = int(gost.get("font_size", 14))
@@ -323,7 +326,6 @@ def calculate_chars_per_page(gost: dict) -> int:
 
     return max(1450, min(2100, base))
 
-CHARS_PER_PAGE = int(cfg("CHARS_PER_PAGE", "1850"))
 # Страниц без текста (титул + содержание)
 NON_TEXT_PAGES = int(cfg("NON_TEXT_PAGES", "2"))
 
@@ -1043,11 +1045,11 @@ def target_chars(pages: int, gost: dict = None) -> int:
     Использует динамический расчёт из ГОСТа, если gost передан.
     """
     if gost:
-        chars = calculate_chars_per_page(gost)
+        chars_per_page = calculate_chars_per_page(gost)
     else:
-        chars = CHARS_PER_PAGE
+        chars_per_page = CHARS_PER_PAGE
     text_pages = max(1, pages - NON_TEXT_PAGES)
-    return text_pages * chars
+    return text_pages * chars_per_page
 
 
 def tokens_for_chars(chars: int) -> int:
@@ -2416,10 +2418,18 @@ def add_toc(doc: Document, blocks: list[tuple], gost: dict) -> None:
     run._r.append(instr)
     run._r.append(fld_sep)
 
-    # Минимальная заглушка внутри TOC-поля.
-    # При открытии в Word нужно нажать Ctrl+A → F9 для обновления.
-    # НЕ вставляем полный список — иначе он дублируется и занимает лишние страницы.
-    run.add_text("Обновите содержание: Ctrl+A, затем F9")
+    # Текстовая заглушка внутри TOC-поля (между separate и end).
+    # При обновлении в Word/LO она ЗАМЕНИТСЯ реальным содержанием.
+    # Каждый пункт — через <w:br/> (перенос строки), чтобы DOCX
+    # отображал их на отдельных строках даже без обновления поля.
+    toc_entries = _toc_entries(blocks)
+    for i, (entry_title, entry_level) in enumerate(toc_entries):
+        prefix = "    " if entry_level == 2 else ""
+        run.add_text(f"{prefix}{entry_title}")
+        # Добавляем перенос строки (w:br) после каждого пункта кроме последнего
+        if i < len(toc_entries) - 1:
+            br_el = OxmlElement("w:br")
+            run._r.append(br_el)
 
     run._r.append(fld_end)
 
@@ -2528,7 +2538,8 @@ def add_paragraphs_from_text(
             # Нормализуем для сравнения
             norm_first = re.sub(r'\s+', ' ', first_line.lower().replace('.', ''))
             norm_heading = re.sub(r'\s+', ' ', skip_first_heading.lower().replace('.', ''))
-            if norm_first == norm_heading or norm_first.startswith(norm_heading[:20]):
+            # Проверяем на строгое совпадение или очень близкое, чтобы не удалять обычный текст
+            if norm_first == norm_heading or (len(norm_heading) > 10 and norm_first == norm_heading[:len(norm_first)]):
                 text = '\n'.join(lines[1:]).strip()
 
     def _apply_body_format(p) -> None:
@@ -2633,9 +2644,10 @@ def build_docx_bytes(
         # а НЕ doc.add_page_break() после предыдущего блока.
         # Это исключает создание пустого параграфа-разрыва, который
         # вызывает «пустые страницы» между разделами.
-        # Первый блок тоже получает page_break_before (отделяет от содержания).
-        if level == 1:
-            hp.paragraph_format.page_break_before = True
+    # Первый блок тоже получает page_break_before (отделяет от содержания).
+    # Но НЕ для «СОДЕРЖАНИЕ» (оно уже обработано выше)
+    if level == 1 and title.upper() != "СОДЕРЖАНИЕ":
+        hp.paragraph_format.page_break_before = True
 
         # Основной текст главы
         is_bib = any(w in title.upper() for w in ("ИСТОЧНИК", "ЛИТЕРАТ", "БИБЛИОГРАФ"))
@@ -2794,27 +2806,17 @@ except ImportError:
     fitz = None
 
 
-# Символов на страницу (ГОСТ: ~1800 знаков с пробелами на стр A4 14pt 1.5 интервал)
-CHARS_PER_PAGE = int(cfg("CHARS_PER_PAGE", "1800"))  # ИСПРАВЛЕНО: 1850 → 1800
-
-# Страниц без текста (титул + содержание)
-NON_TEXT_PAGES = int(cfg("NON_TEXT_PAGES", "2"))
-
 # Калибровочный множитель (ИСПРАВЛЕНО: 1.10 → 1.00)
 _ESTIM_CALIBRATION = 1.00
 
 
-def target_chars(pages: int) -> int:
-    """
-    Целевое количество символов ДЛЯ ОСНОВНОГО ТЕКСТА (без титула и содержания)
-    """
-    text_pages = max(1, pages - NON_TEXT_PAGES)
-    return text_pages * CHARS_PER_PAGE
-
-
-def target_pages_from_chars(chars: int) -> int:
+def target_pages_from_chars(chars: int, gost: dict = None) -> int:
     """Возвращает количество страниц по количеству символов"""
-    text_pages = max(1, chars // CHARS_PER_PAGE)
+    if gost:
+        chars_per_page = calculate_chars_per_page(gost)
+    else:
+        chars_per_page = CHARS_PER_PAGE
+    text_pages = max(1, chars // chars_per_page)
     return text_pages + NON_TEXT_PAGES
 
 
@@ -3154,40 +3156,24 @@ def _trim_blocks_by_chars(blocks: list[tuple], chars_to_remove: int) -> list[tup
         subblocks = b[3]
 
         if subblocks:
-            # Обрезаем с последней подглавы, но НЕ ниже 400 символов
-            MIN_SUB_CHARS = 400
+            # Обрезаем с последней подглавы
             for si in range(len(subblocks) - 1, -1, -1):
                 if chars_to_remove <= 0:
                     break
                 stitle, stext = subblocks[si]
-                if not stext or len(stext) <= MIN_SUB_CHARS:
+                if not stext or len(stext) < 200:
                     continue
-                # Обрезаем но не ниже минимума
-                can_remove = max(0, len(stext) - MIN_SUB_CHARS)
-                actual_need = min(chars_to_remove, can_remove)
-                if actual_need <= 0:
-                    continue
-                new_stext, removed = _trim_text(stext, actual_need)
-                if len(new_stext) < MIN_SUB_CHARS:
-                    new_stext = stext[:MIN_SUB_CHARS]
-                    removed = len(stext) - MIN_SUB_CHARS
+                new_stext, removed = _trim_text(stext, chars_to_remove)
                 chars_to_remove -= removed
                 subblocks[si] = (stitle, new_stext)
             # Обновляем агрегированный текст
             b[2] = "\n\n".join(st for _, st in subblocks if st)
         else:
             txt = b[2] or ""
-            MIN_BLOCK_CHARS = 400
-            if len(txt) > MIN_BLOCK_CHARS:
-                can_remove = max(0, len(txt) - MIN_BLOCK_CHARS)
-                actual_need = min(chars_to_remove, can_remove)
-                if actual_need > 0:
-                    new_txt, removed = _trim_text(txt, actual_need)
-                    if len(new_txt) < MIN_BLOCK_CHARS:
-                        new_txt = txt[:MIN_BLOCK_CHARS]
-                        removed = len(txt) - MIN_BLOCK_CHARS
-                    chars_to_remove -= removed
-                    b[2] = new_txt
+            if len(txt) >= 400:
+                new_txt, removed = _trim_text(txt, chars_to_remove)
+                chars_to_remove -= removed
+                b[2] = new_txt
 
     # Логируем состояние после обрезки
     for b in blocks:
@@ -3328,7 +3314,8 @@ async def precise_page_adjustment(
     measure_dir = os.path.join(work_dir, "_measure")
     os.makedirs(measure_dir, exist_ok=True)
     
-    max_iters = 5  # Не больше 5 итераций, чтобы не обрезать текст до нуля
+    max_iters = 30
+    target_chars_goal = target_chars(target_pages, gost)
     
     for it in range(max_iters):
         # Измеряем текущее количество страниц
@@ -3336,7 +3323,7 @@ async def precise_page_adjustment(
         
         if real_pages is None:
             total_chars = _blocks_text_total(blocks)
-            real_pages = target_pages_from_chars(total_chars)
+            real_pages = target_pages_from_chars(total_chars, gost)
         
         diff = real_pages - target_pages
         print(f"[ADJUST] Итерация {it+1}: цель={target_pages}, факт={real_pages}, разница={diff:+d}")
@@ -3359,11 +3346,12 @@ async def precise_page_adjustment(
             break
         
         # Рассчитываем сколько символов нужно добавить/убрать
-        chars_per_real_page = CHARS_PER_PAGE
+        chars_per_real_page = calculate_chars_per_page(gost)
         
         if diff > 0:
             # Слишком много страниц — обрезаем
-            chars_to_remove = int(diff * chars_per_real_page)
+            # Используем консервативный множитель 0.8 чтобы не отрезать лишнего за раз
+            chars_to_remove = int(diff * chars_per_real_page * 0.8)
             print(f"[ADJUST] ✂️ Обрезаю {chars_to_remove} знаков")
             blocks = _trim_blocks_by_chars(blocks, chars_to_remove)
         else:
@@ -3381,8 +3369,8 @@ async def precise_page_adjustment(
 
         # ═══ ЗАЩИТА: проверяем что текст не потерялся после обрезки ═══
         _total_text = sum(len(b[2] or "") for b in blocks)
-        if _total_text < 500:
-            print(f"[ADJUST] ⚠️ КРИТИЧЕСКИ мало текста после обрезки: {_total_text} зн. Прерываю подгонку!")
+        if _total_text < int(target_chars_goal * 0.5):
+            print(f"[ADJUST] ⚠️ Текст сократился слишком сильно ({_total_text} зн. при цели {target_chars_goal}). Прерываю обрезку для сохранения смысла.")
             break
     
     # Финальный замер
@@ -4638,18 +4626,33 @@ async def generate_and_send(
                 work_dir=work_dir,
             )
 
-            # ── LibreOffice — ТОЛЬКО для подсчёта страниц, НЕ для финального файла ──
-            # LO при конвертации docx→docx раскрывает TOC-поле и создаёт
-            # отдельные параграфы для каждого пункта содержания, что раздувает
-            # документ на 2-3 лишних страницы. Поэтому пользователю отправляем
-            # оригинальный DOCX (python-docx), а LO используем только для замера.
-            await prog.update(label="🔄 Финальная проверка...", step_done=True)
-            final_path = tmp_in  # Отправляем ОРИГИНАЛЬНЫЙ docx без LO-конвертации
+            # ── LibreOffice (финальная конвертация — обновит TOC и поля PAGE) ──
+            await prog.update(label="🔄 Обновляю содержание (LibreOffice)...", step_done=True)
+            updated    = libreoffice_update_docx(tmp_in, tmp_out)
+            final_path = tmp_out if updated else tmp_in
 
-            # Замеряем страницы через LO→PDF (без перезаписи docx)
-            final_pages = await measure_pages_async(tmp_in, work_dir)
-            if final_pages is None:
-                final_pages = pages
+            # Если после LibreOffice количество страниц изменилось, подгоняем финальный файл еще раз
+            post_lo_pages = await measure_pages_async(final_path, work_dir)
+            if post_lo_pages is not None and post_lo_pages != pages:
+                print(f"[PAGES] LO сдвинул страницы ({post_lo_pages} вместо {pages}). Запуск финальной коррекции...")
+                # Уменьшаем количество итераций для финальной коррекции
+                blocks, final_pages = await precise_page_adjustment(
+                    tmp_in=final_path,
+                    blocks=blocks,
+                    target_pages=pages,
+                    topic=topic,
+                    model_key=model_key,
+                    writing_style=writing_style,
+                    data=data,
+                    gost=gost,
+                    prog=prog,
+                    work_dir=work_dir,
+                )
+                # После финальной подгонки нужно еще раз прогнать через LibreOffice для обновления ТОС
+                libreoffice_update_docx(final_path, final_path)
+                final_pages = await measure_pages_async(final_path, work_dir) or pages
+            else:
+                final_pages = post_lo_pages or pages
 
             print(f"[PAGES] 📤 Итог в caption: {final_pages} страниц")
 
