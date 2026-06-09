@@ -1080,8 +1080,10 @@ def target_chars(pages: int, gost: dict = None) -> int:
         chars_per_page = CHARS_PER_PAGE
     text_pages = max(1, pages - NON_TEXT_PAGES)
     raw_total  = text_pages * chars_per_page
-    # 0.80 — эмпирический коэффициент на структурные элементы и заголовки.
-    return int(raw_total * 0.80)
+    # 0.62 — эмпирический коэффициент. Калиброван по реальным запускам:
+    # коэффициент 0.80 давал перебор +3 страницы (14 на запросе 11),
+    # 0.62 ≈ 0.80 × (11/14) и попадает в цель.
+    return int(raw_total * 0.62)
 
 
 def tokens_for_chars(chars: int) -> int:
@@ -3438,9 +3440,10 @@ async def precise_page_adjustment(
         chars_per_real_page = calculate_chars_per_page(gost)
         
         if diff > 0:
-            # Слишком много страниц — обрезаем
-            # Используем консервативный множитель 0.8 чтобы не отрезать лишнего за раз
-            chars_to_remove = int(diff * chars_per_real_page * 0.8)
+            # Слишком много страниц — обрезаем. Множитель 1.0 (раньше 0.8) —
+            # консерватизм давал недорез на 1–2 страницы за итерацию и
+            # приводил к остановке цикла раньше времени.
+            chars_to_remove = int(diff * chars_per_real_page * 1.0)
             print(f"[ADJUST] ✂️ Обрезаю {chars_to_remove} знаков")
             blocks = _trim_blocks_by_chars(blocks, chars_to_remove)
         else:
