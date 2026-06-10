@@ -1329,16 +1329,43 @@ def build_prompts(
     num_ch  = len(chapter_titles)
     prompts = {}
 
+    # ── Формируем задачи из реальных названий подглав/глав ──
+    # Это критично: без этого «цель и задачи» во введении живут отдельно
+    # от содержания, и часть задач не покрывается главами.
+    _tasks_source = []
+    for _ch in chapter_titles:
+        _subs = _ch.get("subs", []) or []
+        if _subs:
+            for _sub in _subs:
+                _tasks_source.append(_sub)
+        else:
+            _tasks_source.append(_ch.get("title", ""))
+    _tasks_source = [t for t in _tasks_source if t and t.strip()]
+    # 3–5 задач: если подглав слишком много — берём первые 5
+    _tasks_list = _tasks_source[:5] if len(_tasks_source) >= 3 else _tasks_source
+    _tasks_block = ""
+    if _tasks_list:
+        _tasks_lines = []
+        for _i, _t in enumerate(_tasks_list, start=1):
+            # Приводим название подглавы к глагольной формулировке задачи
+            _clean = re.sub(r"^\d+(\.\d+)*\.?\s*", "", _t).strip()
+            _tasks_lines.append(f"{_i}) рассмотреть/изучить {_clean.lower()}")
+        _tasks_block = (
+            "\n\nОБЯЗАТЕЛЬНО сформулируй РОВНО эти задачи (можно слегка "
+            "переформулировать, но смысл сохрани):\n" + "\n".join(_tasks_lines) +
+            "\nЭти задачи должны точно соответствовать содержанию глав."
+        )
+
     # Введение — 10% от текста
-    # Генерируем ВРЕМЕННОЕ введение; оно будет заменено после генерации всех глав
     prompts["intro"] = strict_prompt(
         f"Напиши введение для {DOC_TYPES.get(doc_type, DOC_TYPES['referat'])['word'].lower()}а "
         f"на тему «{topic}», предмет «{subject}».{ctx}"
         f"Раскрой: актуальность темы, степень разработанности (упомяни 3–5 реальных "
         f"исследователей/учёных по этой теме — называй их имена в тексте), "
-        f"цель, задачи (3–5 задач), объект и предмет исследования, методы, "
+        f"цель, задачи, объект и предмет исследования, методы, "
         f"краткую структуру работы. "
-        f"Используй ссылки на источники [1], [2] где уместно.",
+        f"Используй ссылки на источники [1], [2] где уместно."
+        f"{_tasks_block}",
         int(total * 0.10),
         writing_style, doc_type,
     )
@@ -1918,6 +1945,9 @@ async def generate_text_blocks(
                 continue
             parts[key] = _fix_citations(parts[key], n_sources)
 
+        # Удаляем неиспользуемые источники (фикс «избыточен, N не используются»)
+        parts = _prune_unused_sources(parts)
+
     # ═══════════════════════════════════════════════════════════
     # ФИНАЛЬНАЯ ПРОВЕРКА: все ли ожидаемые ключи заполнены
     # ═══════════════════════════════════════════════════════════
@@ -2076,6 +2106,100 @@ def _fix_citations(text: str, n_sources: int) -> str:
 
     # Ссылки ГОСТ: [3], [3, с. 45], [2; 5], [4, с. 120–125]
     return re.sub(r"\[(\d[^\]\n]*)\]", _fix_one, text)
+
+
+def _collect_used_sources(parts: dict) -> set[int]:
+    """Собирает множество номеров источников, реально упомянутых в тексте."""
+    used = set()
+    for key, val in parts.items():
+        if key == "literature" or not val:
+            continue
+        for m in re.finditer(r"\[(\d[^\]\n]*)\]", val):
+            inner = m.group(1)
+            for part in inner.split(";"):
+                num_match = re.match(r"^\s*(\d+)", part.strip())
+                if num_match:
+                    used.add(int(num_match.group(1)))
+    return used
+
+
+def _prune_unused_sources(parts: dict) -> dict:
+    """Удаляет неиспользуемые источники из списка литературы и
+    перенумеровывает оставшиеся, обновляя сноски в тексте.
+
+    Это устраняет ошибку «список литературы избыточен, N источников не
+    используются». Если использовано < 5 источников — оставляем как есть
+    (значит, ИИ почти не ссылался, лучше не калечить библиографию).
+    """
+    bib = parts.get("literature", "") or ""
+    if not bib:
+        return parts
+
+    bib_norm = _normalize_bibliography(bib)
+    lines = [l.strip() for l in bib_norm.split("\n") if re.match(r"^\d+\.\s", l.strip())]
+    if not lines:
+        return parts
+
+    used = _collect_used_sources(parts)
+    n_total = len(lines)
+    if not used or len(used) < 5:
+        # Слишком мало реальных ссылок — оставляем список как есть
+        return parts
+
+    # Защитный минимум: для солидности оставляем не меньше 8 источников
+    MIN_KEEP = 8
+    used_sorted = sorted(used)
+    kept_indices = [i for i in used_sorted if 1 <= i <= n_total]
+    if len(kept_indices) < MIN_KEEP:
+        # Добивам до минимума «соседями» в порядке оригинала
+        for i in range(1, n_total + 1):
+            if i not in kept_indices:
+                kept_indices.append(i)
+            if len(kept_indices) >= MIN_KEEP:
+                break
+        kept_indices.sort()
+
+    if len(kept_indices) >= n_total:
+        return parts
+
+    # Карта: старый номер → новый номер
+    remap = {old: new for new, old in enumerate(kept_indices, start=1)}
+    new_n = len(kept_indices)
+
+    # Обновляем сноски в тексте
+    def _remap_citation(m: re.Match) -> str:
+        inner = m.group(1)
+        out_parts = []
+        for part in inner.split(";"):
+            part = part.strip()
+            num_match = re.match(r"^(\d+)(.*)$", part)
+            if num_match:
+                old = int(num_match.group(1))
+                rest = num_match.group(2)
+                if old in remap:
+                    out_parts.append(f"{remap[old]}{rest}")
+                else:
+                    # Источник удалён → мапим на ближайший существующий
+                    new = ((old - 1) % new_n) + 1
+                    out_parts.append(f"{new}{rest}")
+        return "[" + "; ".join(out_parts) + "]"
+
+    for key in list(parts.keys()):
+        if key == "literature" or not parts[key]:
+            continue
+        parts[key] = re.sub(r"\[(\d[^\]\n]*)\]", _remap_citation, parts[key])
+
+    # Перенумеровываем оставшиеся строки библиографии
+    kept_lines = [lines[i - 1] for i in kept_indices]
+    new_bib = []
+    for new_num, line in enumerate(kept_lines, start=1):
+        # Убираем старый номер
+        body = re.sub(r"^\d+\.\s*", "", line).strip()
+        new_bib.append(f"{new_num}. {body}")
+    parts["literature"] = "\n".join(new_bib)
+
+    print(f"[BIB] Использовано источников: {len(used)}/{n_total}, оставлено: {new_n}")
+    return parts
 
 
 def _normalize_punctuation(text: str) -> str:
@@ -3164,7 +3288,7 @@ async def measure_pages_async(docx_path: str, work_dir: str) -> Optional[int]:
     """
     Главная функция подсчёта страниц (async).
 
-    Порядок приоритетов (v2.7-fix7):
+    Порядок приоритетов (v2.7-fix8):
     1. LibreOffice → PDF + PyMuPDF/PyPDF2 — самый честный для нашего пайплайна:
        мы и обновляем TOC через LibreOffice, поэтому им же и меряем — чтобы
        не было расхождения между «померили в Aspose, обновили в LO».
@@ -3218,38 +3342,74 @@ def _trim_blocks_by_chars(blocks: list[tuple], chars_to_remove: int) -> list[tup
         up = (title or "").upper()
         return not any(w in up for w in ("ЛИТЕРАТ", "ИСТОЧНИК", "БИБЛИОГРАФ", "ЗАКЛЮЧЕНИ"))
 
-    def _trim_text(txt: str, need: int) -> tuple[str, int]:
+    def _trim_text(txt: str, need: int, floor: int = 0) -> tuple[str, int]:
         """
         Откусывает с конца:
         1) сначала целыми абзацами (пока их >1);
-        2) затем — целыми предложениями внутри последнего абзаца, пока в
-           абзаце остаётся хотя бы ~200 символов (чтобы не превратить главу
-           в обрубок).
-        Это критично, когда LLM вернула 1–2 жирных абзаца на главу: иначе
-        старая логика «оставь последний абзац целым» практически ничего не
-        обрезала и итерации топчутся на месте.
+        2) затем — целыми предложениями внутри последнего абзаца.
+        Жёсткие гарантии:
+          * не уменьшаем текст ниже `floor` символов (защита от «обрубка»);
+          * последний абзац всегда оканчивается на знак конца предложения —
+            если после обрезки остался «висящий» хвост, отрезаем ещё одно
+            предложение;
+          * сохраняется минимум 1 абзац длиной ≥200 знаков.
         """
         paras = [p for p in txt.split("\n\n") if p.strip()]
         removed_total = 0
-        # 1) Абзацами с конца — пока их больше одного
+        cur_len = len(txt)
+
+        def _cur_len_paras():
+            return sum(len(p) for p in paras) + 2 * max(0, len(paras) - 1)
+
+        # 1) Абзацами с конца — пока их больше одного и не упёрлись в floor
         while paras and need > 0 and len(paras) > 1:
-            removed = len(paras[-1]) + 2
+            tail_len = len(paras[-1]) + 2
+            if floor > 0 and cur_len - tail_len < floor:
+                break
             paras.pop()
-            need -= removed
-            removed_total += removed
-        # 2) Последний абзац — режем по предложениям, оставляя минимум ~200 знаков
+            cur_len -= tail_len
+            need -= tail_len
+            removed_total += tail_len
+        # 2) Последний абзац — режем по предложениям
         if paras and need > 0:
             last = paras[-1]
-            # Разбиваем по концам предложений, но СОХРАНЯЕМ знак препинания
             parts = re.split(r'(?<=[.!?…])\s+', last)
             parts = [s for s in parts if s.strip()]
-            min_keep = 200
-            while len(parts) > 1 and need > 0 and sum(len(p) + 1 for p in parts) > min_keep + len(parts[-1]):
-                removed = len(parts[-1]) + 1
+            min_keep_in_para = 200
+            while len(parts) > 1 and need > 0:
+                tail_sent_len = len(parts[-1]) + 1
+                new_para_len = sum(len(p) + 1 for p in parts[:-1])
+                if new_para_len < min_keep_in_para:
+                    break
+                if floor > 0 and cur_len - tail_sent_len < floor:
+                    break
                 parts.pop()
-                need -= removed
-                removed_total += removed
+                cur_len -= tail_sent_len
+                need -= tail_sent_len
+                removed_total += tail_sent_len
             paras[-1] = " ".join(parts).rstrip()
+
+        # 3) Гарантия завершённости: последний абзац должен заканчиваться
+        #    знаком конца предложения. Если нет — отрезаем «висящий» хвост.
+        if paras:
+            last = paras[-1].rstrip()
+            if last and last[-1] not in ".!?…»":
+                # Ищем последний знак конца предложения
+                m = re.search(r"[.!?…][»\"']?\s*$", last)
+                if not m:
+                    cut = max(
+                        last.rfind("."), last.rfind("!"),
+                        last.rfind("?"), last.rfind("…"),
+                    )
+                    if cut > 50:  # не калечим короткий абзац
+                        # Включаем сам знак препинания
+                        new_last = last[: cut + 1].rstrip()
+                        removed_total += len(last) - len(new_last)
+                        paras[-1] = new_last
+                    else:
+                        # Дописываем точку, чтобы не было обрыва
+                        paras[-1] = last + "."
+
         return "\n\n".join(paras), removed_total
 
     # Сортируем кандидатов по размеру (самые большие первые)
@@ -3273,14 +3433,16 @@ def _trim_blocks_by_chars(blocks: list[tuple], chars_to_remove: int) -> list[tup
         subblocks = b[3]
 
         if subblocks:
-            # Обрезаем с последней подглавы
+            # Обрезаем с последней подглавы. Каждой подглаве — пол «70 %
+            # от текущей длины», чтобы они не превращались в обрубки.
             for si in range(len(subblocks) - 1, -1, -1):
                 if chars_to_remove <= 0:
                     break
                 stitle, stext = subblocks[si]
                 if not stext or len(stext) < 200:
                     continue
-                new_stext, removed = _trim_text(stext, chars_to_remove)
+                floor = max(400, int(len(stext) * 0.70))
+                new_stext, removed = _trim_text(stext, chars_to_remove, floor=floor)
                 chars_to_remove -= removed
                 subblocks[si] = (stitle, new_stext)
             # Обновляем агрегированный текст
@@ -3288,7 +3450,8 @@ def _trim_blocks_by_chars(blocks: list[tuple], chars_to_remove: int) -> list[tup
         else:
             txt = b[2] or ""
             if len(txt) >= 400:
-                new_txt, removed = _trim_text(txt, chars_to_remove)
+                floor = max(400, int(len(txt) * 0.70))
+                new_txt, removed = _trim_text(txt, chars_to_remove, floor=floor)
                 chars_to_remove -= removed
                 b[2] = new_txt
 
@@ -3471,7 +3634,16 @@ async def precise_page_adjustment(
             # приводил к остановке цикла раньше времени.
             chars_to_remove = int(diff * chars_per_real_page * 1.0)
             print(f"[ADJUST] ✂️ Обрезаю {chars_to_remove} знаков")
+            _before = _blocks_text_total(blocks)
             blocks = _trim_blocks_by_chars(blocks, chars_to_remove)
+            _after = _blocks_text_total(blocks)
+            # Если обрезка упёрлась в floor и реально ничего не удалила —
+            # дальнейшие итерации бессмысленны (мы защищаем целостность глав).
+            if _before - _after < max(50, chars_to_remove // 10):
+                print(f"[ADJUST] ⛔ Обрезка упёрлась в порог целостности "
+                      f"({_before - _after} зн. из {chars_to_remove}). "
+                      f"Останавливаюсь: {real_pages} стр. вместо {target_pages}.")
+                break
         else:
             # Слишком мало страниц — добавляем
             chars_to_add = int(abs(diff) * chars_per_real_page)
@@ -4879,7 +5051,7 @@ async def generate_and_send(
 
 async def main() -> None:
     print("═" * 62)
-    print("  🤖  ГОСТ-АССИСТЕНТ v2.7-fix7")
+    print("  🤖  ГОСТ-АССИСТЕНТ v2.7-fix8")
     print("═" * 62)
     print(f"  LibreOffice : {shutil.which('soffice') or '❌ не найден'}")
     print(f"  DeepSeek    : {'✅' if DEEPSEEK_KEY else '❌ нет ключа'}")
