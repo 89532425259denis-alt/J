@@ -1,7 +1,20 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-"""ГОСТ-АССИСТЕНТ v2.7 — ТОЧНЫЕ СТРАНИЦЫ + ДИСЦИПЛИНА
+"""ГОСТ-АССИСТЕНТ v2.7-fix6 — ПОЛНОЕ СООТВЕТСТВИЕ ГОСТ 7.32-2017
+
+v2.7-fix6:
+  • Правое поле страницы 10 → 15 мм (ГОСТ 7.32-2017 §6.1.1).
+  • Номера разделов без точки: «1 Название», «1.1 Название»
+    (ГОСТ 7.32-2017 §6.3.2). Чистится и в названиях, и в TOC,
+    и в подзаголовках, встроенных в текст.
+  • Слово «Глава» из автозаголовков удаляется автоматически.
+  • Шрифт колонтитула с номером страницы 12 → 14 pt (TNR).
+  • Формат библиографического описания обновлён до
+    ГОСТ Р 7.0.100-2018; сноски — по ГОСТ Р 7.0.5-2008.
+  • Миграция сохранённого gost_configs.json: старое поле 10 → 15.
+
+
 
 Главные изменения v2.1 относительно v2.0:
 ────────────────────────────────────────────────────────────────
@@ -313,14 +326,16 @@ def calculate_chars_per_page(gost: dict) -> int:
     font_size    = int(gost.get("font_size", 14))
     line_spacing = float(gost.get("line_spacing", 1.5))
     left_mm   = int(gost.get("left_margin_mm",   30))
-    right_mm  = int(gost.get("right_margin_mm",  10))
+    right_mm  = int(gost.get("right_margin_mm",  15))
     top_mm    = int(gost.get("top_margin_mm",    20))
     bottom_mm = int(gost.get("bottom_margin_mm", 20))
 
-    # Базовая площадь текстового блока (TNR 14, 1.5, поля 30/10/20/20).
+    # Базовая площадь текстового блока (TNR 14, 1.5, поля 30/10/20/20 —
+    # старый эмпирический замер). При новых ГОСТ-полях 30/15/20/20
+    # area_factor даст ~0.97 от базы → ≈1359 знаков/стр, что точнее.
     # 1400 — эмпирически, см. комментарий к CHARS_PER_PAGE выше.
     BASE_CHARS   = 1400.0
-    BASE_W_MM    = 210 - 30 - 10   # 170
+    BASE_W_MM    = 210 - 30 - 10   # 170 (базовая точка замера)
     BASE_H_MM    = 297 - 20 - 20   # 257
 
     text_w = max(60, 210 - left_mm - right_mm)
@@ -509,7 +524,7 @@ DEFAULT_GOST_CONFIGS: dict = {
         "line_spacing":           1.5,
         "first_line_indent_cm":   1.25,
         "left_margin_mm":         30,
-        "right_margin_mm":        10,
+        "right_margin_mm":        15,
         "top_margin_mm":          20,
         "bottom_margin_mm":       20,
         "alignment":              "justify",
@@ -527,6 +542,12 @@ for _t in DOC_TYPES.keys():
     GOST_CONFIGS.setdefault(_t, {})
     for _k, _v in DEFAULT_GOST_CONFIGS[_t].items():
         GOST_CONFIGS[_t].setdefault(_k, _v)
+    # ── Миграция к ГОСТ 7.32-2017 §6.1: правое поле 15 мм (а не 10) ──
+    # До v2.7-fix6 в дефолтах стояло 10 мм. Если у пользователя сохранился
+    # старый дефолт, мягко обновляем до 15 — пользовательские отличия
+    # (≠ 10) сохраняются.
+    if GOST_CONFIGS[_t].get("right_margin_mm") == 10:
+        GOST_CONFIGS[_t]["right_margin_mm"] = 15
 
 _save_json(GOST_CONFIG_FILE, GOST_CONFIGS)
 
@@ -969,12 +990,16 @@ async def generate_chapter_titles(
     try:
         result = json.loads(raw)
         if isinstance(result, list) and all("title" in r for r in result):
-            return result
+            # ГОСТ 7.32-2017 §6.3.2 — убираем точки после номеров разделов,
+            # которые иногда вставляет модель вопреки инструкции.
+            return _normalize_chapter_titles(result)
     except Exception:
         pass
 
     # Фоллбэк: базовые названия
-    return _default_chapter_titles(doc_type, topic, num_chapters)
+    return _normalize_chapter_titles(
+        _default_chapter_titles(doc_type, topic, num_chapters)
+    )
 
 
 async def verify_discipline_relevance(
@@ -1024,6 +1049,39 @@ async def verify_discipline_relevance(
         print(f"[RELEVANCE] check failed: {e}")
 
     return True, "проверка недоступна"
+
+
+def _strip_dot_after_section_number(title: str) -> str:
+    """ГОСТ 7.32-2017 §6.3.2: после номера раздела/подраздела точка НЕ ставится.
+
+    Приводит «1. Название» → «1 Название», «1.1. Название» → «1.1 Название»,
+    «Глава 1. Название» → «1 Название». Безопасно для уже корректных заголовков
+    и для текстовых заголовков без номера.
+    """
+    if not title:
+        return title
+    t = title.strip()
+    # Убираем слово «Глава N.» — не нужно по ГОСТ
+    t = re.sub(r"^\s*Глава\s+(\d+)\.?\s*", r"\1 ", t, flags=re.IGNORECASE)
+    # «1.1.1.   Название» → «1.1.1 Название»; «1.   Название» → «1 Название»
+    t = re.sub(r"^(\d+(?:\.\d+)*)\.\s+", r"\1 ", t)
+    # «1.Название» (без пробела) → «1 Название»
+    t = re.sub(r"^(\d+(?:\.\d+)*)\.(?=[А-ЯA-Z])", r"\1 ", t)
+    # На всякий случай — точка в самом конце заголовка убирается
+    t = re.sub(r"\.\s*$", "", t)
+    return t
+
+
+def _normalize_chapter_titles(chapters: list[dict]) -> list[dict]:
+    """Нормализует заголовки разделов и подразделов по ГОСТ 7.32-2017 §6.3."""
+    out = []
+    for ch in chapters:
+        new_ch = {
+            "title": _strip_dot_after_section_number(ch.get("title", "")),
+            "subs":  [_strip_dot_after_section_number(s) for s in ch.get("subs", [])],
+        }
+        out.append(new_ch)
+    return out
 
 
 def _default_chapter_titles(doc_type: str, topic: str, num_chapters: int) -> list[dict]:
@@ -1251,7 +1309,7 @@ def build_prompts(
                 f"статьи из реальных журналов, известные монографии. "
                 f"НЕ выдумывай фамилии, названия издательств или журналов. "
                 f"Если точный источник неизвестен — опусти его, не фантазируй. "
-                f"Формат ГОСТ Р 7.0.5-2008: 1. Автор А.А. Название. — М.: Изд-во, год. — N с.\n"
+                f"Формат ГОСТ Р 7.0.100-2018: Фамилия, И. О. Название : сведения / И. О. Фамилия. — Город : Изд-во, год. — N с. — ISBN.\n"
                 f"Только список, без заголовков и пояснений."
             ),
         }
@@ -1283,7 +1341,7 @@ def build_prompts(
                 f"статьи из реальных журналов, известные монографии. "
                 f"НЕ выдумывай фамилии, названия издательств или журналов. "
                 f"Если точный источник неизвестен — опусти его, не фантазируй. "
-                f"Формат ГОСТ Р 7.0.5-2008. Только нумерованный список."
+                f"Формат ГОСТ Р 7.0.100-2018 (библиографическое описание). Сноски в тексте — по ГОСТ Р 7.0.5-2008 [1, с. 45]. Только нумерованный список."
             ),
         }
         # Заключение для доклада генерируется ПОСЛЕ разделов (см. generate_text_blocks)
@@ -1333,7 +1391,7 @@ def build_prompts(
                 f"Используй ТОЛЬКО реальные источники: учебники, законы, статьи из реальных журналов, "
                 f"известные монографии. НЕ выдумывай фамилии, названия издательств или DOI. "
                 f"Если точный источник неизвестен — опусти его, не фантазируй. "
-                f"Формат ГОСТ Р 7.0.5-2008 / ГОСТ Р 7.0.7-2021. Только нумерованный список."
+                f"Формат ГОСТ Р 7.0.100-2018 (описание источников); сноски — по ГОСТ Р 7.0.5-2008. Только нумерованный список."
             ),
         }
 
@@ -1397,7 +1455,7 @@ def build_prompts(
         f"статьи из реальных журналов, известные монографии. "
         f"НЕ выдумывай фамилии, названия издательств или журналов. "
         f"Если точный источник неизвестен — опусти его, не фантазируй. "
-        f"Формат ГОСТ Р 7.0.5-2008: 1. Автор А.А. Название / А.А. Автор. — М.: Изд-во, год. — N с.\n"
+        f"Формат ГОСТ Р 7.0.100-2018: Фамилия, И. О. Название : сведения / И. О. Фамилия. — Город : Изд-во, год. — N с. — ISBN.\n"
         f"Только нумерованный список без заголовков."
     )
 
@@ -1434,8 +1492,8 @@ def generate_structure(
     if doc_type == "doklad":
         return [
             ("ВВЕДЕНИЕ", 1, parts.get("intro", ""), []),
-            ("1. Теоретические основы и ключевые понятия", 1, parts.get("part1", ""), []),
-            ("2. Факты, статистика и практические примеры", 1, parts.get("part2", ""), []),
+            ("1 Теоретические основы и ключевые понятия", 1, parts.get("part1", ""), []),
+            ("2 Факты, статистика и практические примеры", 1, parts.get("part2", ""), []),
             ("ЗАКЛЮЧЕНИЕ", 1, parts.get("conclusion", ""), []),
             ("СПИСОК ИСПОЛЬЗОВАННЫХ ИСТОЧНИКОВ", 1, parts.get("literature", ""), []),
         ]
@@ -2289,7 +2347,7 @@ def setup_gost_page(doc: Document, gost: dict) -> None:
         sec.top_margin    = Mm(int(gost.get("top_margin_mm",    20)))
         sec.bottom_margin = Mm(int(gost.get("bottom_margin_mm", 20)))
         sec.left_margin   = Mm(int(gost.get("left_margin_mm",   30)))
-        sec.right_margin  = Mm(int(gost.get("right_margin_mm",  10)))
+        sec.right_margin  = Mm(int(gost.get("right_margin_mm",  15)))
 
     style      = doc.styles["Normal"]
     font_name  = gost.get("font_name", "Times New Roman")
@@ -2354,7 +2412,7 @@ def _setup_heading_style(doc: Document, style_name: str, font_name: str, size_pt
         pass
 
 
-def _add_page_field_to_paragraph(p, font_name: str = "Times New Roman", font_size: int = 12) -> None:
+def _add_page_field_to_paragraph(p, font_name: str = "Times New Roman", font_size: int = 14) -> None:
     """Добавляет поле { PAGE } в указанный абзац."""
     p.alignment = WD_ALIGN_PARAGRAPH.CENTER
     p.paragraph_format.first_line_indent = Cm(0)
@@ -2436,7 +2494,7 @@ def _toc_entries(blocks: list[tuple]) -> list[tuple[str, int]]:
             for line in text.split("\n"):
                 line = line.strip()
                 if sub_pat.match(line):
-                    entries.append((line, 2))
+                    entries.append((_strip_dot_after_section_number(line), 2))
     return entries
 
 
@@ -2651,9 +2709,11 @@ def add_paragraphs_from_text(
 
         if subheading_pat.match(first_line):
             # Подзаголовок — жирным в обычном абзаце (не Heading 2)
+            # ГОСТ 7.32-2017 §6.3.2: точка после номера подраздела не ставится
+            clean_subheading = _strip_dot_after_section_number(first_line)
             p = doc.add_paragraph()
             _apply_body_format(p)
-            run1 = p.add_run(first_line)
+            run1 = p.add_run(clean_subheading)
             _set_run_font(run1, font, size, True)
             rest = ch[len(first_line):].strip()
             if rest:
