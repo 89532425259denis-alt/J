@@ -3233,120 +3233,156 @@ def _blocks_text_total(blocks: list[tuple]) -> int:
 
 
 def _trim_blocks_by_chars(blocks: list[tuple], chars_to_remove: int) -> list[tuple]:
-    """Аккуратно укорачивает блоки, сохраняя последний абзац целым."""
+    """
+    Надёжно укорачивает содержательные блоки.
+
+    ИСПРАВЛЕНИЕ ДЛЯ СЛУЧАЯ 12 ВМЕСТО 11:
+    старая версия часто не могла убрать последнюю лишнюю страницу, потому что
+    резала только последний подпункт и старалась оставлять слишком много текста.
+    Эта версия режет самые крупные текстовые куски по всему документу: подглавы,
+    основной текст блока, введение и заключение. Список литературы не трогаем.
+    """
     if chars_to_remove <= 0:
         return blocks
-    
+
     blocks = [list(b) for b in blocks]
+    requested = int(chars_to_remove)
+    removed_total = 0
 
-    def _can_trim(title: str) -> bool:
+    def _is_literature(title: str) -> bool:
         up = (title or "").upper()
-        return not any(w in up for w in ("ЛИТЕРАТ", "ИСТОЧНИК", "БИБЛИОГРАФ", "ЗАКЛЮЧЕНИ"))
+        return any(w in up for w in ("ЛИТЕРАТ", "ИСТОЧНИК", "БИБЛИОГРАФ"))
 
-    def _trim_text(txt: str, need: int) -> tuple[str, int]:
+    def _trim_text(txt: str, need: int, min_keep: int = 250) -> tuple[str, int]:
         """
-        Аккуратно обрезает текст с конца.
-
-        ИСПРАВЛЕНИЕ: раньше функция удаляла только целые абзацы и обязательно
-        оставляла минимум один абзац. Если ИИ написал один огромный абзац,
-        фактически ничего не обрезалось, поэтому при заказе 11 страниц могло
-        оставаться 16. Теперь алгоритм:
-        1) удаляет целые абзацы с конца;
-        2) если всё ещё много — режет последний абзац по предложениям;
-        3) в крайнем случае режет по символам, но оставляет раздел читаемым.
+        Обрезает текст с конца и возвращает (новый_текст, сколько_убрали).
+        Режет абзацы → предложения → символы. Не оставляет блок полностью пустым.
         """
         if not txt or need <= 0:
             return txt, 0
 
-        original_len = len(txt)
+        original = txt
+        original_len = len(original)
+        if original_len <= min_keep:
+            return txt, 0
+
         paras = [p.strip() for p in re.split(r"\n\s*\n", txt) if p.strip()]
         if not paras:
             return txt, 0
 
-        # 1) Удаляем целые абзацы, но оставляем хотя бы один.
-        while len(paras) > 1 and need > 0:
-            removed = len(paras[-1]) + 2
+        # 1) Убираем целые абзацы с конца, пока это не уничтожает блок.
+        while len(paras) > 1 and need > 0 and sum(len(x) for x in paras) > min_keep:
+            last = paras[-1]
+            if sum(len(x) for x in paras[:-1]) < min_keep:
+                break
             paras.pop()
-            need -= removed
+            need -= len(last) + 2
 
-        # 2) Если остался один большой абзац — режем по предложениям.
+        # 2) Режем последний оставшийся/текущий абзац по предложениям.
         if need > 0 and paras:
             paragraph = paras[-1]
             sentences = [x.strip() for x in re.split(r"(?<=[.!?])\s+", paragraph) if x.strip()]
 
-            # Оставляем минимум 2 предложения, чтобы раздел не стал пустым.
-            while len(sentences) > 2 and need > 0:
+            while len(sentences) > 1 and need > 0:
+                candidate = " ".join(sentences[:-1]).strip()
+                full_candidate = "\n\n".join(paras[:-1] + [candidate]).strip()
+                if len(full_candidate) < min_keep:
+                    break
                 removed_sentence = sentences.pop()
                 need -= len(removed_sentence) + 1
 
-            paragraph = " ".join(sentences).strip() if sentences else paragraph
+            if sentences:
+                paras[-1] = " ".join(sentences).strip()
 
-            # 3) Если всё равно нужно убрать — режем по символам.
-            if need > 0 and len(paragraph) > 700:
-                cut_to = max(500, len(paragraph) - need)
-                paragraph = paragraph[:cut_to].rstrip()
+        # 3) Если всё ещё надо убрать — режем по символам, но аккуратно.
+        if need > 0:
+            joined = "\n\n".join(paras).strip()
+            if len(joined) > min_keep:
+                cut_to = max(min_keep, len(joined) - need)
+                joined = joined[:cut_to].rstrip()
+                last_end = max(joined.rfind("."), joined.rfind("!"), joined.rfind("?"))
+                if last_end > min_keep:
+                    joined = joined[:last_end + 1].rstrip()
+                paras = [p.strip() for p in re.split(r"\n\s*\n", joined) if p.strip()]
 
-                # Заканчиваем на последнем полном предложении, если возможно.
-                last_end = max(
-                    paragraph.rfind("."),
-                    paragraph.rfind("!"),
-                    paragraph.rfind("?"),
-                )
-                if last_end > 300:
-                    paragraph = paragraph[:last_end + 1].rstrip()
+        new_txt = "\n\n".join(p for p in paras if p.strip()).strip()
+        removed = max(0, original_len - len(new_txt))
+        return new_txt, removed
 
-            paras[-1] = paragraph
-
-        new_txt = "\n\n".join(p for p in paras if p.strip())
-        removed_total = max(0, original_len - len(new_txt))
-        return new_txt, removed_total
-
-    # Сортируем кандидатов по размеру (самые большие первые)
-    def _block_total(i: int) -> int:
-        b = blocks[i]
+    def _block_text_len(b) -> int:
         total = len(b[2] or "")
         for _, st in (b[3] or []):
             total += len(st or "")
         return total
 
-    candidates = sorted(
-        [i for i, b in enumerate(blocks) if _can_trim(b[0])],
-        key=_block_total, reverse=True,
-    )
+    # Два прохода: сначала основные главы, потом введение/заключение как запас.
+    primary = []
+    secondary = []
+    for i, b in enumerate(blocks):
+        title = b[0] or ""
+        up = title.upper()
+        if _is_literature(title):
+            continue
+        if "ВВЕДЕНИ" in up or "ЗАКЛЮЧЕНИ" in up:
+            secondary.append(i)
+        else:
+            primary.append(i)
 
-    for i in candidates:
-        if chars_to_remove <= 0:
+    candidates = sorted(primary, key=lambda i: _block_text_len(blocks[i]), reverse=True)
+    candidates += sorted(secondary, key=lambda i: _block_text_len(blocks[i]), reverse=True)
+
+    # Режем самые большие текстовые куски. Если надо убрать одну лишнюю страницу,
+    # важно брать не только последний подпункт, а любой крупный подпункт.
+    while chars_to_remove > 0:
+        made_progress = False
+
+        # Собираем все доступные текстовые сегменты.
+        segments = []
+        for i in candidates:
+            b = blocks[i]
+            if b[3]:
+                for si, (_stitle, stext) in enumerate(b[3]):
+                    if stext and len(stext) > 300:
+                        segments.append((len(stext), i, si))
+            if b[2] and len(b[2]) > 300:
+                segments.append((len(b[2]), i, None))
+
+        if not segments:
             break
 
+        segments.sort(reverse=True)
+        _length, i, si = segments[0]
         b = blocks[i]
-        subblocks = b[3]
 
-        if subblocks:
-            # Обрезаем с последней подглавы
-            for si in range(len(subblocks) - 1, -1, -1):
-                if chars_to_remove <= 0:
-                    break
-                stitle, stext = subblocks[si]
-                if not stext or len(stext) < 200:
-                    continue
-                new_stext, removed = _trim_text(stext, chars_to_remove)
-                chars_to_remove -= removed
-                subblocks[si] = (stitle, new_stext)
-            # Обновляем агрегированный текст
-            b[2] = "\n\n".join(st for _, st in subblocks if st)
-        else:
-            txt = b[2] or ""
-            if len(txt) >= 400:
-                new_txt, removed = _trim_text(txt, chars_to_remove)
-                chars_to_remove -= removed
+        # За один шаг режем не больше примерно страницы, чтобы не перелетать слишком сильно.
+        need_now = min(chars_to_remove, max(400, int(_length * 0.45)))
+
+        if si is None:
+            new_txt, removed = _trim_text(b[2] or "", need_now)
+            if removed > 0:
                 b[2] = new_txt
+                made_progress = True
+        else:
+            stitle, stext = b[3][si]
+            new_stext, removed = _trim_text(stext or "", need_now)
+            if removed > 0:
+                b[3][si] = (stitle, new_stext)
+                b[2] = "\n\n".join(st for _, st in b[3] if st)
+                made_progress = True
 
-    # Логируем состояние после обрезки
+        if made_progress:
+            chars_to_remove -= removed
+            removed_total += removed
+        else:
+            break
+
+    print(f"[TRIM] Запрошено убрать {requested} зн.; реально убрано {removed_total} зн.; осталось убрать {max(0, chars_to_remove)} зн.")
+
     for b in blocks:
-        title = b[0][:40]
+        title = (b[0] or "")[:40]
         text_len = len(b[2] or "")
         sub_lens = [len(st or "") for _, st in (b[3] or [])]
-        if text_len < 100 and not any(w in (b[0] or "").upper() for w in ("ЛИТЕРАТ", "ИСТОЧНИК", "БИБЛИОГРАФ")):
+        if text_len < 100 and not _is_literature(b[0] or ""):
             print(f"[TRIM] ⚠️ «{title}» — осталось {text_len} зн., подглавы: {sub_lens}")
 
     return [tuple(b) for b in blocks]
@@ -3515,12 +3551,17 @@ async def precise_page_adjustment(
         chars_per_real_page = calculate_chars_per_page(gost)
         
         if diff > 0:
-            # Слишком много страниц — обрезаем. Множитель 1.0 (раньше 0.8) —
-            # консерватизм давал недорез на 1–2 страницы за итерацию и
-            # приводил к остановке цикла раньше времени.
-            chars_to_remove = int(diff * chars_per_real_page * 1.0)
+            # Слишком много страниц — обрезаем с запасом.
+            # Для случая +1 страница обычные 1400 знаков часто не хватали из-за
+            # заголовков, TOC и неполных строк, поэтому добавлен запас.
+            chars_to_remove = int(diff * chars_per_real_page * 1.35 + 500)
             print(f"[ADJUST] ✂️ Обрезаю {chars_to_remove} знаков")
+            before_trim = _blocks_text_total(blocks)
             blocks = _trim_blocks_by_chars(blocks, chars_to_remove)
+            after_trim = _blocks_text_total(blocks)
+            if after_trim >= before_trim:
+                print("[ADJUST] ⚠️ Обрезка не уменьшила текст. Пробую более жёсткую обрезку.")
+                blocks = _trim_blocks_by_chars(blocks, int(chars_per_real_page * 2.0))
         else:
             # Слишком мало страниц — добавляем
             chars_to_add = int(abs(diff) * chars_per_real_page)
@@ -4798,11 +4839,19 @@ async def generate_and_send(
             updated    = libreoffice_update_docx(tmp_in, tmp_out)
             final_path = tmp_out if updated else tmp_in
 
-            # Если после LibreOffice количество страниц изменилось, подгоняем финальный файл еще раз
-            post_lo_pages = await measure_pages_async(final_path, work_dir)
-            if post_lo_pages is not None and post_lo_pages != pages:
-                print(f"[PAGES] LO сдвинул страницы ({post_lo_pages} вместо {pages}). Запуск финальной коррекции...")
-                # Уменьшаем количество итераций для финальной коррекции
+            # Если после LibreOffice количество страниц изменилось, подгоняем финальный файл.
+            # ВАЖНО: один прогон иногда даёт 12 вместо 11, потому что обновление TOC/полей
+            # снова немного меняет разметку. Поэтому делаем несколько финальных циклов:
+            # замер → коррекция → обновление LibreOffice → замер.
+            final_pages = await measure_pages_async(final_path, work_dir) or pages
+            for final_try in range(5):
+                if final_pages == pages:
+                    break
+
+                print(
+                    f"[PAGES] Финальная коррекция {final_try + 1}/5: "
+                    f"факт={final_pages}, нужно={pages}"
+                )
                 blocks, final_pages = await precise_page_adjustment(
                     tmp_in=final_path,
                     blocks=blocks,
@@ -4815,11 +4864,16 @@ async def generate_and_send(
                     prog=prog,
                     work_dir=work_dir,
                 )
-                # После финальной подгонки нужно еще раз прогнать через LibreOffice для обновления ТОС
+
+                # После коррекции обновляем поля/TOC и снова измеряем уже обновлённый документ.
                 libreoffice_update_docx(final_path, final_path)
-                final_pages = await measure_pages_async(final_path, work_dir) or pages
-            else:
-                final_pages = post_lo_pages or pages
+                final_pages = await measure_pages_async(final_path, work_dir) or final_pages
+
+            if final_pages != pages:
+                print(
+                    f"[PAGES] ⚠️ Не удалось добиться точного числа страниц: "
+                    f"факт={final_pages}, нужно={pages}"
+                )
 
             print(f"[PAGES] 📤 Итог в caption: {final_pages} страниц")
 
