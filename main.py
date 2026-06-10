@@ -3163,21 +3163,24 @@ async def count_pages_via_aspose(docx_path: str) -> Optional[int]:
 async def measure_pages_async(docx_path: str, work_dir: str) -> Optional[int]:
     """
     Главная функция подсчёта страниц (async).
-    
-    Порядок приоритетов:
-    1. Aspose Words Counter API — точный, не требует LibreOffice
-    2. LibreOffice → PDF + PyMuPDF/PyPDF2 — точный, требует soffice
-    3. estimate_docx_pages — расчётный, без внешних зависимостей
-    """
-    # 1) Aspose
-    n = await count_pages_via_aspose(docx_path)
-    if n is not None:
-        return n
 
-    # 2) LibreOffice
+    Порядок приоритетов (v2.7-fix7):
+    1. LibreOffice → PDF + PyMuPDF/PyPDF2 — самый честный для нашего пайплайна:
+       мы и обновляем TOC через LibreOffice, поэтому им же и меряем — чтобы
+       не было расхождения между «померили в Aspose, обновили в LO».
+    2. Aspose Words Counter API — резерв, если soffice недоступен.
+    3. estimate_docx_pages — расчётный, без внешних зависимостей.
+    """
+    # 1) LibreOffice (приоритет: совпадает с тем, чем мы и собираем финал)
     n = count_docx_pages(docx_path, work_dir)
     if n is not None:
         print(f"[LO] Страниц: {n}")
+        return n
+
+    # 2) Aspose
+    n = await count_pages_via_aspose(docx_path)
+    if n is not None:
+        print(f"[ASPOSE] Страниц: {n}")
         return n
 
     # 3) Расчётный эстиматор
@@ -3216,14 +3219,37 @@ def _trim_blocks_by_chars(blocks: list[tuple], chars_to_remove: int) -> list[tup
         return not any(w in up for w in ("ЛИТЕРАТ", "ИСТОЧНИК", "БИБЛИОГРАФ", "ЗАКЛЮЧЕНИ"))
 
     def _trim_text(txt: str, need: int) -> tuple[str, int]:
-        """Откусывает абзацы с конца. Возвращает (новый_текст, сколько_ушло)."""
+        """
+        Откусывает с конца:
+        1) сначала целыми абзацами (пока их >1);
+        2) затем — целыми предложениями внутри последнего абзаца, пока в
+           абзаце остаётся хотя бы ~200 символов (чтобы не превратить главу
+           в обрубок).
+        Это критично, когда LLM вернула 1–2 жирных абзаца на главу: иначе
+        старая логика «оставь последний абзац целым» практически ничего не
+        обрезала и итерации топчутся на месте.
+        """
         paras = [p for p in txt.split("\n\n") if p.strip()]
         removed_total = 0
+        # 1) Абзацами с конца — пока их больше одного
         while paras and need > 0 and len(paras) > 1:
             removed = len(paras[-1]) + 2
             paras.pop()
             need -= removed
             removed_total += removed
+        # 2) Последний абзац — режем по предложениям, оставляя минимум ~200 знаков
+        if paras and need > 0:
+            last = paras[-1]
+            # Разбиваем по концам предложений, но СОХРАНЯЕМ знак препинания
+            parts = re.split(r'(?<=[.!?…])\s+', last)
+            parts = [s for s in parts if s.strip()]
+            min_keep = 200
+            while len(parts) > 1 and need > 0 and sum(len(p) + 1 for p in parts) > min_keep + len(parts[-1]):
+                removed = len(parts[-1]) + 1
+                parts.pop()
+                need -= removed
+                removed_total += removed
+            paras[-1] = " ".join(parts).rstrip()
         return "\n\n".join(paras), removed_total
 
     # Сортируем кандидатов по размеру (самые большие первые)
@@ -4723,13 +4749,27 @@ async def generate_and_send(
             updated    = libreoffice_update_docx(tmp_in, tmp_out)
             final_path = tmp_out if updated else tmp_in
 
-            # Если после LibreOffice количество страниц изменилось, подгоняем финальный файл еще раз
-            post_lo_pages = await measure_pages_async(final_path, work_dir)
-            if post_lo_pages is not None and post_lo_pages != pages:
-                print(f"[PAGES] LO сдвинул страницы ({post_lo_pages} вместо {pages}). Запуск финальной коррекции...")
-                # Уменьшаем количество итераций для финальной коррекции
-                blocks, final_pages = await precise_page_adjustment(
-                    tmp_in=final_path,
+            # ── Постобработка: LO после обновления TOC может «раздуть»
+            #    документ на 1–2 страницы. Поэтому крутим коррекцию в цикле
+            #    до 3 раз: измерили → подогнали blocks → пересобрали → LO → снова замер. ──
+            POST_LO_MAX_ROUNDS = 3
+            final_pages = pages
+            for round_idx in range(POST_LO_MAX_ROUNDS):
+                post_lo_pages = await measure_pages_async(final_path, work_dir)
+                if post_lo_pages is None:
+                    final_pages = pages
+                    break
+                final_pages = post_lo_pages
+                if post_lo_pages == pages:
+                    print(f"[PAGES] ✅ После LO совпало с целью ({pages}) на раунде {round_idx+1}")
+                    break
+
+                print(f"[PAGES] Раунд {round_idx+1}/{POST_LO_MAX_ROUNDS}: LO дал {post_lo_pages}, цель {pages}. Корректирую…")
+
+                # Перегенерируем blocks→docx «сырьём», подгоняем, и затем снова
+                # прогоняем через LibreOffice (он же — финальный источник правды).
+                blocks, _ = await precise_page_adjustment(
+                    tmp_in=tmp_in,
                     blocks=blocks,
                     target_pages=pages,
                     topic=topic,
@@ -4740,11 +4780,16 @@ async def generate_and_send(
                     prog=prog,
                     work_dir=work_dir,
                 )
-                # После финальной подгонки нужно еще раз прогнать через LibreOffice для обновления ТОС
-                libreoffice_update_docx(final_path, final_path)
-                final_pages = await measure_pages_async(final_path, work_dir) or pages
+                # Пересобираем DOCX «как новый» из обновлённых blocks
+                docx_raw = build_docx_bytes(data, blocks, gost)
+                with open(tmp_in, "wb") as f:
+                    f.write(docx_raw)
+                # И снова через LO — это, как правило, и есть «+1 страница» источник
+                updated = libreoffice_update_docx(tmp_in, tmp_out)
+                final_path = tmp_out if updated else tmp_in
             else:
-                final_pages = post_lo_pages or pages
+                # Цикл закончился без break — печатаем итог
+                print(f"[PAGES] ⚠️ После {POST_LO_MAX_ROUNDS} раундов финальная цифра {final_pages}, цель {pages}")
 
             print(f"[PAGES] 📤 Итог в caption: {final_pages} страниц")
 
@@ -4834,7 +4879,7 @@ async def generate_and_send(
 
 async def main() -> None:
     print("═" * 62)
-    print("  🤖  ГОСТ-АССИСТЕНТ v2.7")
+    print("  🤖  ГОСТ-АССИСТЕНТ v2.7-fix7")
     print("═" * 62)
     print(f"  LibreOffice : {shutil.which('soffice') or '❌ не найден'}")
     print(f"  DeepSeek    : {'✅' if DEEPSEEK_KEY else '❌ нет ключа'}")
