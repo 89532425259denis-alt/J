@@ -3180,24 +3180,35 @@ async def count_pages_via_aspose(docx_path: str) -> Optional[int]:
 async def measure_pages_async(docx_path: str, work_dir: str) -> Optional[int]:
     """
     Главная функция подсчёта страниц (async).
-    
-    Порядок приоритетов:
-    1. Aspose Words Counter API — точный, не требует LibreOffice
-    2. LibreOffice → PDF + PyMuPDF/PyPDF2 — точный, требует soffice
-    3. estimate_docx_pages — расчётный, без внешних зависимостей
-    """
-    # 1) Aspose
-    n = await count_pages_via_aspose(docx_path)
-    if n is not None:
-        return n
 
-    # 2) LibreOffice
+    ВАЖНОЕ ИСПРАВЛЕНИЕ:
+    сначала считаем страницы через локальный LibreOffice → PDF. Это самый
+    стабильный способ, потому что он считает именно тот DOCX, который бот
+    отправит пользователю. Aspose оставлен только как запасной вариант.
+
+    Порядок приоритетов:
+    1. LibreOffice → PDF + PyMuPDF/PyPDF2/pdfinfo — точный локальный подсчёт
+    2. Aspose Words Counter API — запасной онлайн-сервис
+    3. estimate_docx_pages — грубая оценка, если нет ни LibreOffice, ни Aspose
+    """
+    # 1) LibreOffice — основной точный способ
     n = count_docx_pages(docx_path, work_dir)
     if n is not None:
         print(f"[LO] Страниц: {n}")
         return n
 
-    # 3) Расчётный эстиматор
+    print(
+        "[WARN] LibreOffice не найден или не смог посчитать страницы. "
+        "Проверь apt.txt: нужен libreoffice/libreoffice-writer."
+    )
+
+    # 2) Aspose — запасной онлайн-сервис
+    n = await count_pages_via_aspose(docx_path)
+    if n is not None:
+        print(f"[ASPOSE] Страниц: {n}")
+        return n
+
+    # 3) Расчётный эстиматор — только крайний fallback
     n = estimate_docx_pages(docx_path)
     if n is not None:
         print(f"[ESTIM] Страниц (расчётно): {n}")
@@ -3233,15 +3244,62 @@ def _trim_blocks_by_chars(blocks: list[tuple], chars_to_remove: int) -> list[tup
         return not any(w in up for w in ("ЛИТЕРАТ", "ИСТОЧНИК", "БИБЛИОГРАФ", "ЗАКЛЮЧЕНИ"))
 
     def _trim_text(txt: str, need: int) -> tuple[str, int]:
-        """Откусывает абзацы с конца. Возвращает (новый_текст, сколько_ушло)."""
-        paras = [p for p in txt.split("\n\n") if p.strip()]
-        removed_total = 0
-        while paras and need > 0 and len(paras) > 1:
+        """
+        Аккуратно обрезает текст с конца.
+
+        ИСПРАВЛЕНИЕ: раньше функция удаляла только целые абзацы и обязательно
+        оставляла минимум один абзац. Если ИИ написал один огромный абзац,
+        фактически ничего не обрезалось, поэтому при заказе 11 страниц могло
+        оставаться 16. Теперь алгоритм:
+        1) удаляет целые абзацы с конца;
+        2) если всё ещё много — режет последний абзац по предложениям;
+        3) в крайнем случае режет по символам, но оставляет раздел читаемым.
+        """
+        if not txt or need <= 0:
+            return txt, 0
+
+        original_len = len(txt)
+        paras = [p.strip() for p in re.split(r"\n\s*\n", txt) if p.strip()]
+        if not paras:
+            return txt, 0
+
+        # 1) Удаляем целые абзацы, но оставляем хотя бы один.
+        while len(paras) > 1 and need > 0:
             removed = len(paras[-1]) + 2
             paras.pop()
             need -= removed
-            removed_total += removed
-        return "\n\n".join(paras), removed_total
+
+        # 2) Если остался один большой абзац — режем по предложениям.
+        if need > 0 and paras:
+            paragraph = paras[-1]
+            sentences = [x.strip() for x in re.split(r"(?<=[.!?])\s+", paragraph) if x.strip()]
+
+            # Оставляем минимум 2 предложения, чтобы раздел не стал пустым.
+            while len(sentences) > 2 and need > 0:
+                removed_sentence = sentences.pop()
+                need -= len(removed_sentence) + 1
+
+            paragraph = " ".join(sentences).strip() if sentences else paragraph
+
+            # 3) Если всё равно нужно убрать — режем по символам.
+            if need > 0 and len(paragraph) > 700:
+                cut_to = max(500, len(paragraph) - need)
+                paragraph = paragraph[:cut_to].rstrip()
+
+                # Заканчиваем на последнем полном предложении, если возможно.
+                last_end = max(
+                    paragraph.rfind("."),
+                    paragraph.rfind("!"),
+                    paragraph.rfind("?"),
+                )
+                if last_end > 300:
+                    paragraph = paragraph[:last_end + 1].rstrip()
+
+            paras[-1] = paragraph
+
+        new_txt = "\n\n".join(p for p in paras if p.strip())
+        removed_total = max(0, original_len - len(new_txt))
+        return new_txt, removed_total
 
     # Сортируем кандидатов по размеру (самые большие первые)
     def _block_total(i: int) -> int:
