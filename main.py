@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-"""ГОСТ-АССИСТЕНТ v2.7-fix15 — ТОЧНЫЕ СТРАНИЦЫ + ДИСЦИПЛИНА
+"""ГОСТ-АССИСТЕНТ v2.7-fix16 — ТОЧНЫЕ СТРАНИЦЫ + ДИСЦИПЛИНА
 
 Главные изменения v2.1 относительно v2.0:
 ────────────────────────────────────────────────────────────────
@@ -2027,17 +2027,30 @@ async def generate_text_blocks(
     # ═══════════════════════════════════════════════════════════
     n_sources = _count_sources(parts.get("literature", ""))
     if n_sources > 0:
+        # fix16: сначала прогоняем repair+fix_nonsense+fix_citations,
+        # потом собираем ГЛОБАЛЬНУЮ карту страниц со всех частей и
+        # дозаполняем bare `[N]` ею (раньше карта была только локальной,
+        # поэтому `[2]` в 1.2 не получал страницу из `[2, с. 25]` в 2.1).
         for key in list(parts.keys()):
             if key == "literature":
                 continue
-            # Сначала чиним оборванные ссылки `[1, с.` → `[1]` (fix10),
-            # затем — характерные «галлюцинации» промпта (fix12),
-            # и только потом приводим номера к допустимому диапазону.
             parts[key] = _repair_broken_citations(parts[key])
             parts[key] = _fix_nonsense_phrases(parts[key])
             parts[key] = _fix_citations(parts[key], n_sources)
-            # fix14: дозаполняем `[N]` без страницы из предыдущих ссылок
-            parts[key] = _fill_missing_pages(parts[key])
+
+        global_page_map: dict = {}
+        for key, val in parts.items():
+            if key == "literature" or not val:
+                continue
+            for n, p in _build_page_map(val).items():
+                global_page_map.setdefault(n, p)
+
+        for key in list(parts.keys()):
+            if key == "literature":
+                continue
+            # fix14+16: дозаполняем `[N]` без страницы из глобальной карты
+            parts[key] = _fill_missing_pages(parts[key],
+                                            global_page_map=global_page_map)
 
         # Удаляем неиспользуемые источники (фикс «избыточен, N не используются»)
         parts = _prune_unused_sources(parts)
@@ -2114,10 +2127,10 @@ def _ensure_paragraph_breaks(text: str, min_paragraphs: int = 3) -> str:
     if len(flat) < 350:
         return text  # слишком короткий, не режем
     # Режем по предложениям
-    sentences = re.findall(r'[^.!?…]+[.!?…]+\s*', flat)
+    # fix16: безопасный split — не режем `[N, с. K]`
+    sentences = _split_sentences_safe(flat)
     if not sentences:
         return text
-    sentences = [s.strip() for s in sentences if s.strip()]
     if len(sentences) < min_paragraphs:
         return text
     # Разделяем предложения примерно поровну между min_paragraphs кусками
@@ -2203,6 +2216,18 @@ def _normalize_typography(text: str) -> str:
     return text
 
 
+def _split_sentences_safe(text: str) -> list[str]:
+    """fix16: разбивает текст на предложения, НЕ срываясь на `с.` внутри
+    ссылок `[N, с. K]`. Точка считается концом предложения только если
+    следующее «предложение» начинается с заглавной буквы / открывающей
+    кавычки / скобки. Иначе склеиваем обратно.
+    """
+    if not text:
+        return []
+    parts = re.split(r"(?<=[.!?…])\s+(?=[А-ЯA-ZЁ«„„\"(])", text)
+    return [p for p in parts if p and p.strip()]
+
+
 def _count_sources(bib_text: str) -> int:
     """Считает количество позиций в списке литературы (после нормализации)."""
     if not bib_text:
@@ -2259,6 +2284,13 @@ def _repair_broken_citations(text: str) -> str:
     text = re.sub(
         r"\[\s*(\d+)\s*,?\s*(?=[\n\r])", r"[\1].", text
     )
+    # 9) fix16: orphan-хвост ` 89]. ` сразу после `[N]. `
+    #    (последствие старого split на `с.` в `[N, с. K]`)
+    text = re.sub(
+        r"(\[\d+\])\.\s+\d+\]\.\s*",
+        r"\1. ",
+        text,
+    )
     if text != original:
         before = len(
             re.findall(r"\[\s*\d+\s*,\s*" + S + r"\.(?!\s*\d)", original)
@@ -2268,22 +2300,33 @@ def _repair_broken_citations(text: str) -> str:
     return text
 
 
-def _fill_missing_pages(text: str) -> str:
-    """fix14: `[N]` без `с.` → `[N, с. K]` где K взято из предыдущего
-    появления того же источника `[N, с. K]` в тексте. Если ранее не
-    встречалось — оставляем как есть.
-
-    Тоже принимает Latin `c.` и Cyrillic `с.`.
-    """
-    if not text:
-        return text
-    # Соберём mapping {N: первая встреченная страница}
+def _build_page_map(text: str) -> dict:
+    """fix16: собирает {N: первая страница} из всех `[N, с. K]` в тексте."""
     page_map: dict[str, str] = {}
+    if not text:
+        return page_map
     for m in re.finditer(
         r"\[\s*(\d+)\s*,\s*[сСcC]\.\s*(\d+(?:[\u2013\u2014-]\d+)?)\s*\]",
         text,
     ):
         page_map.setdefault(m.group(1), m.group(2))
+    return page_map
+
+
+def _fill_missing_pages(text: str, global_page_map: Optional[dict] = None) -> str:
+    """fix14: `[N]` без `с.` → `[N, с. K]` где K взято из предыдущего
+    появления того же источника `[N, с. K]` в тексте.
+
+    fix16: если передан `global_page_map`, дополняет локальный (т. е.
+    bare `[2]` в подглаве 1.2 берёт страницу из `[2, с. 25]` в подглаве 2.1).
+
+    Тоже принимает Latin `c.` и Cyrillic `с.`.
+    """
+    if not text:
+        return text
+    page_map: dict = dict(global_page_map or {})
+    # Локальные ссылки имеют приоритет над глобальной картой
+    page_map.update(_build_page_map(text))
 
     if not page_map:
         return text
@@ -2342,7 +2385,8 @@ def _normalize_homoglyphs(text: str) -> str:
 # ═══════════════════════════════════════════════════════════════
 #  fix15: финальная очистка LLM-выхода после expand-цикла
 # ═══════════════════════════════════════════════════════════════
-def _clean_llm_chunk(text: str, n_sources: int = 0) -> str:
+def _clean_llm_chunk(text: str, n_sources: int = 0,
+                    global_page_map: Optional[dict] = None) -> str:
     """Применяет тот же chain очисток, что и для основного LLM-выхода.
     Используется в `_expand_blocks_by_chars` для каждого кусочка LLM."""
     if not text:
@@ -2352,7 +2396,7 @@ def _clean_llm_chunk(text: str, n_sources: int = 0) -> str:
     text = _fix_nonsense_phrases(text)
     if n_sources > 0:
         text = _fix_citations(text, n_sources)
-        text = _fill_missing_pages(text)
+        text = _fill_missing_pages(text, global_page_map=global_page_map)
     text = _normalize_homoglyphs(text)
     text = _ensure_block_terminates(text)
     return text
@@ -2673,8 +2717,8 @@ def _validate_conclusion_consistency(conc_text: str, parts: dict) -> str:
     if not body_words:
         return conc_text
 
-    sents = re.split(r"(?<=[.!?…])\s+", conc_text.strip())
-    sents = [s for s in sents if s.strip()]
+    # fix16: безопасный split — точка из `с.` внутри `[N, с. K]` не считается концом предложения
+    sents = _split_sentences_safe(conc_text.strip())
     if len(sents) < 4:
         return conc_text
 
@@ -3328,30 +3372,58 @@ def add_paragraphs_from_text(
     # Удаляем первый заголовок если нужно
     if skip_first_heading and not is_bib and text:
         lines = text.split('\n')
-        # fix15: смотрим первые ДВЕ строки (LLM иногда: "## 2.3 Title\nТекст…",
-        # иногда «2.3. Заголовок\n2.3 Заголовок\nТекст…» — двойной заголовок).
-        for _skip_n in (1, 2):
-            if len(lines) < _skip_n:
+        # fix16: нормализуем обе стороны одинаково — снимаем markdown,
+        # ведущую нумерацию "2.3", "2.3." и точки.
+        def _norm_for_match(s: str) -> str:
+            s = re.sub(r"^#{1,6}\s*", "", s.strip())
+            s = re.sub(r"^\d{1,3}(?:\.\d{1,3})*\.?\s+", "", s)
+            s = re.sub(r"\s+", " ", s.lower().replace(".", "").strip())
+            return s
+
+        norm_heading = _norm_for_match(skip_first_heading)
+
+        def _line_matches(line: str) -> bool:
+            nf = _norm_for_match(line)
+            if not nf or not norm_heading:
+                return False
+            # Полное совпадение
+            if nf == norm_heading:
+                return True
+            # Префиксное совпадение (LLM мог добавить/убрать пару символов)
+            min_len = min(len(nf), len(norm_heading))
+            if min_len > 10:
+                # Считаем совпадением, если короткая версия — префикс длинной,
+                # и они почти одинаковой длины (разница ≤ 3 символа).
+                if (
+                    (nf.startswith(norm_heading) and len(nf) - len(norm_heading) <= 3)
+                    or (norm_heading.startswith(nf) and len(norm_heading) - len(nf) <= 3)
+                ):
+                    return True
+            return False
+
+        def _is_bare_number(line: str) -> bool:
+            # «1.1.» или «1.1» без текста после
+            return bool(re.match(r"^\s*\d{1,3}(?:\.\d{1,3})*\.?\s*$", line.strip()))
+
+        # Повторяем до 3 раз: бывает LLM пишет
+        # "1.1.\n1.1 Title\nТекст" или "1.1. Title\n1.1 Title\nТекст".
+        for _ in range(3):
+            stripped = False
+            if lines:
+                first = lines[0].strip()
+                if _line_matches(first):
+                    lines = lines[1:]
+                    stripped = True
+                elif _is_bare_number(first) and len(lines) >= 2 and _line_matches(lines[1]):
+                    # bare "1.1." на первой строке + полный заголовок на второй
+                    lines = lines[2:]
+                    stripped = True
+            if not stripped:
                 break
-            joined = " ".join(l.strip() for l in lines[:_skip_n] if l.strip())
-            if not joined:
-                continue
-            # Снимаем markdown-решётки и ведущую нумерацию вида "2.3.", "2.3", "N."
-            cand = re.sub(r"^#{1,6}\s*", "", joined)
-            cand = re.sub(r"^\d{1,3}(?:\.\d{1,3})*\.?\s+", "", cand)
-            norm_first = re.sub(r"\s+", " ", cand.lower().replace(".", ""))
-            norm_heading = re.sub(
-                r"\s+", " ", skip_first_heading.lower().replace(".", "")
-            )
-            if (
-                norm_first == norm_heading
-                or (
-                    len(norm_heading) > 10
-                    and norm_first.startswith(norm_heading[: max(10, len(norm_heading) - 2)])
-                )
-            ):
-                text = "\n".join(lines[_skip_n:]).strip()
-                break
+            # Чистим ведущие пустые строки между итерациями
+            while lines and not lines[0].strip():
+                lines = lines[1:]
+        text = "\n".join(lines).strip()
 
     def _apply_body_format(p) -> None:
         p.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
@@ -4031,7 +4103,15 @@ def _trim_blocks_by_chars(blocks: list[tuple], chars_to_remove: int) -> list[tup
                         # Дописываем точку, чтобы не было обрыва
                         paras[-1] = last + "."
 
-        return "\n\n".join(paras), removed_total
+        # fix16: финальная очистка broken-citation после обрезки.
+        # `_trim_text` может оставить хвост `… породами [1, с.` — guard
+        # выше принимает `.` из `с.` как конец предложения и не режет.
+        result = "\n\n".join(paras)
+        cleaned = _repair_broken_citations(result)
+        if cleaned != result:
+            removed_total += len(result) - len(cleaned)
+            result = cleaned
+        return result, removed_total
 
     # Сортируем кандидатов по размеру (самые большие первые)
     def _block_total(i: int) -> int:
@@ -4109,6 +4189,18 @@ async def _expand_blocks_by_chars(
             n_sources_local = _count_sources(_b[2] or "")
             break
 
+    # fix16: глобальная карта страниц по всем блокам — чтобы bare `[N]`
+    # в дописанных кусках получал страницу из ранее увиденных `[N, с. K]`.
+    _global_pm: dict = {}
+    for _b in blocks:
+        for _, _st in (_b[3] or []):
+            if _st:
+                for n, p in _build_page_map(_st).items():
+                    _global_pm.setdefault(n, p)
+        if _b[2]:
+            for n, p in _build_page_map(_b[2]).items():
+                _global_pm.setdefault(n, p)
+
     def _is_expandable(title: str) -> bool:
         up = (title or "").upper()
         return not any(w in up for w in ("ЛИТЕРАТ", "ИСТОЧНИК", "БИБЛИОГРАФ"))
@@ -4177,8 +4269,9 @@ async def _expand_blocks_by_chars(
             if not extra or len(extra.strip()) < 100:
                 continue
 
-            # fix15: тот же chain очисток, что и для основного выхода
-            extra = _clean_llm_chunk(extra.strip(), n_sources=n_sources_local)
+            # fix15+16: тот же chain очисток, плюс глобальная карта страниц
+            extra = _clean_llm_chunk(extra.strip(), n_sources=n_sources_local,
+                                     global_page_map=_global_pm)
             if not extra:
                 continue
             text = (text.rstrip() + "\n\n" + extra) if text else extra
@@ -5687,7 +5780,7 @@ async def generate_and_send(
 
 async def main() -> None:
     print("═" * 62)
-    print("  🤖  ГОСТ-АССИСТЕНТ v2.7-fix15")
+    print("  🤖  ГОСТ-АССИСТЕНТ v2.7-fix16")
     print("═" * 62)
     print(f"  LibreOffice : {shutil.which('soffice') or '❌ не найден'}")
     print(f"  DeepSeek    : {'✅' if DEEPSEEK_KEY else '❌ нет ключа'}")
