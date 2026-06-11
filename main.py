@@ -4092,27 +4092,26 @@ def _trim_blocks_by_chars(blocks: list[tuple], chars_to_remove: int) -> list[tup
                 # Ищем последний знак конца предложения
                 m = re.search(r"[.!?…][»\"']?\s*$", last)
                 if not m:
-                # Ищем последний знак конца предложения.
-                # Чтобы не обрезать на «с. 45», ищем точку, которая НЕ является частью «с. {цифра}».
-                # Используем поиск с конца.
-                cut = -1
-                for i in range(len(last) - 1, -1, -1):
-                    char = last[i]
-                    if char in ".!?…":
-                        # Проверяем, не является ли эта точка частью «с. {цифра}»
-                        is_page_dot = False
-                        if char == '.':
-                            if i > 0 and last[i-1].lower() == 'с':
-                                is_page_dot = True
-                        if not is_page_dot:
-                            cut = i
-                            break
-                if cut > 50:  # не калечим короткий абзац
-                    # Включаем сам знак препинания
-                    new_last = last[: cut + 1].rstrip()
-                    removed_total += len(last) - len(new_last)
-                    paras[-1] = new_last
-
+                    # Ищем последний знак конца предложения.
+                    # Чтобы не обрезать на «с. 45», ищем точку, которая НЕ является частью «с. {цифра}».
+                    # Используем поиск с конца.
+                    cut = -1
+                    for i in range(len(last) - 1, -1, -1):
+                        char = last[i]
+                        if char in ".!?…":
+                            # Проверяем, не является ли эта точка частью «с. {цифра}»
+                            is_page_dot = False
+                            if char == '.':
+                                if i > 0 and last[i-1].lower() == 'с':
+                                    is_page_dot = True
+                            if not is_page_dot:
+                                cut = i
+                                break
+                    if cut > 50:  # не калечим короткий абзац
+                        # Включаем сам знак препинания
+                        new_last = last[: cut + 1].rstrip()
+                        removed_total += len(last) - len(new_last)
+                        paras[-1] = new_last
                     else:
                         # Дописываем точку, чтобы не было обрыва
                         paras[-1] = last + "."
