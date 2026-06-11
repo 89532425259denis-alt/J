@@ -2287,10 +2287,17 @@ def _repair_broken_citations(text: str) -> str:
     # 9) fix16: orphan-хвост ` 89]. ` сразу после `[N]. `
     #    (последствие старого split на `с.` в `[N, с. K]`)
     text = re.sub(
-        r"(\[\d+\])\.\s+\d+\]\.\s*",
+        r"(\[\d+\])\.?\s+\d+\]\.?\s*",
         r"\1. ",
         text,
     )
+    # 10) Дополнительная очистка: удаление остатков вида `с. 45].`
+    text = re.sub(
+        r"\s*[сСcC]\.\s*\d+\]\.?\s*",
+        " ",
+        text,
+    )
+
     if text != original:
         before = len(
             re.findall(r"\[\s*\d+\s*,\s*" + S + r"\.(?!\s*\d)", original)
@@ -2301,12 +2308,15 @@ def _repair_broken_citations(text: str) -> str:
 
 
 def _build_page_map(text: str) -> dict:
-    """fix16: собирает {N: первая страница} из всех `[N, с. K]` в тексте."""
+    """fix16: собирает {N: первая страница} из всех `[N, с. K]` в тексте.
+    Регулярное выражение стало гибким к пробелам.
+    """
     page_map: dict[str, str] = {}
     if not text:
         return page_map
+    # Гибкий поиск: [N, с. K], [N,с. K], [N, с.K] и т.д.
     for m in re.finditer(
-        r"\[\s*(\d+)\s*,\s*[сСcC]\.\s*(\d+(?:[\u2013\u2014-]\d+)?)\s*\]",
+        r"\[\s*(\d+)\s*,\s*[сСcC]\.?\s*(\d+(?:[\u2013\u2014-]\d+)?)\s*\]",
         text,
     ):
         page_map.setdefault(m.group(1), m.group(2))
@@ -3383,23 +3393,15 @@ def add_paragraphs_from_text(
         norm_heading = _norm_for_match(skip_first_heading)
 
         def _line_matches(line: str) -> bool:
-            nf = _norm_for_match(line)
-            if not nf or not norm_heading:
-                return False
-            # Полное совпадение
-            if nf == norm_heading:
-                return True
-            # Префиксное совпадение (LLM мог добавить/убрать пару символов)
-            min_len = min(len(nf), len(norm_heading))
-            if min_len > 10:
-                # Считаем совпадением, если короткая версия — префикс длинной,
-                # и они почти одинаковой длины (разница ≤ 3 символа).
-                if (
-                    (nf.startswith(norm_heading) and len(nf) - len(norm_heading) <= 3)
-                    or (norm_heading.startswith(nf) and len(norm_heading) - len(nf) <= 3)
-                ):
-                    return True
-            return False
+            # Сравниваем максимально «очищенные» версии строк
+            def _deep_clean(s: str) -> str:
+                s = s.strip().lower()
+                s = re.sub(r'^\s*#{1,6}\s*', '', s)
+                s = re.sub(r'^\d{1,3}(?:\.\d{1,3})*\.?\s*', '', s)
+                s = re.sub(r'[\.\,\-\_\:;\"\'«»\(\)]', '', s)
+                return re.sub(r'\s+', ' ', s).strip()
+
+            return _deep_clean(line) == _deep_clean(skip_first_heading)
 
         def _is_bare_number(line: str) -> bool:
             # «1.1.» или «1.1» без текста после
@@ -4090,15 +4092,27 @@ def _trim_blocks_by_chars(blocks: list[tuple], chars_to_remove: int) -> list[tup
                 # Ищем последний знак конца предложения
                 m = re.search(r"[.!?…][»\"']?\s*$", last)
                 if not m:
-                    cut = max(
-                        last.rfind("."), last.rfind("!"),
-                        last.rfind("?"), last.rfind("…"),
-                    )
-                    if cut > 50:  # не калечим короткий абзац
-                        # Включаем сам знак препинания
-                        new_last = last[: cut + 1].rstrip()
-                        removed_total += len(last) - len(new_last)
-                        paras[-1] = new_last
+                # Ищем последний знак конца предложения.
+                # Чтобы не обрезать на «с. 45», ищем точку, которая НЕ является частью «с. {цифра}».
+                # Используем поиск с конца.
+                cut = -1
+                for i in range(len(last) - 1, -1, -1):
+                    char = last[i]
+                    if char in ".!?…":
+                        # Проверяем, не является ли эта точка частью «с. {цифра}»
+                        is_page_dot = False
+                        if char == '.':
+                            if i > 0 and last[i-1].lower() == 'с':
+                                is_page_dot = True
+                        if not is_page_dot:
+                            cut = i
+                            break
+                if cut > 50:  # не калечим короткий абзац
+                    # Включаем сам знак препинания
+                    new_last = last[: cut + 1].rstrip()
+                    removed_total += len(last) - len(new_last)
+                    paras[-1] = new_last
+
                     else:
                         # Дописываем точку, чтобы не было обрыва
                         paras[-1] = last + "."
