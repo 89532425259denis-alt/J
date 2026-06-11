@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-"""ГОСТ-АССИСТЕНТ v2.7-fix14 — ТОЧНЫЕ СТРАНИЦЫ + ДИСЦИПЛИНА
+"""ГОСТ-АССИСТЕНТ v2.7-fix15 — ТОЧНЫЕ СТРАНИЦЫ + ДИСЦИПЛИНА
 
 Главные изменения v2.1 относительно v2.0:
 ────────────────────────────────────────────────────────────────
@@ -886,7 +886,7 @@ async def call_openai_compat(
 
 async def chat_with_model(info: dict, messages: list[dict], max_tokens: int = 4096) -> str:
     raw = await call_openai_compat(info, messages, max_tokens=max_tokens)
-    return sanitize_llm_text(raw)
+    return _normalize_homoglyphs(sanitize_llm_text(raw))
 
 
 def fallback_chain(primary: str) -> list[str]:
@@ -1448,11 +1448,19 @@ def build_prompts(
     # Библиография
     num_sources = 12 if pages <= 20 else 20
     prompts["literature"] = (
-        f"Составь список из {num_sources}–{num_sources + 5} источников по теме «{topic}», дисциплина «{subject}». "
-        f"Используй ТОЛЬКО реальные, проверяемые источники: учебники, законы, "
-        f"статьи из реальных журналов, известные монографии. "
-        f"НЕ выдумывай фамилии, названия издательств или журналов. "
-        f"Если точный источник неизвестен — опусти его, не фантазируй. "
+        f"Составь список из {num_sources}–{num_sources + 5} источников по теме «{topic}» "
+        f"(дисциплина «{subject}»).\n\n"
+        f"⚠️ КРИТИЧЕСКИ ВАЖНО: ВСЕ источники ДОЛЖНЫ быть посвящены конкретно теме "
+        f"«{topic}». НЕ включай учебники общего профиля по дисциплине, если они "
+        f"не относятся к теме напрямую. Если тема «{topic}» — то и все источники "
+        f"должны быть про «{topic}» или смежные узкие вопросы.\n\n"
+        f"Запрещено: подменять тему общими учебниками по дисциплине. Например, "
+        f"если тема «Озеро Байкал» — НЕ пиши учебники Кнута, Кормена, Таненбаума "
+        f"или любые работы по информатике/программированию. Должны быть работы "
+        f"именно про Байкал: Галазий, Грачёв, Кожова и т.п.\n\n"
+        f"Используй ТОЛЬКО реальные, проверяемые источники: монографии, статьи в "
+        f"научных журналах, законы. НЕ выдумывай фамилии, названия издательств "
+        f"или журналов. Если точный источник неизвестен — опусти его, не фантазируй.\n\n"
         f"Формат ГОСТ Р 7.0.5-2008: 1. Автор А.А. Название / А.А. Автор. — М.: Изд-во, год. — N с.\n"
         f"Только нумерованный список без заголовков."
     )
@@ -2298,6 +2306,56 @@ def _fill_missing_pages(text: str) -> str:
         if filled:
             print(f"[CITE] Дополнено страниц в `[N]`: {filled}")
     return new
+
+
+# ═══════════════════════════════════════════════════════════════
+#  fix15: гомоглиф-нормализация (латиница → кириллица в рус. словах)
+# ═══════════════════════════════════════════════════════════════
+_HOMOGLYPH_LAT2CYR = str.maketrans({
+    "a": "а", "c": "с", "e": "е", "o": "о", "p": "р", "x": "х", "y": "у",
+    "A": "А", "B": "В", "C": "С", "E": "Е", "H": "Н", "K": "К", "M": "М",
+    "O": "О", "P": "Р", "T": "Т", "X": "Х", "Y": "У",
+})
+
+
+def _normalize_homoglyphs(text: str) -> str:
+    """В словах, где есть кириллица, преобразует визуально-похожие
+    латинские буквы в кириллические (фикс «мониторинга» с латинскими
+    буквами внутри). Слова без кириллицы (англ. термины, source codes)
+    не трогаются.
+    """
+    if not text:
+        return text
+
+    def fix_word(m: "re.Match[str]") -> str:
+        word = m.group(0)
+        has_cyr = bool(re.search(r"[А-Яа-яЁё]", word))
+        has_lat = bool(re.search(r"[A-Za-z]", word))
+        if has_cyr and has_lat:
+            return word.translate(_HOMOGLYPH_LAT2CYR)
+        return word
+
+    # Слово = последовательность букв (любых: кир+лат)
+    return re.sub(r"[A-Za-zА-Яа-яЁё]+", fix_word, text)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  fix15: финальная очистка LLM-выхода после expand-цикла
+# ═══════════════════════════════════════════════════════════════
+def _clean_llm_chunk(text: str, n_sources: int = 0) -> str:
+    """Применяет тот же chain очисток, что и для основного LLM-выхода.
+    Используется в `_expand_blocks_by_chars` для каждого кусочка LLM."""
+    if not text:
+        return text
+    text = sanitize_llm_text(text)
+    text = _repair_broken_citations(text)
+    text = _fix_nonsense_phrases(text)
+    if n_sources > 0:
+        text = _fix_citations(text, n_sources)
+        text = _fill_missing_pages(text)
+    text = _normalize_homoglyphs(text)
+    text = _ensure_block_terminates(text)
+    return text
 
 
 _NONSENSE_PATTERNS = [
@@ -3270,14 +3328,30 @@ def add_paragraphs_from_text(
     # Удаляем первый заголовок если нужно
     if skip_first_heading and not is_bib and text:
         lines = text.split('\n')
-        if lines:
-            first_line = lines[0].strip()
-            # Нормализуем для сравнения
-            norm_first = re.sub(r'\s+', ' ', first_line.lower().replace('.', ''))
-            norm_heading = re.sub(r'\s+', ' ', skip_first_heading.lower().replace('.', ''))
-            # Проверяем на строгое совпадение или очень близкое, чтобы не удалять обычный текст
-            if norm_first == norm_heading or (len(norm_heading) > 10 and norm_first == norm_heading[:len(norm_first)]):
-                text = '\n'.join(lines[1:]).strip()
+        # fix15: смотрим первые ДВЕ строки (LLM иногда: "## 2.3 Title\nТекст…",
+        # иногда «2.3. Заголовок\n2.3 Заголовок\nТекст…» — двойной заголовок).
+        for _skip_n in (1, 2):
+            if len(lines) < _skip_n:
+                break
+            joined = " ".join(l.strip() for l in lines[:_skip_n] if l.strip())
+            if not joined:
+                continue
+            # Снимаем markdown-решётки и ведущую нумерацию вида "2.3.", "2.3", "N."
+            cand = re.sub(r"^#{1,6}\s*", "", joined)
+            cand = re.sub(r"^\d{1,3}(?:\.\d{1,3})*\.?\s+", "", cand)
+            norm_first = re.sub(r"\s+", " ", cand.lower().replace(".", ""))
+            norm_heading = re.sub(
+                r"\s+", " ", skip_first_heading.lower().replace(".", "")
+            )
+            if (
+                norm_first == norm_heading
+                or (
+                    len(norm_heading) > 10
+                    and norm_first.startswith(norm_heading[: max(10, len(norm_heading) - 2)])
+                )
+            ):
+                text = "\n".join(lines[_skip_n:]).strip()
+                break
 
     def _apply_body_format(p) -> None:
         p.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
@@ -4027,6 +4101,14 @@ async def _expand_blocks_by_chars(
     
     blocks = [list(b) for b in blocks]
 
+    # fix15: вытаскиваем кол-во источников, чтобы прогнать дописанные куски
+    # через тот же chain (_repair → _fix_citations → _fill_missing_pages).
+    n_sources_local = 0
+    for _b in blocks:
+        if "ЛИТЕРАТ" in (_b[0] or "").upper() or "ИСТОЧНИК" in (_b[0] or "").upper():
+            n_sources_local = _count_sources(_b[2] or "")
+            break
+
     def _is_expandable(title: str) -> bool:
         up = (title or "").upper()
         return not any(w in up for w in ("ЛИТЕРАТ", "ИСТОЧНИК", "БИБЛИОГРАФ"))
@@ -4095,7 +4177,10 @@ async def _expand_blocks_by_chars(
             if not extra or len(extra.strip()) < 100:
                 continue
 
-            extra = sanitize_llm_text(extra.strip())
+            # fix15: тот же chain очисток, что и для основного выхода
+            extra = _clean_llm_chunk(extra.strip(), n_sources=n_sources_local)
+            if not extra:
+                continue
             text = (text.rstrip() + "\n\n" + extra) if text else extra
             need -= len(extra)
 
@@ -5602,7 +5687,7 @@ async def generate_and_send(
 
 async def main() -> None:
     print("═" * 62)
-    print("  🤖  ГОСТ-АССИСТЕНТ v2.7-fix14")
+    print("  🤖  ГОСТ-АССИСТЕНТ v2.7-fix15")
     print("═" * 62)
     print(f"  LibreOffice : {shutil.which('soffice') or '❌ не найден'}")
     print(f"  DeepSeek    : {'✅' if DEEPSEEK_KEY else '❌ нет ключа'}")
