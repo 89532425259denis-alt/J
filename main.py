@@ -86,40 +86,30 @@ def _spinner() -> str:
 
 
 def _progress_bar(done: int, total: int, width: int = 16) -> str:
-    """Прогресс-бар «змейкой» (fix11).
+    """Прогресс-бар «брайль-змейкой» (fix12).
 
-    - Заполненная часть рисуется `█`.
-    - Внутри заполненной части бегает «голова змейки» `▓` —
-      её положение меняется каждый кадр (тик ~0.5 с) и создаёт
-      эффект скользящего блика.
-    - Если прогресс == 0, через всю пустую полосу справа-налево
-      пробегает «змейка» из 3 ячеек `▒▓█▓▒`, чтобы не выглядело
-      замёрзшим.
-    - Пустая часть — `░`.
+    Каждая ячейка показывает кадр брайль-спиннера ⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏,
+    сдвигаемый по времени:  cells[i] = frames[(i + frame) % 10].
+    Это даёт визуальный поток точек, бегущих СПРАВА-НАЛЕВО — именно
+    как просил пользователь («чтобы точки двигались последовательно»).
+
+    Заполненная часть рисуется брайль-точками (видно как яркий поток),
+    пустая — приглушённые `·`. Граница (filled-я ячейка) тоже
+    анимируется, чтобы переход выглядел плавно.
     """
     total = max(1, int(total))
     done  = max(0, min(int(done), total))
     ratio = done / total
     filled = int(round(width * ratio))
     frame = int(time.monotonic() * 2)  # 2 кадра в секунду
+    frames = _SPINNER_FRAMES  # 10 кадров: ⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏
 
-    # Случай 1: прогресса ещё нет → бежит «змейка» через пустую полосу.
-    if filled == 0:
-        snake = ["▒", "▓", "█", "▓", "▒"]
-        pos = frame % (width + len(snake))
-        cells = [_BAR_EMPTY] * width
-        for i, ch in enumerate(snake):
-            x = pos - i
-            if 0 <= x < width:
-                cells[x] = ch
-        return "".join(cells)
-
-    # Случай 2: бар частично/полностью заполнен.
-    cells = [_BAR_FULL] * filled + [_BAR_EMPTY] * (width - filled)
-    # «Голова» движется внутри заполненной части.
-    if filled >= 2:
-        head = frame % filled
-        cells[head] = _BAR_HALF
+    cells = []
+    for i in range(width):
+        if i <= filled and i < width:
+            cells.append(frames[(i + frame) % len(frames)])
+        else:
+            cells.append("·")
     return "".join(cells)
 
 
@@ -1721,7 +1711,7 @@ async def generate_text_blocks(
                 "логичная структура, конкретные утверждения."
             )
 
-    # ── Универсальные правила академической генерации (v2.7-fix11) ──
+    # ── Универсальные правила академической генерации (v2.7-fix12) ──
     # Применяются ко всем типам работ; добавлены последними, чтобы перекрывать
     # дисциплинарные шаблоны.
     style_sys += (
@@ -1997,6 +1987,7 @@ async def generate_text_blocks(
         conc_text = _stub_text("conclusion", topic)
 
     conc_text = _clean_ai_artifacts(conc_text)
+    conc_text = _fix_nonsense_phrases(conc_text)
     conc_text = _replace_ai_cliches(conc_text)
     if humanize:
         conc_text = _add_human_touch(conc_text)
@@ -2025,8 +2016,10 @@ async def generate_text_blocks(
             if key == "literature":
                 continue
             # Сначала чиним оборванные ссылки `[1, с.` → `[1]` (fix10),
-            # потом приводим номера к допустимому диапазону.
+            # затем — характерные «галлюцинации» промпта (fix12),
+            # и только потом приводим номера к допустимому диапазону.
             parts[key] = _repair_broken_citations(parts[key])
+            parts[key] = _fix_nonsense_phrases(parts[key])
             parts[key] = _fix_citations(parts[key], n_sources)
 
         # Удаляем неиспользуемые источники (фикс «избыточен, N не используются»)
@@ -2201,6 +2194,52 @@ def _repair_broken_citations(text: str) -> str:
         if before:
             print(f"[CITE] Починено оборванных ссылок: {before}")
     return text
+
+
+_NONSENSE_PATTERNS = [
+    # «это может пригодиться заключается в …» → «Практическое значение работы заключается в …»
+    (
+        re.compile(
+            r"\b(?:это может пригодиться|это пригодится|это полезно)\s+заключается\s+в\b",
+            re.IGNORECASE,
+        ),
+        "Практическое значение работы заключается в",
+    ),
+    # «эта тема важна сейчас(,)? потому что необходимостью …» →
+    # «Актуальность темы обусловлена необходимостью …»
+    (
+        re.compile(
+            r"\bэта тема важна сейчас\s*,?\s*потому что\s+необходимостью\b",
+            re.IGNORECASE,
+        ),
+        "Актуальность темы обусловлена необходимостью",
+    ),
+    # «я хотел(а) понять <P>» → «Цель работы — провести <P>»
+    (
+        re.compile(r"\bя хотел\(а\) понять\s+", re.IGNORECASE),
+        "Цель работы — провести ",
+    ),
+    # `[1, с. 45]. 145].` — лишний хвост от удвоенной страницы
+    (
+        re.compile(
+            r"(\[\s*\d+\s*,\s*с\.\s*\d+(?:[–-]\d+)?\s*\])\.\s*\d+\s*\]\."
+        ),
+        r"\1.",
+    ),
+]
+
+
+def _fix_nonsense_phrases(text: str) -> str:
+    """Чинит характерные «галлюцинации» шаблонов промпта (fix12)."""
+    if not text:
+        return text
+    out = text
+    for pat, repl in _NONSENSE_PATTERNS:
+        new = pat.sub(repl, out)
+        if new != out:
+            print(f"[NONSENSE] Замена по шаблону «{pat.pattern[:40]}…»")
+            out = new
+    return out
 
 
 def _ensure_block_terminates(text: str) -> str:
@@ -2414,20 +2453,36 @@ _FORBIDDEN_CONC_OPENERS = (
 
 
 def _strip_forbidden_openers(conc_text: str) -> str:
-    """Срезает в начале заключения «итак»/«таким образом»/«подводя итог»."""
+    """Срезает «итак»/«таким образом»/«в итоге»/«подводя итог»
+    в начале КАЖДОГО абзаца заключения и сразу после `. ` внутри
+    абзаца (fix12: раньше только в самом начале)."""
     if not conc_text:
         return conc_text
-    stripped = conc_text.lstrip()
-    low = stripped.lower()
+
+    def _strip_one(chunk: str) -> str:
+        s = chunk.lstrip()
+        low = s.lower()
+        for opener in _FORBIDDEN_CONC_OPENERS:
+            if low.startswith(opener):
+                s = s[len(opener):].lstrip()
+                if s:
+                    s = s[0].upper() + s[1:]
+                print(f"[CONC] Удалён вводный оборот: «{opener.strip()}»")
+                break
+        return s
+
+    paras = conc_text.split("\n")
+    paras = [_strip_one(p) if p.strip() else p for p in paras]
+    text = "\n".join(paras)
+
     for opener in _FORBIDDEN_CONC_OPENERS:
-        if low.startswith(opener):
-            stripped = stripped[len(opener):].lstrip()
-            # Капитализируем первое слово
-            if stripped:
-                stripped = stripped[0].upper() + stripped[1:]
-            print(f"[CONC] Удалён вводный оборот: «{opener.strip(' ,')}»")
-            break
-    return stripped
+        opener_clean = opener.strip()
+        pat = re.compile(
+            r"([\.!?…]\s+)" + re.escape(opener_clean) + r"\s*",
+            re.IGNORECASE,
+        )
+        text = pat.sub(r"\1", text)
+    return text
 
 
 def _validate_conclusion_consistency(conc_text: str, parts: dict) -> str:
@@ -2972,6 +3027,47 @@ def _norm_heading(text: str) -> str:
     # убираем все точки для ещё большей толерантности
     t = t.replace('.', '')
     return t
+
+
+def _format_heading_with_dot(title: str, level: int) -> str:
+    """Форматирует заголовок согласно пожеланиям пользователя (fix12).
+
+    Уровень 1 (не структурный, начинается с цифры) → «Глава N. Title».
+    Уровень 2 (N.M Title) → «N.M. Title» (точка после номера).
+
+    Структурные элементы (ВВЕДЕНИЕ/ЗАКЛЮЧЕНИЕ/СПИСОК/АННОТАЦИЯ …) не трогаем — это ГОСТ.
+    """
+    if not title:
+        return title
+    if _is_structural_heading(title):
+        return title.strip()
+
+    t = title.strip()
+    if level == 1:
+        m = re.match(r"^(?:глава\s+)?(\d+)\.?\s+(.+)$", t, re.IGNORECASE)
+        if m:
+            num, rest = m.group(1), m.group(2).strip()
+            return f"Глава {num}. {rest}"
+        return t
+
+    m = re.match(r"^(\d+\.\d+)\.?\s+(.+)$", t)
+    if m:
+        num, rest = m.group(1), m.group(2).strip()
+        return f"{num}. {rest}"
+    return t
+
+
+def _apply_heading_format_to_blocks(blocks):
+    """Прогоняет _format_heading_with_dot по всем уровням, включая subblocks (fix12)."""
+    out = []
+    for title, level, text, subblocks in blocks:
+        new_title = _format_heading_with_dot(title, level)
+        new_subs = [
+            (_format_heading_with_dot(s_title, 2), s_text)
+            for s_title, s_text in (subblocks or [])
+        ]
+        out.append((new_title, level, text, new_subs))
+    return out
 
 
 def _is_structural_heading(title: str) -> bool:
@@ -3584,7 +3680,7 @@ async def measure_pages_async(docx_path: str, work_dir: str) -> Optional[int]:
     """
     Главная функция подсчёта страниц (async).
 
-    Порядок приоритетов (v2.7-fix11):
+    Порядок приоритетов (v2.7-fix12):
     1. LibreOffice → PDF + PyMuPDF/PyPDF2 — самый честный для нашего пайплайна:
        мы и обновляем TOC через LibreOffice, поэтому им же и меряем — чтобы
        не было расхождения между «померили в Aspose, обновили в LO».
@@ -5192,6 +5288,9 @@ async def generate_and_send(
             tmp_in  = os.path.join(work_dir, f"tmp_{event.chat.id}_{ts}.docx")
             tmp_out = os.path.join(work_dir, f"final_{event.chat.id}_{ts}.docx")
 
+            # Форматируем заголовки «Глава N. ...» / «N.M. ...» (fix12)
+            blocks = _apply_heading_format_to_blocks(blocks)
+
             docx_raw = build_docx_bytes(data, blocks, gost)
             with open(tmp_in, "wb") as f:
                 f.write(docx_raw)
@@ -5249,6 +5348,7 @@ async def generate_and_send(
                     work_dir=work_dir,
                 )
                 # Пересобираем DOCX «как новый» из обновлённых blocks
+                blocks = _apply_heading_format_to_blocks(blocks)
                 docx_raw = build_docx_bytes(data, blocks, gost)
                 with open(tmp_in, "wb") as f:
                     f.write(docx_raw)
@@ -5347,7 +5447,7 @@ async def generate_and_send(
 
 async def main() -> None:
     print("═" * 62)
-    print("  🤖  ГОСТ-АССИСТЕНТ v2.7-fix11")
+    print("  🤖  ГОСТ-АССИСТЕНТ v2.7-fix12")
     print("═" * 62)
     print(f"  LibreOffice : {shutil.which('soffice') or '❌ не найден'}")
     print(f"  DeepSeek    : {'✅' if DEEPSEEK_KEY else '❌ нет ключа'}")
