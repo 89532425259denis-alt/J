@@ -1671,22 +1671,25 @@ async def generate_text_blocks(
                 "логичная структура, конкретные утверждения."
             )
 
-    # ── Универсальные правила академической генерации (v2.7-fix9) ──
+    # ── Универсальные правила академической генерации (v2.7-fix10) ──
     # Применяются ко всем типам работ; добавлены последними, чтобы перекрывать
     # дисциплинарные шаблоны.
     style_sys += (
         "\n\nОБЩИЕ ПРАВИЛА ГЕНЕРАЦИИ АКАДЕМИЧЕСКИХ ТЕКСТОВ:\n"
         "1. ФАКТИЧЕСКАЯ ТОЧНОСТЬ: все цифры, даты, названия, проценты "
         "должны быть проверяемыми и общепринятыми. Если точное значение "
-        "неизвестно — используй диапазон или формулировку «около». "
-        "Запрещено выдумывать несуществующие факты.\n"
+        "неизвестно — используй диапазон или формулировку «около / "
+        "значительная часть / подавляющее большинство». Запрещено "
+        "выдумывать несуществующие факты и придумывать точные проценты.\n"
         "2. ЦЕЛОСТНОСТЬ ТЕКСТА: никогда не обрывай главу, параграф или "
         "ссылку на полуслове. Каждая подглава содержит минимум 3 "
-        "предложения. Ссылки оформляй полностью: [1, с. 45] — не "
-        "обрывай после «с.».\n"
+        "предложения. Ссылки оформляй полностью: либо `[1]`, либо "
+        "`[1, с. 45]` — НИКОГДА не оставляй `[1, с.` без номера страницы. "
+        "Последнее предложение всегда заканчивается точкой/!/?.\n"
         "3. ЛОГИЧЕСКАЯ СОГЛАСОВАННОСТЬ: в заключении упоминай ТОЛЬКО те "
         "угрозы, факты и выводы, которые есть в основной части. Не "
-        "добавляй новых концепций, не раскрытых в главах.\n"
+        "добавляй новых концепций, не раскрытых в главах. Запрещено "
+        "начинать заключение с «итак», «таким образом», «подводя итог».\n"
         f"4. ДИСЦИПЛИНАРНАЯ ПРИВЯЗКА: текст строго соответствует "
         f"дисциплине «{subject}». Если тема и дисциплина из разных "
         f"областей — рассматривай тему через призму дисциплины.\n"
@@ -1951,7 +1954,9 @@ async def generate_text_blocks(
         conc_text = _replace_ai_cliches(conc_text)
         if humanize:
             conc_text = _add_human_touch(conc_text)
-    # Проверка согласованности с основной частью (v2.7-fix9):
+    # Запрещённые вводные обороты в начале (fix10).
+    conc_text = _strip_forbidden_openers(conc_text)
+    # Проверка согласованности с основной частью (fix9, ужесточена в fix10):
     # выкидывает предложения с фактами, которых нет в главах.
     conc_text = _validate_conclusion_consistency(conc_text, parts)
     parts["conclusion"] = conc_text
@@ -1969,10 +1974,25 @@ async def generate_text_blocks(
         for key in list(parts.keys()):
             if key == "literature":
                 continue
+            # Сначала чиним оборванные ссылки `[1, с.` → `[1]` (fix10),
+            # потом приводим номера к допустимому диапазону.
+            parts[key] = _repair_broken_citations(parts[key])
             parts[key] = _fix_citations(parts[key], n_sources)
 
         # Удаляем неиспользуемые источники (фикс «избыточен, N не используются»)
         parts = _prune_unused_sources(parts)
+    else:
+        # Источников нет, но оборванные ссылки всё равно надо почистить
+        for key in list(parts.keys()):
+            if key == "literature":
+                continue
+            parts[key] = _repair_broken_citations(parts[key])
+
+    # Гарантируем, что каждый блок заканчивается на `.!?…` (fix10).
+    for key in list(parts.keys()):
+        if key == "literature":
+            continue
+        parts[key] = _ensure_block_terminates(parts[key])
 
     # ═══════════════════════════════════════════════════════════
     # ФИНАЛЬНАЯ ПРОВЕРКА: все ли ожидаемые ключи заполнены
@@ -2094,6 +2114,66 @@ def _count_sources(bib_text: str) -> int:
         return 0
     norm = _normalize_bibliography(bib_text)
     return len([l for l in norm.split("\n") if re.match(r"^\d+\.\s", l.strip())])
+
+
+def _repair_broken_citations(text: str) -> str:
+    """Чинит оборванные ссылки вида `[1, с.` или `[1, с.]` — когда LLM
+    не дописала номер страницы. Превращает их в полные ссылки `[1]`.
+
+    Кейсы (fix10):
+    - `[1, с.]`           → `[1]`
+    - `[1, с. ` (без `]`) → `[1] ` (без открытого квадрата)
+    - `[1, с.<EOL>`       → `[1]`
+    - `[1, с.<EOF>`       → `[1]`
+    Корректные ссылки `[1, с. 45]` НЕ трогаются.
+    """
+    if not text:
+        return text
+    original = text
+    # 1) Закрытая, но пустая страница: `[N, с.]` / `[N, с. ]`
+    text = re.sub(r"\[\s*(\d+)\s*,\s*с\.\s*\]", r"[\1]", text)
+    # 2) Открытая скобка без `]`, перед не-цифрой (буквой, знаком препинания):
+    #    `[N, с.` + (не цифра)  →  `[N] ` + (тот символ)
+    #    ВАЖНО: lookahead исключает `\s` и `\d`, иначе срабатывает на
+    #    валидное `[3, с. 45]` (через backtrack \s*).
+    text = re.sub(
+        r"\[\s*(\d+)\s*,\s*с\.(?!\s*\d)\s*(?=[^\d\]\s])",
+        r"[\1] ",
+        text,
+    )
+    # 3) Хвост строки/документа: `[N, с.` в самом конце
+    text = re.sub(r"\[\s*(\d+)\s*,\s*с\.\s*$", r"[\1]", text)
+    # 4) Перед переводом строки
+    text = re.sub(r"\[\s*(\d+)\s*,\s*с\.\s*(?=[\n\r])", r"[\1]", text)
+    if text != original:
+        # Сообщим в консоль сколько починили
+        before = len(re.findall(r"\[\s*\d+\s*,\s*с\.(?!\s*\d)", original))
+        if before:
+            print(f"[CITE] Починено оборванных ссылок: {before}")
+    return text
+
+
+def _ensure_block_terminates(text: str) -> str:
+    """Гарантирует, что блок текста заканчивается на `.!?…` (fix10).
+    Если последнее предложение оборвано (LLM упёрлась в token limit) —
+    обрезаем по последнему встретившемуся терминатору. Если терминатора
+    нет вовсе — добавляем точку.
+    """
+    if not text:
+        return text
+    s = text.rstrip()
+    if not s:
+        return text
+    if s[-1] in ".!?…":
+        return text
+    # Ищем последний терминатор и обрезаем по нему (включительно)
+    # Минимум — не отрезаем больше последних 600 символов (иначе теряем абзац)
+    cutoff_limit = max(0, len(s) - 600)
+    last = max(s.rfind("."), s.rfind("!"), s.rfind("?"), s.rfind("…"))
+    if last >= cutoff_limit and last > 0:
+        return s[: last + 1]
+    # Не нашли — просто точку добавим
+    return s + "."
 
 
 def _fix_citations(text: str, n_sources: int) -> str:
@@ -2267,6 +2347,39 @@ _GENERIC_ACADEMIC_WORDS = frozenset({
 })
 
 
+# Маркеры «угроз/проблем/нелегальной деятельности» — для предложений с
+# такими словами фильтр работает СТРОЖЕ (любое отсутствующее в основной
+# части специфичное слово ведёт к удалению предложения). Эти предложения
+# чаще всего галлюцинируют, поэтому консерватизм опасен.
+_THREAT_MARKERS = (
+    "угроз", "опасност", "браконьер", "нелегальн", "незаконн",
+    "контрабанд", "вылов", "выруб", "вырубк",
+)
+
+# Запрещённые «вводные» в начале заключения (fix10).
+_FORBIDDEN_CONC_OPENERS = (
+    "итак,", "итак ", "таким образом,", "таким образом ",
+    "в итоге,", "подводя итог,",
+)
+
+
+def _strip_forbidden_openers(conc_text: str) -> str:
+    """Срезает в начале заключения «итак»/«таким образом»/«подводя итог»."""
+    if not conc_text:
+        return conc_text
+    stripped = conc_text.lstrip()
+    low = stripped.lower()
+    for opener in _FORBIDDEN_CONC_OPENERS:
+        if low.startswith(opener):
+            stripped = stripped[len(opener):].lstrip()
+            # Капитализируем первое слово
+            if stripped:
+                stripped = stripped[0].upper() + stripped[1:]
+            print(f"[CONC] Удалён вводный оборот: «{opener.strip(' ,')}»")
+            break
+    return stripped
+
+
 def _validate_conclusion_consistency(conc_text: str, parts: dict) -> str:
     """Удаляет из заключения предложения с «чужими» специфичными терминами,
     которых нет в основной части (фикс случая «в заключении упомянуты
@@ -2307,14 +2420,21 @@ def _validate_conclusion_consistency(conc_text: str, parts: dict) -> str:
         if i == 0 or i == len(sents) - 1:
             kept.append(s)
             continue
-        words = re.findall(r"[а-яё]{6,}", s.lower())
+        s_low = s.lower()
+        words = re.findall(r"[а-яё]{6,}", s_low)
         spec = _specific(words)
         if len(spec) < 3:
             kept.append(s)
             continue
         missing = [w for w in spec if w not in body_words]
-        if len(missing) >= 2 and len(missing) > len(spec) * 0.6:
-            print(f"[CONC] ⚠️ Удалено: «{s[:80]}…» (чужие: {missing[:5]})")
+        # Жёсткое правило для предложений с маркерами угроз/проблем —
+        # достаточно ОДНОГО специфичного слова не из основной части.
+        is_threat = any(m in s_low for m in _THREAT_MARKERS)
+        threshold_count = 1 if is_threat else 2
+        threshold_ratio = 0.30 if is_threat else 0.60
+        if len(missing) >= threshold_count and len(missing) > len(spec) * threshold_ratio:
+            tag = "⚠️ THREAT" if is_threat else "⚠️ Удалено"
+            print(f"[CONC] {tag}: «{s[:80]}…» (чужие: {missing[:5]})")
             dropped += 1
             continue
         kept.append(s)
@@ -3414,7 +3534,7 @@ async def measure_pages_async(docx_path: str, work_dir: str) -> Optional[int]:
     """
     Главная функция подсчёта страниц (async).
 
-    Порядок приоритетов (v2.7-fix9):
+    Порядок приоритетов (v2.7-fix10):
     1. LibreOffice → PDF + PyMuPDF/PyPDF2 — самый честный для нашего пайплайна:
        мы и обновляем TOC через LibreOffice, поэтому им же и меряем — чтобы
        не было расхождения между «померили в Aspose, обновили в LO».
@@ -5177,7 +5297,7 @@ async def generate_and_send(
 
 async def main() -> None:
     print("═" * 62)
-    print("  🤖  ГОСТ-АССИСТЕНТ v2.7-fix9")
+    print("  🤖  ГОСТ-АССИСТЕНТ v2.7-fix10")
     print("═" * 62)
     print(f"  LibreOffice : {shutil.which('soffice') or '❌ не найден'}")
     print(f"  DeepSeek    : {'✅' if DEEPSEEK_KEY else '❌ нет ключа'}")
