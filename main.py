@@ -86,20 +86,41 @@ def _spinner() -> str:
 
 
 def _progress_bar(done: int, total: int, width: int = 16) -> str:
-    """Рисует красивый прогресс-бар с половинным блоком на границе."""
+    """Прогресс-бар «змейкой» (fix11).
+
+    - Заполненная часть рисуется `█`.
+    - Внутри заполненной части бегает «голова змейки» `▓` —
+      её положение меняется каждый кадр (тик ~0.5 с) и создаёт
+      эффект скользящего блика.
+    - Если прогресс == 0, через всю пустую полосу справа-налево
+      пробегает «змейка» из 3 ячеек `▒▓█▓▒`, чтобы не выглядело
+      замёрзшим.
+    - Пустая часть — `░`.
+    """
     total = max(1, int(total))
     done  = max(0, min(int(done), total))
     ratio = done / total
-    filled_f = width * ratio
-    filled_i = int(filled_f)
-    half     = filled_f - filled_i >= 0.5
-    bar      = _BAR_FULL * filled_i
-    if half and filled_i < width:
-        bar += _BAR_HALF
-        bar += _BAR_EMPTY * (width - filled_i - 1)
-    else:
-        bar += _BAR_EMPTY * (width - filled_i)
-    return bar
+    filled = int(round(width * ratio))
+    frame = int(time.monotonic() * 2)  # 2 кадра в секунду
+
+    # Случай 1: прогресса ещё нет → бежит «змейка» через пустую полосу.
+    if filled == 0:
+        snake = ["▒", "▓", "█", "▓", "▒"]
+        pos = frame % (width + len(snake))
+        cells = [_BAR_EMPTY] * width
+        for i, ch in enumerate(snake):
+            x = pos - i
+            if 0 <= x < width:
+                cells[x] = ch
+        return "".join(cells)
+
+    # Случай 2: бар частично/полностью заполнен.
+    cells = [_BAR_FULL] * filled + [_BAR_EMPTY] * (width - filled)
+    # «Голова» движется внутри заполненной части.
+    if filled >= 2:
+        head = frame % filled
+        cells[head] = _BAR_HALF
+    return "".join(cells)
 
 
 def _fmt_time(seconds: float) -> str:
@@ -124,19 +145,43 @@ class Progress:
     _last_ts: float = field(default=0.0, repr=False)
     _start_ts: float = field(default_factory=time.monotonic, repr=False)
     _step_labels: list = field(default_factory=list, repr=False)
+    _eta_prev: Optional[float] = field(default=None, repr=False)
 
     def _elapsed(self) -> float:
         return time.monotonic() - self._start_ts
 
     def _eta(self) -> str:
+        """Оценка оставшегося времени (fix11).
+
+        - Пока ни один шаг не закрыт: даём приблизительную оценку,
+          исходя из общего числа шагов и среднего времени на шаг ~25 с
+          (если elapsed > 3 с), вместо вечного «считаю…».
+        - Со 2-го шага: добавляем EMA сглаживание, чтобы оценка
+          не прыгала при разных по длительности шагах.
+        """
         elapsed = self._elapsed()
+        remaining_steps = max(0, self.total_steps - self.done)
+        if remaining_steps == 0:
+            return "≈0с"
+
         if self.done == 0:
-            return "считаю..."
-        rate = self.done / elapsed  # шагов в секунду
-        remaining_steps = self.total_steps - self.done
+            if elapsed < 3.0:
+                return "считаю…"
+            # эвристика: ~25 секунд на шаг, минимум 10
+            est_per_step = max(10.0, elapsed / 0.5)
+            return "≈" + _fmt_time(est_per_step * remaining_steps)
+
+        rate = self.done / elapsed
         if rate <= 0:
-            return "..."
+            return "…"
         eta_sec = remaining_steps / rate
+        # Сглаживание: микшируем с предыдущим значением
+        prev = getattr(self, "_eta_prev", None)
+        if prev is None:
+            self._eta_prev = eta_sec
+        else:
+            self._eta_prev = 0.6 * prev + 0.4 * eta_sec
+            eta_sec = self._eta_prev
         return _fmt_time(eta_sec)
 
     def render(self) -> str:
@@ -202,18 +247,23 @@ class Progress:
             pass
 
     async def animate_loop(self, stop_event: asyncio.Event) -> None:
-        """Фоновый цикл: обновляет спиннер и ETA каждую секунду."""
+        """Фоновый цикл (fix11): обновляет спиннер/змейку/ETA каждые ~1.5 с.
+
+        Telegram режет частые edit_text (429 Flood). Минимальный безопасный
+        интервал — 1.2-1.5 с. Бар анимируется самим временем (frame =
+        int(monotonic()*2)), поэтому каждые 1.5 с кадры реально меняются.
+        """
         while not stop_event.is_set():
             try:
                 text = self.render()
                 now  = time.monotonic()
-                if text != self._last_text and (now - self._last_ts) >= 1.0:
+                if text != self._last_text and (now - self._last_ts) >= 1.4:
                     await self.msg.edit_text(text, parse_mode="HTML")
                     self._last_text = text
                     self._last_ts   = now
             except Exception:
                 pass
-            await asyncio.sleep(1.2)
+            await asyncio.sleep(1.5)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1671,7 +1721,7 @@ async def generate_text_blocks(
                 "логичная структура, конкретные утверждения."
             )
 
-    # ── Универсальные правила академической генерации (v2.7-fix10) ──
+    # ── Универсальные правила академической генерации (v2.7-fix11) ──
     # Применяются ко всем типам работ; добавлены последними, чтобы перекрывать
     # дисциплинарные шаблоны.
     style_sys += (
@@ -3534,7 +3584,7 @@ async def measure_pages_async(docx_path: str, work_dir: str) -> Optional[int]:
     """
     Главная функция подсчёта страниц (async).
 
-    Порядок приоритетов (v2.7-fix10):
+    Порядок приоритетов (v2.7-fix11):
     1. LibreOffice → PDF + PyMuPDF/PyPDF2 — самый честный для нашего пайплайна:
        мы и обновляем TOC через LibreOffice, поэтому им же и меряем — чтобы
        не было расхождения между «померили в Aspose, обновили в LO».
@@ -5297,7 +5347,7 @@ async def generate_and_send(
 
 async def main() -> None:
     print("═" * 62)
-    print("  🤖  ГОСТ-АССИСТЕНТ v2.7-fix10")
+    print("  🤖  ГОСТ-АССИСТЕНТ v2.7-fix11")
     print("═" * 62)
     print(f"  LibreOffice : {shutil.which('soffice') or '❌ не найден'}")
     print(f"  DeepSeek    : {'✅' if DEEPSEEK_KEY else '❌ нет ключа'}")
