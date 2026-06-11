@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-"""ГОСТ-АССИСТЕНТ v2.7 — ТОЧНЫЕ СТРАНИЦЫ + ДИСЦИПЛИНА
+"""ГОСТ-АССИСТЕНТ v2.7-fix13 — ТОЧНЫЕ СТРАНИЦЫ + ДИСЦИПЛИНА
 
 Главные изменения v2.1 относительно v2.0:
 ────────────────────────────────────────────────────────────────
@@ -1433,9 +1433,11 @@ def build_prompts(
             f"Это отдельная подглава — завершённый смысловой блок.\n"
             f"Начни с заголовка подглавы '{sub_title}' на отдельной строке, "
             f"затем идёт содержательный текст.\n"
-            f"Количество абзацев — сколько уместится в указанный объём знаков "
-            f"(обычно 2–4 абзаца, не больше). Не раздувай объём ради абзацев.\n"
-            f"Используй 1–2 ссылки на источники в формате [1, с. 45] или [3].",
+            f"Количество абзацев — РОВНО 3 АБЗАЦА, разделённых пустой строкой "
+            f"(двойным переводом строки между ними). НЕ объединяй текст в один абзац.\n"
+            f"Используй 1–2 ссылки на источники в формате [1, с. 45] или [3]. "
+            f"Ссылка должна быть ПОЛНОЙ (с номером страницы) или просто [N] — "
+            f"никогда не оставляй незавершённое [N, с.",
             sub_chars,
             writing_style, doc_type,
         )
@@ -1543,6 +1545,9 @@ def generate_structure(
                 print(f"[WARN] Подглава «{sub_title}» пустая или короткая "
                       f"({len(sub_text)} зн.), генерирую заглушку")
                 sub_text = _generate_substantial_stub(sub_title, ch["title"], topic)
+
+            # fix13: гарантируем 3 абзаца если LLM вернула монолит
+            sub_text = _ensure_paragraph_breaks(sub_text, min_paragraphs=3)
 
             if sub_text:
                 sub_blocks.append((sub_title, sub_text))
@@ -2080,6 +2085,41 @@ def _stub_text(key: str, topic: str) -> str:
     )
 
 
+def _ensure_paragraph_breaks(text: str, min_paragraphs: int = 3) -> str:
+    """fix13: если LLM вернула монолитный текст без \n\n — режем по предложениям.
+
+    Гарантирует наличие минимум `min_paragraphs` абзацев, разделённых пустой строкой.
+    Не трогает уже разбитый текст.
+    """
+    if not text:
+        return text
+    # Если уже есть достаточные разбиения — не трогаем
+    paragraphs = [p.strip() for p in re.split(r'\n\s*\n', text) if p.strip()]
+    if len(paragraphs) >= min_paragraphs:
+        return text
+    # Собираем всё в один абзац (на случай если \n не пустыми разделены)
+    flat = re.sub(r'\s*\n\s*', ' ', text).strip()
+    if len(flat) < 350:
+        return text  # слишком короткий, не режем
+    # Режем по предложениям
+    sentences = re.findall(r'[^.!?…]+[.!?…]+\s*', flat)
+    if not sentences:
+        return text
+    sentences = [s.strip() for s in sentences if s.strip()]
+    if len(sentences) < min_paragraphs:
+        return text
+    # Разделяем предложения примерно поровну между min_paragraphs кусками
+    per_chunk = max(1, len(sentences) // min_paragraphs)
+    chunks = []
+    for i in range(min_paragraphs):
+        start = i * per_chunk
+        end = start + per_chunk if i < min_paragraphs - 1 else len(sentences)
+        chunk = ' '.join(sentences[start:end]).strip()
+        if chunk:
+            chunks.append(chunk)
+    return '\n\n'.join(chunks)
+
+
 def _generate_substantial_stub(sub_title: str, chapter_title: str, topic: str) -> str:
     """Развёрнутая заглушка для пустой подглавы (минимум 600 символов).
 
@@ -2108,7 +2148,7 @@ def _generate_substantial_stub(sub_title: str, chapter_title: str, topic: str) -
         f"исследование «{sub_title.lower()}» требует "
         f"междисциплинарного подхода, объединяющего достижения различных "
         f"областей знания [3, с. 112].\n\n"
-        f"Таким образом, анализ рассмотренных источников позволяет "
+        f"В целом анализ рассмотренных источников позволяет "
         f"констатировать, что проблема «{sub_title.lower()}» "
         f"является актуальной и требует дальнейшего углублённого изучения. "
         f"Полученные в ходе анализа данные могут быть использованы "
@@ -2188,6 +2228,10 @@ def _repair_broken_citations(text: str) -> str:
     text = re.sub(r"\[\s*(\d+)\s*,\s*с\.\s*$", r"[\1]", text)
     # 4) Перед переводом строки
     text = re.sub(r"\[\s*(\d+)\s*,\s*с\.\s*(?=[\n\r])", r"[\1]", text)
+    # 5) fix13: `[N, с. <буква/спецсимвол>` — открытая скобка с пробелом
+    text = re.sub(r"\[\s*(\d+)\s*,\s*с\.\s+(?=[А-Яа-яA-Za-z(«„])", r"[\1] ", text)
+    # 6) fix13: `[N, с. .` или `[N, с. ,` — мусор после с.
+    text = re.sub(r"\[\s*(\d+)\s*,\s*с\.\s*[.,;:!?]+", r"[\1].", text)
     if text != original:
         # Сообщим в консоль сколько починили
         before = len(re.findall(r"\[\s*\d+\s*,\s*с\.(?!\s*\d)", original))
@@ -2902,6 +2946,46 @@ def _toc_entries(blocks: list[tuple]) -> list[tuple[str, int]]:
     return entries
 
 
+def _toc_entries_with_pages(blocks: list[tuple], gost: dict) -> list[tuple[str, int, int]]:
+    """fix13: оценивает реальные номера страниц для пунктов оглавления.
+
+    Возвращает [(title, level, page_number), ...].
+    Расчёт: title=1, СОДЕРЖАНИЕ=2, остальные блоки — каждый на новой странице
+    + аккумулированный char_count / chars_per_page.
+    """
+    try:
+        chars_per_page = calculate_chars_per_page(gost)
+    except Exception:
+        chars_per_page = CHARS_PER_PAGE
+    if not chars_per_page or chars_per_page < 500:
+        chars_per_page = 1400
+
+    out: list[tuple[str, int, int]] = []
+    sub_pat = re.compile(r'^(\d+\.\d+\.?\s+.{3,80})$')
+    # Титульный лист = 1, СОДЕРЖАНИЕ = 2, первый блок начинается с 3
+    cur_page = 3
+    for title, level, text, subblocks in blocks:
+        out.append((title, 1, cur_page))
+        cum_chars = 0
+        # явные подблоки
+        sub_list = list(subblocks or [])
+        # если subblocks пуст — собираем встроенные подзаголовки
+        if not sub_list and text:
+            for line in text.split('\n'):
+                line = line.strip()
+                if sub_pat.match(line):
+                    sub_list.append((line, ''))
+        for sub_title, sub_text in sub_list:
+            sub_page = cur_page + cum_chars // chars_per_page
+            out.append((sub_title.strip(), 2, sub_page))
+            cum_chars += len(sub_text or '')
+        # Считаем сколько страниц съел блок
+        block_chars = sum(len(st or '') for _, st in sub_list) or len(text or '') or 100
+        pages_in_block = max(1, (block_chars + chars_per_page - 1) // chars_per_page)
+        cur_page += pages_in_block
+    return out
+
+
 def add_toc(doc: Document, blocks: list[tuple], gost: dict) -> None:
     """
     Вставляет содержание с реальными заголовками (уровни 1 и 2).
@@ -2941,12 +3025,17 @@ def add_toc(doc: Document, blocks: list[tuple], gost: dict) -> None:
     # При обновлении в Word/LO она ЗАМЕНИТСЯ реальным содержанием.
     # Каждый пункт — через <w:br/> (перенос строки), чтобы DOCX
     # отображал их на отдельных строках даже без обновления поля.
-    toc_entries = _toc_entries(blocks)
-    for i, (entry_title, entry_level) in enumerate(toc_entries):
+    # fix13: статический TOC с номерами страниц (fallback если LO не апдейтит поля)
+    toc_entries_paged = _toc_entries_with_pages(blocks, gost)
+    for i, (entry_title, entry_level, entry_page) in enumerate(toc_entries_paged):
         prefix = "    " if entry_level == 2 else ""
-        run.add_text(f"{prefix}{entry_title}")
+        # Длина пунктирного «забора»: подгоняем чтобы строка ~70 знаков
+        line_visible = f"{prefix}{entry_title}"
+        dots_count = max(3, 72 - len(line_visible) - len(str(entry_page)) - 2)
+        dots = " " + "." * dots_count + " "
+        run.add_text(f"{line_visible}{dots}{entry_page}")
         # Добавляем перенос строки (w:br) после каждого пункта кроме последнего
-        if i < len(toc_entries) - 1:
+        if i < len(toc_entries_paged) - 1:
             br_el = OxmlElement("w:br")
             run._r.append(br_el)
 
@@ -3039,6 +3128,9 @@ def _format_heading_with_dot(title: str, level: int) -> str:
     """
     if not title:
         return title
+    # fix13: убираем markdown # перед заголовком (LLM любит их вставлять)
+    title = re.sub(r'^\s*#{1,6}\s*', '', title)
+    title = re.sub(r'\s*#{1,6}\s*$', '', title)
     if _is_structural_heading(title):
         return title.strip()
 
@@ -3302,6 +3394,9 @@ def build_docx_bytes(
                 rest = text[len(first_line):].lstrip('\n').lstrip('\r')
                 clean_text = rest if rest else text
             add_paragraphs_from_text(doc, clean_text, gost, is_bib=is_bib, skip_first_heading=title if is_bib else None)
+            # fix13: разрыв страницы после списка литературы (даже если он последний)
+            if is_bib:
+                doc.add_page_break()
         else:
             # ═══ Блок без текста — вставляем аварийную заглушку ═══
             print(f"[EMERGENCY] Блок «{title}» полностью пуст — вставляю заглушку")
