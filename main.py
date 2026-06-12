@@ -86,31 +86,24 @@ def _spinner() -> str:
 
 
 def _progress_bar(done: int, total: int, width: int = 16) -> str:
-    """Прогресс-бар «брайль-змейкой» (fix12).
-
-    Каждая ячейка показывает кадр брайль-спиннера ⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏,
-    сдвигаемый по времени:  cells[i] = frames[(i + frame) % 10].
-    Это даёт визуальный поток точек, бегущих СПРАВА-НАЛЕВО — именно
-    как просил пользователь («чтобы точки двигались последовательно»).
-
-    Заполненная часть рисуется брайль-точками (видно как яркий поток),
-    пустая — приглушённые `·`. Граница (filled-я ячейка) тоже
-    анимируется, чтобы переход выглядел плавно.
-    """
+    """Улучшенный прогресс-бар с более плавным визуалом."""
     total = max(1, int(total))
     done  = max(0, min(int(done), total))
     ratio = done / total
     filled = int(round(width * ratio))
-    frame = int(time.monotonic() * 2)  # 2 кадра в секунду
-    frames = _SPINNER_FRAMES  # 10 кадров: ⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏
-
-    cells = []
-    for i in range(width):
-        if i <= filled and i < width:
-            cells.append(frames[(i + frame) % len(frames)])
-        else:
-            cells.append("·")
-    return "".join(cells)
+    
+    # Используем более современные символы для заполнения
+    # █ - полный, ▓ - почти полный, ░ - пустой
+    bar = "█" * filled + "░" * (width - filled)
+    
+    # Добавляем динамический «бегунок» в конец заполненной части, если работа не завершена
+    if 0 < filled < width:
+        frame = int(time.monotonic() * 2) % 2
+        marker = "▓" if frame == 0 else "▒"
+        # Заменяем последний заполненный символ на маркер
+        bar = bar[:filled-1] + marker + bar[filled:]
+        
+    return bar
 
 
 def _fmt_time(seconds: float) -> str:
@@ -185,11 +178,10 @@ class Progress:
 
         return (
             f"{spin} <b>{self.title}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"<code>[{bar}] {pct}%</code>\n"
+            f"<code>{bar}</code> <b>{pct}%</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
             f"📌 <b>Шаг {step_num}/{self.total_steps}:</b> {self.label}{model}\n"
-            f"⏱ Прошло: <code>{elapsed}</code> · До конца: <code>{eta}</code>"
+            f"⏱ <code>{elapsed}</code> ➔ ⏳ <code>{eta}</code>"
         )
 
     async def update(
@@ -2249,6 +2241,8 @@ def _repair_broken_citations(text: str) -> str:
     S = r"[сСcC]"
     # 1) Закрытая, но пустая страница: `[N, с.]` / `[N, с. ]`
     text = re.sub(r"\[\s*(\d+)\s*,\s*" + S + r"\.\s*\]", r"[\1]", text)
+    # 1.1) Очистка `[N,` где нет даже попытки указать страницу (нет 'с.')
+    text = re.sub(r"\[\s*(\d+)\s*,\s*(?![сСcC]\.)", r"[\1]", text)
     # 2) Открытая скобка без `]`, перед не-цифрой:
     #    `[N, с.` + (не цифра)  →  `[N] ` + (тот символ)
     text = re.sub(
