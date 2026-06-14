@@ -2341,6 +2341,7 @@ def _is_garbage(text: str) -> bool:
     return False
 
 
+def _count_sources(bib_text: str) -> int:
     """Считает количество позиций в списке литературы (после нормализации)."""
     if not bib_text:
         return 0
