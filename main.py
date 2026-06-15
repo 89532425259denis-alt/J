@@ -2879,6 +2879,8 @@ def _normalize_typography(text: str) -> str:
     text = re.sub(r'"([^"\n]*)"', _quotes, text)
     # Одиночные оставшиеся '#' (не часть слова) убираем
     text = re.sub(r"(?<!\w)#(?!\w)", "", text)
+    # Убираем ** в начале строки после удаления #
+    text = re.sub(r'(?m)^\s*\*\*', '', text)
     return text
 
 
@@ -2916,13 +2918,23 @@ def _is_garbage(text: str) -> bool:
     t = text.strip()
     if len(t) < 2:
         return True
-    # только повторяющиеся буквы одного типа типа "лллл", "шшш"
-    if len(set(t.lower())) == 1:
+    # только повторяющиеся буквы одного типа "лллл", "шшшш"
+    if len(set(t.lower())) == 1 and t.isalpha():
         return True
-    # проверка на слишком много спецсимволов относительно букв
-    letters = len(re.findall(r'[а-яА-Яa-zA-Z]', t))
+    # только цифры/спецсимволы без букв
+    letters = len(re.findall(r'[А-Яа-яA-Za-z]', t))
     if letters == 0:
         return True
+    # соотношение букв к общему числу менее 50%
+    if letters / len(t) < 0.5:
+        return True
+    # дополнительная защита для титульного листа: случайные сочетания вроде
+    # "Ршп дир" обычно имеют слишком мало гласных для ФИО/названия.
+    cyr_letters = re.findall(r'[А-Яа-яЁё]', t)
+    if len(cyr_letters) >= 5:
+        vowels = len(re.findall(r'[АаЕеЁёИиОоУуЫыЭэЮюЯя]', t))
+        if vowels / max(1, len(cyr_letters)) < 0.18:
+            return True
     return False
 
 
@@ -3024,13 +3036,13 @@ def _build_page_map(text: str) -> dict:
 def _pseudo_page_for_source(n: str) -> str:
     """Стабильная страница-заглушка, если модель не указала номер страницы."""
     try:
-        return str(12 + (int(n) * 17) % 180)
+        return str(12 + (int(n) * 17) % 150)
     except Exception:
         return "45"
 
 
 def _fill_missing_pages(text: str, global_page_map: Optional[dict] = None) -> str:
-    """Приводит ВСЕ цифровые внутритекстовые ссылки к формату `[N, с. X]`.
+    """Приводит ВСЕ ссылки к формату [N, с. X] с принудительной страницей.
 
     Обрабатывает не только простые `[N]`, но и `[1; 2]`, `[1, с. 45; 2]`,
     `[1, c. 45]`, `[1 p. 45]`. Страницы берутся из локальной/глобальной карты,
@@ -3044,16 +3056,18 @@ def _fill_missing_pages(text: str, global_page_map: Optional[dict] = None) -> st
     # Локальные ссылки имеют приоритет над глобальной картой
     page_map.update(_build_page_map(text))
 
-    if not page_map and not FILL_UNKNOWN_CITATION_PAGES:
-        return text
-
-    def _page_for(n: str) -> Optional[str]:
+    def _page_for(n: str) -> str:
         page = page_map.get(n)
         if page:
             return str(page)
-        if FILL_UNKNOWN_CITATION_PAGES:
-            return _pseudo_page_for_source(n)
-        return None
+        return _pseudo_page_for_source(n)
+
+    def _ensure_page(n: str) -> str:
+        return f"[{n}, с. {_page_for(n)}]"
+
+    # Чиним оборванные ссылки `[N, с.]` / `[N, с.` даже если нет закрывающей скобки.
+    text = re.sub(r'\[\s*(\d+)\s*,\s*[сСcC]\.\s*\]', lambda m: _ensure_page(m.group(1)), text)
+    text = re.sub(r'\[\s*(\d+)\s*,\s*[сСcC]\.\s*$', lambda m: _ensure_page(m.group(1)), text)
 
     def _normalize_part(part: str) -> Optional[str]:
         part = part.strip()
@@ -3145,6 +3159,11 @@ def _clean_llm_chunk(text: str, n_sources: int = 0,
 
 
 _NONSENSE_PATTERNS = [
+    # Исправление «эта тема важна сейчас, потому что тем, что»
+    (
+        re.compile(r'эта тема важна сейчас,?\s*потому что тем, что\s+', re.IGNORECASE),
+        'Актуальность темы обусловлена тем, что ',
+    ),
     # «это может пригодиться заключается в …» → «Практическое значение работы заключается в …»
     (
         re.compile(
