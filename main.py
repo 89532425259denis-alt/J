@@ -1820,6 +1820,50 @@ async def fetch_sources_via_deepseek_search(
     
     return "\n".join(bib_lines), unique_sources
 
+
+async def fetch_verified_sources(topic: str, subject: str, limit: int = 12, doc_type: str = "") -> str:
+    """Берёт реальные проверяемые источники из OpenAlex и Crossref.
+
+    Это не заменяет академическую проверку преподавателем, но резко снижает
+    риск выдуманных книг/статей: DOI, журнал, год и авторы приходят из
+    публичных каталогов.
+    """
+    if not ENABLE_WEB_SOURCES:
+        return ""
+    # Для библиографии первична именно тема, а дисциплина — только уточнение.
+    # Иначе каталоги часто возвращают общие учебники по предмету, не относящиеся
+    # к заданной теме.
+    query = (topic or "").strip() or " ".join(x for x in (topic, subject) if x).strip()
+    if len(query) < 4:
+        return ""
+
+    limit = max(MIN_REAL_SOURCES, min(limit, MAX_WEB_SOURCES, BIB_SOURCE_TARGET))
+    fetch_rows = max(60, limit * 6)
+    records: list[dict] = []
+    headers = {"User-Agent": "GOST-Assistant/3.0 (academic bibliography bot)"}
+    try:
+        query_variants = _source_query_variants(topic, subject)
+        async with aiohttp.ClientSession(headers=headers) as session:
+            for q_text in query_variants:
+                records.extend(await _fetch_source_records_for_query(session, q_text, fetch_rows))
+    except Exception as e:
+        print(f"[WEB] Ошибка получения источников: {e}")
+        return ""
+
+    records = _filter_relevant_source_records(records, topic, subject, min(limit, MAX_WEB_SOURCES), doc_type=doc_type)
+    lines: list[str] = []
+    for rec in records:
+        ref = _format_source_record(rec)
+        if ref:
+            lines.append(f"{len(lines) + 1}. {ref}")
+        if len(lines) >= limit:
+            break
+    bib = "\n".join(lines)
+    if bib:
+        print(f"[WEB] Найдено реальных источников: {len(lines)}")
+    return bib
+
+
     """Берёт реальные проверяемые источники из OpenAlex и Crossref.
 
     Это не заменяет академическую проверку преподавателем, но резко снижает
