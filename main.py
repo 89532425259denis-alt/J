@@ -2121,12 +2121,12 @@ async def verify_discipline_relevance_universal(
     """
     Универсальная проверка соответствия темы и дисциплины.
     Возвращает: (соответствует, причина, рекомендуемые_дисциплины)
-
+      
     Работает для ЛЮБЫХ тем и дисциплин, без хардкода.
     """
     if not topic or not subject:
         return False, "Тема или дисциплина не указаны", []
-
+   
     system = (
         "Ты — эксперт по академическим дисциплинам. Оцени, соответствует ли тема "
         "заявленной учебной дисциплине.\n\n"
@@ -2137,42 +2137,40 @@ async def verify_discipline_relevance_universal(
         "Ответ СТРОГО в формате JSON:\n"
         '{"match": true|false, "reason": "краткая причина", "suggested": ["Дисциплина1", "Дисциплина2"]}'
     )
-
+   
     user = (
         f"Тема работы: «{topic}»\n"
         f"Дисциплина: «{subject}»\n"
         f"Тип документа: {doc_type or 'не указан'}\n\n"
         "Оцени соответствие темы и дисциплины. Если не соответствует, предложи 2-3 подходящие дисциплины."
     )
-
+   
     try:
         raw, _ = await chat_with_fallback(
             model_key,
             [{"role": "system", "content": system}, {"role": "user", "content": user}],
             max_tokens=400,
         )
-
+          
         # Извлекаем JSON
         m = re.search(r"\{.*\}", raw, flags=re.S)
         if m:
             data = json.loads(m.group(0))
             suggested = data.get("suggested", [])
             if isinstance(suggested, list):
-                suggested = [s.strip() for s in suggested if str(s).strip()]
-            else:
-                suggested = []
+                suggested = [s.strip() for s in suggested if s.strip()]
             return (
                 bool(data.get("match", True)),
                 str(data.get("reason", "")).strip(),
-                suggested[:5],  # максимум 5 рекомендаций
+                suggested[:5]  # максимум 5 рекомендаций
             )
     except Exception as e:
         print(f"[RELEVANCE] Ошибка проверки: {e}")
-
+      
     # По умолчанию пропускаем, если проверка не удалась
     return True, "проверка недоступна", []
-
-
+   
+   
 def extract_topic_keywords(topic: str) -> list[str]:
     """
     Извлекает ключевые слова из темы для поиска подходящих дисциплин.
@@ -2180,7 +2178,7 @@ def extract_topic_keywords(topic: str) -> list[str]:
     """
     if not topic:
         return []
-
+      
     # Очищаем тему от стоп-слов
     stopwords = {
         "тема", "работа", "исследование", "анализ", "роль", "значение",
@@ -2188,12 +2186,12 @@ def extract_topic_keywords(topic: str) -> list[str]:
         "современная", "современное", "развитие", "система", "метод",
         "методы", "подход", "подходы", "россии", "российской", "российский",
         "the", "and", "for", "with", "from", "this", "that", "study",
-        "analysis", "role", "problems", "development",
+        "analysis", "role", "problems", "development"
     }
-
+      
     # Извлекаем слова длиной >= 4 символа
     words = re.findall(r'[A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё\-]{3,}', topic.lower())
-
+      
     # Фильтруем стоп-слова и дубликаты
     keywords = []
     seen = set()
@@ -2202,10 +2200,10 @@ def extract_topic_keywords(topic: str) -> list[str]:
         if w not in stopwords and w not in seen and len(w) >= 4:
             seen.add(w)
             keywords.append(w)
-
+      
     return keywords[:10]  # максимум 10 ключевых слов
-
-
+   
+   
 def map_keywords_to_disciplines(keywords: list[str]) -> list[str]:
     """
     Универсальное сопоставление ключевых слов с дисциплинами.
@@ -2213,7 +2211,7 @@ def map_keywords_to_disciplines(keywords: list[str]) -> list[str]:
     """
     if not keywords:
         return []
-
+      
     # Семантические группы дисциплин с ключевыми словами-маркерами
     discipline_groups = {
         "Информатика": ["компьютер", "программ", "алгоритм", "данн", "информац", "цифр", "вычисл", "искусственн", "нейросет", "машин"],
@@ -2237,7 +2235,7 @@ def map_keywords_to_disciplines(keywords: list[str]) -> list[str]:
         "Менеджмент": ["управлени", "организац", "персонал", "стратеги", "лидерств"],
         "Политология": ["власт", "государств", "политик", "парти", "выбор", "режим"],
     }
-
+      
     # Собираем дисциплины, которые соответствуют ключевым словам
     matched = set()
     for kw in keywords:
@@ -2247,14 +2245,14 @@ def map_keywords_to_disciplines(keywords: list[str]) -> list[str]:
                 if marker in kw_lower or kw_lower in marker:
                     matched.add(discipline)
                     break
-
+      
     # Если ничего не найдено, возвращаем универсальные дисциплины
     if not matched:
         return ["Литература", "История", "Обществознание", "Русский язык", "Философия"]
-
+      
     return list(matched)[:5]
-
-
+   
+   
 async def check_and_suggest_discipline_universal(
     model_key: str,
     topic: str,
@@ -2268,35 +2266,35 @@ async def check_and_suggest_discipline_universal(
     # 1. Быстрая проверка по ключевым словам
     keywords = extract_topic_keywords(topic)
     suggested_by_keywords = map_keywords_to_disciplines(keywords)
-
+      
     # Проверяем, есть ли текущая дисциплина среди рекомендованных
     subject_lower = subject.lower()
     is_in_suggested = any(
         d.lower() in subject_lower or subject_lower in d.lower()
         for d in suggested_by_keywords
     )
-
+      
     # Если дисциплина в списке подходящих — пропускаем
     if is_in_suggested:
         return True, "", suggested_by_keywords
-
+      
     # 2. Если не в списке — делаем ИИ-проверку
     match, reason, suggested_by_ai = await verify_discipline_relevance_universal(
         model_key, topic, subject, doc_type
     )
-
+      
     # Объединяем рекомендации
     all_suggested = list(dict.fromkeys(suggested_by_ai + suggested_by_keywords))
     if not all_suggested:
         # Если ничего не найдено, предлагаем общие дисциплины
         all_suggested = ["Литература", "История", "Обществознание", "Философия"]
-
+      
     if match:
         return True, "", all_suggested[:5]
-
+      
     # 3. Формируем сообщение для пользователя
     suggested_list = "\n".join(f"  • {d}" for d in all_suggested[:5])
-
+      
     message = (
         f"⚠️ <b>Внимание!</b>\n\n"
         f"Тема «{topic}» может не совсем соответствовать дисциплине «{subject}».\n\n"
@@ -2308,10 +2306,16 @@ async def check_and_suggest_discipline_universal(
         f"2️⃣ <b>Уточнить тему</b> — чтобы она лучше соответствовала «{subject}»\n"
         f"3️⃣ <b>Продолжить</b> — если вы уверены, что тема относится к «{subject}»"
     )
-
+      
     return False, message, all_suggested[:5]
-
-
+   
+   
+# ============================================================
+# ХЭНДЛЕРЫ ДЛЯ ИСПРАВЛЕНИЯ ДИСЦИПЛИНЫ
+# ============================================================
+   
+   
+@dp.callback_query(F.data.startswith("fix_subj_"))
 def _default_chapter_titles(doc_type: str, topic: str, num_chapters: int) -> list[dict]:
     """Запасные названия глав если ИИ не ответил."""
     # ГОСТ 7.32-2017: без слова «Глава» и без точки после номера раздела
@@ -7072,7 +7076,7 @@ async def h_fix_subject_universal(cb: CallbackQuery, state: FSMContext) -> None:
     """Обработчик для исправления дисциплины после предупреждения (универсальный)"""
     action = cb.data.replace("fix_subj_", "", 1)
     data = await state.get_data()
-
+      
     if action == "continue":
         # Пользователь решил продолжить, несмотря на предупреждение
         await cb.message.edit_text(
@@ -7082,13 +7086,13 @@ async def h_fix_subject_universal(cb: CallbackQuery, state: FSMContext) -> None:
         )
         await cb.answer()
         await generate_and_send(
-            cb.message,
-            state,
+            cb.message,   
+            state,   
             model_key=data.get("model_key", FREE_MODEL_KEY),
-            pay_mode=data.get("mode", "free"),
+            pay_mode=data.get("mode", "free")
         )
         return
-
+      
     elif action == "change_topic":
         # Пользователь хочет изменить тему
         subject = data.get("subject", "")
@@ -7104,12 +7108,12 @@ async def h_fix_subject_universal(cb: CallbackQuery, state: FSMContext) -> None:
         await state.set_state(WorkState.topic)
         await cb.answer()
         return
-
+      
     else:
         # Пользователь выбрал одну из предложенных дисциплин
         new_subject = action
         await state.update_data(subject=new_subject)
-
+          
         await cb.message.edit_text(
             f"✅ <b>Дисциплина изменена</b>\n\n"
             f"Новая дисциплина: <b>{new_subject}</b>\n"
@@ -7119,20 +7123,25 @@ async def h_fix_subject_universal(cb: CallbackQuery, state: FSMContext) -> None:
         )
         await cb.answer()
         await generate_and_send(
-            cb.message,
-            state,
+            cb.message,   
+            state,   
             model_key=data.get("model_key", FREE_MODEL_KEY),
-            pay_mode=data.get("mode", "free"),
+            pay_mode=data.get("mode", "free")
         )
         return
-
-
+   
+   
+# ============================================================
+# ОБНОВЛЕННЫЙ ХЭНДЛЕР ВЫБОРА ДИСЦИПЛИНЫ
+# ============================================================
+   
+   
 @dp.callback_query(F.data.startswith("subj_"))
-async def h_subject_cb(cb: CallbackQuery, state: FSMContext) -> None:
+async def h_subject_cb_universal(cb: CallbackQuery, state: FSMContext) -> None:
     subj = cb.data.replace("subj_", "", 1)
     data = await state.get_data()
     topic = data.get("topic", "")
-
+      
     if subj == "other":
         # Показываем подсказки для темы (универсальные)
         keywords = extract_topic_keywords(topic)
@@ -7141,7 +7150,7 @@ async def h_subject_cb(cb: CallbackQuery, state: FSMContext) -> None:
         if suggested:
             hint = f"\n\n💡 <b>Для темы «{topic}» рекомендуются:</b>\n"
             hint += "\n".join(f"  • {d}" for d in suggested[:5])
-
+          
         await cb.message.edit_text(
             f"✏️ <b>Введите название предмета</b>{hint}",
             parse_mode="HTML",
@@ -7149,7 +7158,7 @@ async def h_subject_cb(cb: CallbackQuery, state: FSMContext) -> None:
         )
         await state.set_state(WorkState.subject)
     else:
-        await state.update_data(subject=subj, subj_check_passed=False)
+        await state.update_data(subject=subj)
         await cb.message.edit_text(
             f"✅ Предмет: <b>{subj}</b>\n\n"
             "🌆 <b>Выберите город</b>:",
@@ -7158,20 +7167,16 @@ async def h_subject_cb(cb: CallbackQuery, state: FSMContext) -> None:
         )
         await state.set_state(WorkState.city)
     await cb.answer()
-
-
-@dp.message(WorkState.subject)
-async def h_subject_text(message: Message, state: FSMContext) -> None:
-    await state.update_data(subject=(message.text or "").strip(), subj_check_passed=False)
-    await message.answer(
-        "🌆 <b>Выберите город:</b>",
-        reply_markup=with_back(kb_city()),
-        parse_mode="HTML",
-    )
-    await state.set_state(WorkState.city)
-
-
-@dp.callback_query(F.data.startswith("city_"))
+   
+   
+# ============================================================
+# ИНТЕГРАЦИЯ В generate_and_send
+# ============================================================
+   
+   
+# Добавьте этот блок в функцию generate_and_send после проверки темы:
+   
+   
 async def h_city_cb(cb: CallbackQuery, state: FSMContext) -> None:
     city = cb.data.replace("city_", "", 1)
     if city == "other":
@@ -7529,40 +7534,34 @@ async def generate_and_send(
         # ═══════════════════════════════════════════════════════════════
         # УНИВЕРСАЛЬНАЯ ПРОВЕРКА СООТВЕТСТВИЯ ТЕМЫ И ДИСЦИПЛИНЫ
         # ═══════════════════════════════════════════════════════════════
-        if not data.get("subj_check_passed"):
-            check_ok, check_message, suggested = await check_and_suggest_discipline_universal(
-                model_key, topic, subject, doc_type
-            )
+        check_ok, check_message, suggested = await check_and_suggest_discipline_universal(
+            model_key, topic, subject, doc_type
+        )
 
-            if not check_ok and suggested:
-                # Создаем клавиатуру с вариантами действий
-                keyboard = InlineKeyboardMarkup(inline_keyboard=[])
+        if not check_ok and suggested:
+            # Создаем клавиатуру с вариантами действий
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[])
 
-                # Кнопки для предлагаемых дисциплин (максимум 4)
-                for d in suggested[:4]:
-                    keyboard.inline_keyboard.append([
-                        InlineKeyboardButton(text=f"📚 {d}", callback_data=f"fix_subj_{d}")
-                    ])
-
-                # Кнопка "Продолжить" (игнорировать предупреждение)
+            # Добавляем кнопки для предлагаемых дисциплин (максимум 4)
+            for d in suggested[:4]:
                 keyboard.inline_keyboard.append([
-                    InlineKeyboardButton(text="⚠️ Продолжить (я уверен)", callback_data="fix_subj_continue")
-                ])
-                keyboard.inline_keyboard.append([
-                    InlineKeyboardButton(text="✏️ Изменить тему", callback_data="fix_subj_change_topic")
-                ])
-                keyboard.inline_keyboard.append([
-                    InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_flow")
+                    InlineKeyboardButton(text=f"📚 {d}", callback_data=f"fix_subj_{d}")
                 ])
 
-                # Помечаем, что проверка показана — повторно не дёргаем при «Продолжить»
-                await state.update_data(subj_check_passed=True)
-                await event.answer(check_message, parse_mode="HTML", reply_markup=keyboard)
-                await state.set_state(WorkState.subject)
-                return
+            # Кнопка "Продолжить" (игнорировать предупреждение)
+            keyboard.inline_keyboard.append([
+                InlineKeyboardButton(text="⚠️ Продолжить (я уверен)", callback_data="fix_subj_continue")
+            ])
+            keyboard.inline_keyboard.append([
+                InlineKeyboardButton(text="✏️ Изменить тему", callback_data="fix_subj_change_topic")
+            ])
+            keyboard.inline_keyboard.append([
+                InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_flow")
+            ])
 
-            # Проверка пройдена — больше не повторяем
-            await state.update_data(subj_check_passed=True)
+            await event.answer(check_message, parse_mode="HTML", reply_markup=keyboard)
+            await state.set_state(WorkState.subject)
+            return
 
         # Определяем количество глав по типу документа
         if doc_type in ("esse", "doklad", "article"):
