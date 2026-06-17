@@ -2107,6 +2107,211 @@ async def verify_discipline_relevance(
     return True, "проверка недоступна"
 
 
+# ============================================================
+# УНИВЕРСАЛЬНАЯ ПРОВЕРКА ТЕМЫ И ДИСЦИПЛИНЫ (БЕЗ ХАРДКОДА)
+# ============================================================
+
+
+async def verify_discipline_relevance_universal(
+    model_key: str,
+    topic: str,
+    subject: str,
+    doc_type: str = "",
+) -> tuple[bool, str, list[str]]:
+    """
+    Универсальная проверка соответствия темы и дисциплины.
+    Возвращает: (соответствует, причина, рекомендуемые_дисциплины)
+
+    Работает для ЛЮБЫХ тем и дисциплин, без хардкода.
+    """
+    if not topic or not subject:
+        return False, "Тема или дисциплина не указаны", []
+
+    system = (
+        "Ты — эксперт по академическим дисциплинам. Оцени, соответствует ли тема "
+        "заявленной учебной дисциплине.\n\n"
+        "Правила оценки:\n"
+        "1. Если тема ОЧЕВИДНО из другой области знаний → НЕ СООТВЕТСТВУЕТ\n"
+        "2. Если тему можно интерпретировать в рамках дисциплины → СООТВЕТСТВУЕТ (с оговоркой)\n"
+        "3. Если тема общая и подходит для многих дисциплин → СООТВЕТСТВУЕТ (требуется уточнение)\n\n"
+        "Ответ СТРОГО в формате JSON:\n"
+        '{"match": true|false, "reason": "краткая причина", "suggested": ["Дисциплина1", "Дисциплина2"]}'
+    )
+
+    user = (
+        f"Тема работы: «{topic}»\n"
+        f"Дисциплина: «{subject}»\n"
+        f"Тип документа: {doc_type or 'не указан'}\n\n"
+        "Оцени соответствие темы и дисциплины. Если не соответствует, предложи 2-3 подходящие дисциплины."
+    )
+
+    try:
+        raw, _ = await chat_with_fallback(
+            model_key,
+            [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            max_tokens=400,
+        )
+
+        # Извлекаем JSON
+        m = re.search(r"\{.*\}", raw, flags=re.S)
+        if m:
+            data = json.loads(m.group(0))
+            suggested = data.get("suggested", [])
+            if isinstance(suggested, list):
+                suggested = [s.strip() for s in suggested if str(s).strip()]
+            else:
+                suggested = []
+            return (
+                bool(data.get("match", True)),
+                str(data.get("reason", "")).strip(),
+                suggested[:5],  # максимум 5 рекомендаций
+            )
+    except Exception as e:
+        print(f"[RELEVANCE] Ошибка проверки: {e}")
+
+    # По умолчанию пропускаем, если проверка не удалась
+    return True, "проверка недоступна", []
+
+
+def extract_topic_keywords(topic: str) -> list[str]:
+    """
+    Извлекает ключевые слова из темы для поиска подходящих дисциплин.
+    Универсальный подход без хардкода.
+    """
+    if not topic:
+        return []
+
+    # Очищаем тему от стоп-слов
+    stopwords = {
+        "тема", "работа", "исследование", "анализ", "роль", "значение",
+        "основы", "особенности", "проблемы", "вопросы", "современный",
+        "современная", "современное", "развитие", "система", "метод",
+        "методы", "подход", "подходы", "россии", "российской", "российский",
+        "the", "and", "for", "with", "from", "this", "that", "study",
+        "analysis", "role", "problems", "development",
+    }
+
+    # Извлекаем слова длиной >= 4 символа
+    words = re.findall(r'[A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё\-]{3,}', topic.lower())
+
+    # Фильтруем стоп-слова и дубликаты
+    keywords = []
+    seen = set()
+    for w in words:
+        w = w.strip("-–—_")
+        if w not in stopwords and w not in seen and len(w) >= 4:
+            seen.add(w)
+            keywords.append(w)
+
+    return keywords[:10]  # максимум 10 ключевых слов
+
+
+def map_keywords_to_disciplines(keywords: list[str]) -> list[str]:
+    """
+    Универсальное сопоставление ключевых слов с дисциплинами.
+    Использует семантические группы, а не жесткий список.
+    """
+    if not keywords:
+        return []
+
+    # Семантические группы дисциплин с ключевыми словами-маркерами
+    discipline_groups = {
+        "Информатика": ["компьютер", "программ", "алгоритм", "данн", "информац", "цифр", "вычисл", "искусственн", "нейросет", "машин"],
+        "Математика": ["числ", "уравнени", "функц", "вероятност", "статистик", "геометри"],
+        "Физика": ["энерг", "движени", "волн", "пол", "атом", "квант", "механи"],
+        "Химия": ["молекул", "веществ", "реакц", "органич", "неорганич", "состав"],
+        "Биология": ["клетк", "ген", "эволюц", "организм", "вид", "экосистем", "белк", "днк"],
+        "География": ["территори", "климат", "ландшафт", "карт", "регион", "природ", "геолог"],
+        "Экология": ["окружающ", "загрязн", "экосистем", "природн", "ресурс", "биоразнообраз"],
+        "История": ["событи", "период", "век", "войн", "государств", "цивилизац", "хронологи"],
+        "Философия": ["сущност", "сознани", "быти", "познани", "нравствен", "этик", "морал"],
+        "Психология": ["личность", "восприяти", "поведени", "эмоц", "сознани", "психик", "когнитив"],
+        "Социология": ["обществ", "социальн", "групп", "культур", "институт", "стратификац"],
+        "Экономика": ["рынок", "финанс", "капитал", "инвестиц", "производств", "потреблени"],
+        "Юриспруденция": ["прав", "закон", "суд", "норм", "конституц", "регулирован"],
+        "Педагогика": ["образовани", "обучени", "воспитани", "школ", "методик", "ученик"],
+        "Литература": ["поэт", "роман", "рассказ", "стих", "жанр", "композиц", "образ"],
+        "Русский язык": ["язык", "речь", "грамматик", "морфолог", "синтаксис", "лексик"],
+        "Медицина": ["здоров", "болезн", "лечени", "диагностик", "пациент", "симптом"],
+        "Архитектура": ["здани", "сооружени", "пространств", "конструкц", "фасад"],
+        "Менеджмент": ["управлени", "организац", "персонал", "стратеги", "лидерств"],
+        "Политология": ["власт", "государств", "политик", "парти", "выбор", "режим"],
+    }
+
+    # Собираем дисциплины, которые соответствуют ключевым словам
+    matched = set()
+    for kw in keywords:
+        kw_lower = kw.lower()
+        for discipline, markers in discipline_groups.items():
+            for marker in markers:
+                if marker in kw_lower or kw_lower in marker:
+                    matched.add(discipline)
+                    break
+
+    # Если ничего не найдено, возвращаем универсальные дисциплины
+    if not matched:
+        return ["Литература", "История", "Обществознание", "Русский язык", "Философия"]
+
+    return list(matched)[:5]
+
+
+async def check_and_suggest_discipline_universal(
+    model_key: str,
+    topic: str,
+    subject: str,
+    doc_type: str = "",
+) -> tuple[bool, str, list[str]]:
+    """
+    Универсальная проверка соответствия темы и дисциплины.
+    Возвращает: (допустимо_ли_продолжить, сообщение_для_пользователя, рекомендуемые_дисциплины)
+    """
+    # 1. Быстрая проверка по ключевым словам
+    keywords = extract_topic_keywords(topic)
+    suggested_by_keywords = map_keywords_to_disciplines(keywords)
+
+    # Проверяем, есть ли текущая дисциплина среди рекомендованных
+    subject_lower = subject.lower()
+    is_in_suggested = any(
+        d.lower() in subject_lower or subject_lower in d.lower()
+        for d in suggested_by_keywords
+    )
+
+    # Если дисциплина в списке подходящих — пропускаем
+    if is_in_suggested:
+        return True, "", suggested_by_keywords
+
+    # 2. Если не в списке — делаем ИИ-проверку
+    match, reason, suggested_by_ai = await verify_discipline_relevance_universal(
+        model_key, topic, subject, doc_type
+    )
+
+    # Объединяем рекомендации
+    all_suggested = list(dict.fromkeys(suggested_by_ai + suggested_by_keywords))
+    if not all_suggested:
+        # Если ничего не найдено, предлагаем общие дисциплины
+        all_suggested = ["Литература", "История", "Обществознание", "Философия"]
+
+    if match:
+        return True, "", all_suggested[:5]
+
+    # 3. Формируем сообщение для пользователя
+    suggested_list = "\n".join(f"  • {d}" for d in all_suggested[:5])
+
+    message = (
+        f"⚠️ <b>Внимание!</b>\n\n"
+        f"Тема «{topic}» может не совсем соответствовать дисциплине «{subject}».\n\n"
+        f"<b>Причина:</b> {reason}\n\n"
+        f"<b>Рекомендуемые дисциплины для этой темы:</b>\n"
+        f"{suggested_list}\n\n"
+        f"Вы можете:\n"
+        f"1️⃣ <b>Изменить дисциплину</b> — выберите из списка выше\n"
+        f"2️⃣ <b>Уточнить тему</b> — чтобы она лучше соответствовала «{subject}»\n"
+        f"3️⃣ <b>Продолжить</b> — если вы уверены, что тема относится к «{subject}»"
+    )
+
+    return False, message, all_suggested[:5]
+
+
 def _default_chapter_titles(doc_type: str, topic: str, num_chapters: int) -> list[dict]:
     """Запасные названия глав если ИИ не ответил."""
     # ГОСТ 7.32-2017: без слова «Глава» и без точки после номера раздела
@@ -6658,7 +6863,7 @@ async def h_topic(message: Message, state: FSMContext) -> None:
         )
         return
 
-    await state.update_data(topic=topic)
+    await state.update_data(topic=topic, subj_check_passed=False)
     await message.answer(
         f"✅ Тема принята: <b>{topic[:80]}</b>\n\n"
         "📎 <b>Есть ли у вас свои материалы?</b>\n\n"
@@ -6857,18 +7062,94 @@ async def h_teacher(message: Message, state: FSMContext) -> None:
 #  ХЭНДЛЕРЫ — ПРЕДМЕТ, ГОРОД, СТРАНИЦЫ
 # ═══════════════════════════════════════════════════════════════
 
+# ============================================================
+# ХЭНДЛЕР ДЛЯ ИСПРАВЛЕНИЯ ДИСЦИПЛИНЫ (УНИВЕРСАЛЬНЫЙ)
+# ============================================================
+
+
+@dp.callback_query(F.data.startswith("fix_subj_"))
+async def h_fix_subject_universal(cb: CallbackQuery, state: FSMContext) -> None:
+    """Обработчик для исправления дисциплины после предупреждения (универсальный)"""
+    action = cb.data.replace("fix_subj_", "", 1)
+    data = await state.get_data()
+
+    if action == "continue":
+        # Пользователь решил продолжить, несмотря на предупреждение
+        await cb.message.edit_text(
+            "✅ <b>Продолжаем генерацию...</b>\n\n"
+            "Убедитесь, что в тексте вы раскрываете тему через призму заявленной дисциплины.",
+            parse_mode="HTML",
+        )
+        await cb.answer()
+        await generate_and_send(
+            cb.message,
+            state,
+            model_key=data.get("model_key", FREE_MODEL_KEY),
+            pay_mode=data.get("mode", "free"),
+        )
+        return
+
+    elif action == "change_topic":
+        # Пользователь хочет изменить тему
+        subject = data.get("subject", "")
+        await cb.message.edit_text(
+            f"✏️ <b>Уточните тему работы</b>\n\n"
+            f"Текущая тема: «{data.get('topic', '')}»\n"
+            f"Дисциплина: «{subject}»\n\n"
+            f"Попробуйте сформулировать тему так, чтобы она лучше соответствовала дисциплине «{subject}».\n"
+            f"<i>Например: вместо «Общие вопросы» → «[Конкретный аспект] в контексте [дисциплина]»</i>",
+            parse_mode="HTML",
+            reply_markup=kb_back_cancel(),
+        )
+        await state.set_state(WorkState.topic)
+        await cb.answer()
+        return
+
+    else:
+        # Пользователь выбрал одну из предложенных дисциплин
+        new_subject = action
+        await state.update_data(subject=new_subject)
+
+        await cb.message.edit_text(
+            f"✅ <b>Дисциплина изменена</b>\n\n"
+            f"Новая дисциплина: <b>{new_subject}</b>\n"
+            f"Тема: «{data.get('topic', '')}»\n\n"
+            "🚀 Запускаю генерацию...",
+            parse_mode="HTML",
+        )
+        await cb.answer()
+        await generate_and_send(
+            cb.message,
+            state,
+            model_key=data.get("model_key", FREE_MODEL_KEY),
+            pay_mode=data.get("mode", "free"),
+        )
+        return
+
+
 @dp.callback_query(F.data.startswith("subj_"))
 async def h_subject_cb(cb: CallbackQuery, state: FSMContext) -> None:
     subj = cb.data.replace("subj_", "", 1)
+    data = await state.get_data()
+    topic = data.get("topic", "")
+
     if subj == "other":
+        # Показываем подсказки для темы (универсальные)
+        keywords = extract_topic_keywords(topic)
+        suggested = map_keywords_to_disciplines(keywords)
+        hint = ""
+        if suggested:
+            hint = f"\n\n💡 <b>Для темы «{topic}» рекомендуются:</b>\n"
+            hint += "\n".join(f"  • {d}" for d in suggested[:5])
+
         await cb.message.edit_text(
-            "✏️ <b>Введите название предмета</b>",
+            f"✏️ <b>Введите название предмета</b>{hint}",
             parse_mode="HTML",
             reply_markup=kb_back_cancel(),
         )
         await state.set_state(WorkState.subject)
     else:
-        await state.update_data(subject=subj)
+        await state.update_data(subject=subj, subj_check_passed=False)
         await cb.message.edit_text(
             f"✅ Предмет: <b>{subj}</b>\n\n"
             "🌆 <b>Выберите город</b>:",
@@ -6881,7 +7162,7 @@ async def h_subject_cb(cb: CallbackQuery, state: FSMContext) -> None:
 
 @dp.message(WorkState.subject)
 async def h_subject_text(message: Message, state: FSMContext) -> None:
-    await state.update_data(subject=(message.text or "").strip())
+    await state.update_data(subject=(message.text or "").strip(), subj_check_passed=False)
     await message.answer(
         "🌆 <b>Выберите город:</b>",
         reply_markup=with_back(kb_city()),
@@ -7244,6 +7525,44 @@ async def generate_and_send(
             )
             await state.clear()
             return
+
+        # ═══════════════════════════════════════════════════════════════
+        # УНИВЕРСАЛЬНАЯ ПРОВЕРКА СООТВЕТСТВИЯ ТЕМЫ И ДИСЦИПЛИНЫ
+        # ═══════════════════════════════════════════════════════════════
+        if not data.get("subj_check_passed"):
+            check_ok, check_message, suggested = await check_and_suggest_discipline_universal(
+                model_key, topic, subject, doc_type
+            )
+
+            if not check_ok and suggested:
+                # Создаем клавиатуру с вариантами действий
+                keyboard = InlineKeyboardMarkup(inline_keyboard=[])
+
+                # Кнопки для предлагаемых дисциплин (максимум 4)
+                for d in suggested[:4]:
+                    keyboard.inline_keyboard.append([
+                        InlineKeyboardButton(text=f"📚 {d}", callback_data=f"fix_subj_{d}")
+                    ])
+
+                # Кнопка "Продолжить" (игнорировать предупреждение)
+                keyboard.inline_keyboard.append([
+                    InlineKeyboardButton(text="⚠️ Продолжить (я уверен)", callback_data="fix_subj_continue")
+                ])
+                keyboard.inline_keyboard.append([
+                    InlineKeyboardButton(text="✏️ Изменить тему", callback_data="fix_subj_change_topic")
+                ])
+                keyboard.inline_keyboard.append([
+                    InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_flow")
+                ])
+
+                # Помечаем, что проверка показана — повторно не дёргаем при «Продолжить»
+                await state.update_data(subj_check_passed=True)
+                await event.answer(check_message, parse_mode="HTML", reply_markup=keyboard)
+                await state.set_state(WorkState.subject)
+                return
+
+            # Проверка пройдена — больше не повторяем
+            await state.update_data(subj_check_passed=True)
 
         # Определяем количество глав по типу документа
         if doc_type in ("esse", "doklad", "article"):
