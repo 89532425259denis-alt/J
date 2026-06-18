@@ -5123,30 +5123,87 @@ async def _download_image_bytes(url: str, *, timeout: int = 15) -> Optional[byte
         return None
 
 
-async def search_wikimedia_images(topic: str, subject: str, limit: int = 3) -> list[dict]:
-    """Ищет свободные изображения на Wikimedia Commons и возвращает bytes + подпись."""
+async def suggest_image_search_queries(
+    model_key: str,
+    topic: str,
+    subject: str,
+    limit: int = 5,
+) -> list[str]:
+    """DeepSeek формирует поисковые запросы для фото/иллюстраций."""
+    base = [" ".join(x for x in [topic, subject] if x).strip(), topic]
+    system = (
+        "Ты помогаешь искать реальные изображения для учебной работы. "
+        "Верни СТРОГО JSON без markdown: {\"queries\": [\"...\"]}. "
+        "Нужны короткие запросы для Wikimedia Commons/поиска изображений. "
+        "Если тема содержит имя человека, обязательно дай вариант на английском."
+    )
+    user = (
+        f"Тема работы: «{topic}»\n"
+        f"Дисциплина: «{subject}»\n"
+        f"Дай до {limit} поисковых запросов для подбора изображений."
+    )
+    try:
+        raw, _ = await chat_with_fallback(
+            model_key,
+            [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            max_tokens=300,
+        )
+        m = re.search(r"\{.*\}", raw or "", flags=re.S)
+        if m:
+            data = json.loads(m.group(0))
+            qs = data.get("queries", [])
+            if isinstance(qs, list):
+                for q in qs:
+                    q = " ".join(str(q).split()).strip(" \"'«»")
+                    if q:
+                        base.append(q)
+    except Exception as e:
+        print(f"[IMAGES] query AI error: {e}")
+
+    # Жёсткий фоллбэк для частых русских имён/тем, чтобы не упираться в русскую выдачу Commons.
+    low = (topic or "").lower()
+    if "байден" in low:
+        base.extend(["Joe Biden", "President Joe Biden", "Joe Biden official portrait"])
+
+    out: list[str] = []
+    for q in base:
+        q = " ".join((q or "").split())
+        if q and q.lower() not in {x.lower() for x in out}:
+            out.append(q)
+    return out[:limit]
+
+
+async def search_wikimedia_images(query: str, limit: int = 3) -> list[dict]:
+    """Ищет свободные JPG/PNG на Wikimedia Commons и возвращает bytes + подпись."""
     if not ENABLE_WEB_SOURCES or limit <= 0:
         return []
 
-    query = " ".join(x for x in [topic, subject] if x).strip()
+    query = " ".join((query or "").split()).strip()
     if not query:
         return []
 
     api = "https://commons.wikimedia.org/w/api.php"
-    params = (
-        "?action=query&generator=search&gsrnamespace=6&gsrlimit={limit}"
-        "&prop=imageinfo&iiprop=url|extmetadata&format=json&gsrsearch={q}"
-    ).format(limit=max(1, min(limit * 3, 15)), q=quote_plus(query))
+    params = {
+        "action": "query",
+        "generator": "search",
+        "gsrnamespace": "6",
+        "gsrlimit": str(max(1, min(limit * 6, 30))),
+        "gsrsearch": query,
+        "prop": "imageinfo",
+        "iiprop": "url|mime|extmetadata",
+        "iiurlwidth": "1200",
+        "format": "json",
+    }
 
     try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=18)) as session:
-            async with session.get(api + params, headers={"User-Agent": "GOST-Assistant/1.0"}) as resp:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as session:
+            async with session.get(api, params=params, headers={"User-Agent": "GOST-Assistant/1.0"}) as resp:
                 if resp.status != 200:
-                    print(f"[IMAGES] Wikimedia status {resp.status}")
+                    print(f"[IMAGES] Wikimedia status {resp.status} for query={query!r}")
                     return []
                 payload = await resp.json(content_type=None)
     except Exception as e:
-        print(f"[IMAGES] search error: {e}")
+        print(f"[IMAGES] search error for {query!r}: {e}")
         return []
 
     pages = (payload.get("query", {}) or {}).get("pages", {}) or {}
@@ -5156,33 +5213,56 @@ async def search_wikimedia_images(topic: str, subject: str, limit: int = 3) -> l
     for item in pages.values():
         title = str(item.get("title") or "").replace("File:", "").strip()
         info = (item.get("imageinfo") or [{}])[0]
-        url = info.get("url") or ""
+        mime = (info.get("mime") or "").lower()
+        url = info.get("thumburl") or info.get("url") or ""
         if not url or url in seen:
             continue
-        if not re.search(r"\.(jpe?g|png)(\?|$)", url, flags=re.I):
+        # python-docx гарантированно работает с JPEG/PNG; svg/webp/tiff пропускаем.
+        if mime not in ("image/jpeg", "image/png") and not re.search(r"\.(jpe?g|png)(\?|$)", url, flags=re.I):
             continue
         seen.add(url)
         img_bytes = await _download_image_bytes(url)
         if not img_bytes:
             continue
-        caption = re.sub(r"\.(jpe?g|png)$", "", title, flags=re.I)
-        caption = re.sub(r"[_\-]+", " ", caption).strip() or topic
-        out.append({"bytes": img_bytes, "caption": caption[:120], "source": url})
+
+        meta = info.get("extmetadata") or {}
+        obj_name = ((meta.get("ObjectName") or {}).get("value") or "").strip()
+        caption = re.sub(r"<[^>]+>", "", obj_name) if obj_name else ""
+        if not caption:
+            caption = re.sub(r"\.(jpe?g|png)$", "", title, flags=re.I)
+        caption = re.sub(r"[_\-]+", " ", caption).strip() or query
+        out.append({"bytes": img_bytes, "caption": caption[:120], "source": info.get("descriptionurl") or info.get("url") or url})
         if len(out) >= limit:
             break
 
-    print(f"[IMAGES] найдено изображений: {len(out)}/{limit}")
+    print(f"[IMAGES] query={query!r}: найдено {len(out)}/{limit}")
     return out
 
 
-async def prepare_work_images(topic: str, subject: str, pages: int) -> list[dict]:
-    """Готовит иллюстрации для DOCX."""
+async def prepare_work_images(topic: str, subject: str, pages: int, model_key: str = FREE_MODEL_KEY) -> list[dict]:
+    """Готовит иллюстрации для DOCX: DeepSeek делает запросы, Commons отдаёт фото."""
     count = _image_count_for_pages(pages)
-    images = await search_wikimedia_images(topic, subject, limit=count)
-    if images:
-        return images
-    # Мягкий фоллбэк: пробуем искать только по теме.
-    return await search_wikimedia_images(topic, "", limit=count)
+    queries = await suggest_image_search_queries(model_key, topic, subject, limit=6)
+    images: list[dict] = []
+    seen_sources: set[str] = set()
+
+    for q in queries:
+        need = count - len(images)
+        if need <= 0:
+            break
+        found = await search_wikimedia_images(q, limit=need)
+        for img in found:
+            src = img.get("source") or ""
+            if src and src in seen_sources:
+                continue
+            if src:
+                seen_sources.add(src)
+            images.append(img)
+            if len(images) >= count:
+                break
+
+    print(f"[IMAGES] итог: {len(images)}/{count}, queries={queries}")
+    return images
 
 
 def add_gost_image(doc: Document, image: dict, number: int, gost: dict) -> None:
@@ -5409,6 +5489,20 @@ def build_docx_bytes(
                 _set_run_font(er, fn, fs, False)
 
         _maybe_add_image_after_block(title, level, is_bib)
+
+    # Если основная структура была нестандартной и часть изображений некуда было
+    # вставить между разделами, выносим остаток в приложение, чтобы оплаченная
+    # опция «с изображениями» не дала пустой результат.
+    if work_images and image_number <= len(work_images):
+        doc.add_page_break()
+        p_app = doc.add_paragraph()
+        p_app.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        p_app.paragraph_format.first_line_indent = Cm(0)
+        r_app = p_app.add_run("ПРИЛОЖЕНИЕ А\nИЛЛЮСТРАЦИОННЫЕ МАТЕРИАЛЫ")
+        _set_run_font(r_app, fn, hfs, True)
+        while image_number <= len(work_images):
+            add_gost_image(doc, work_images[image_number - 1], image_number, gost)
+            image_number += 1
 
     buf = io.BytesIO()
     doc.save(buf)
@@ -8201,7 +8295,7 @@ async def generate_and_send(
 
             if data.get("include_images"):
                 await prog.update(label="🖼 Ищу изображения по теме и готовлю подписи по ГОСТ...", force=True)
-                data["images"] = await prepare_work_images(topic, subject, pages)
+                data["images"] = await prepare_work_images(topic, subject, pages, model_key=model_key)
                 if not data.get("images"):
                     print("[IMAGES] Подходящие изображения не найдены — документ будет без иллюстраций")
 
