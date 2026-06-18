@@ -2310,12 +2310,6 @@ async def check_and_suggest_discipline_universal(
     return False, message, all_suggested[:5]
    
    
-# ============================================================
-# ХЭНДЛЕРЫ ДЛЯ ИСПРАВЛЕНИЯ ДИСЦИПЛИНЫ
-# ============================================================
-   
-   
-@dp.callback_query(F.data.startswith("fix_subj_"))
 def _default_chapter_titles(doc_type: str, topic: str, num_chapters: int) -> list[dict]:
     """Запасные названия глав если ИИ не ответил."""
     # ГОСТ 7.32-2017: без слова «Глава» и без точки после номера раздела
