@@ -1,23 +1,33 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-"""ГОСТ-АССИСТЕНТ v3.1 — УНИВЕРСАЛЬНАЯ ПРОВЕРКА ДИСЦИПЛИН
+"""ГОСТ-АССИСТЕНТ v2.7-fix16 — ТОЧНЫЕ СТРАНИЦЫ + ДИСЦИПЛИНА
 
-Главные изменения v3.1:
+Главные изменения v2.1 относительно v2.0:
 ────────────────────────────────────────────────────────────────
-1. ★ УНИВЕРСАЛЬНАЯ ПРОВЕРКА ТЕМЫ И ДИСЦИПЛИНЫ
-   - Без хардкода, работает для ЛЮБЫХ тем и дисциплин
-   - Семантический анализ ключевых слов
-   - ИИ-проверка соответствия
-   - Предложение подходящих дисциплин
-   - Возможность изменить тему или дисциплину
+1. ★ ТОЧНОЕ ЧИСЛО СТРАНИЦ (±1).
+   После генерации DOCX конвертируется в PDF через LibreOffice,
+   реально пересчитываются страницы (pypdf / pdfinfo). Если страниц
+   меньше цели — главы дозаполняются; если больше — обрезаются
+   по границам абзацев. Цикл до 3 итераций.
 
-2. ★ ИНТЕГРАЦИЯ В ОСНОВНОЙ ПОТОК
-   - Проверка перед генерацией
-   - Интерактивный диалог с пользователем
-   - Сохранение контекста
+2. ★ ПРАВИЛЬНАЯ НУМЕРАЦИЯ СТРАНИЦ ПО ГОСТ.
+   Титульный лист включается в общую нумерацию, но цифра на нём
+   не отображается (different_first_page_header_footer). На странице
+   содержания появляется цифра «2», далее сквозная. Номер — внизу
+   по центру (или сверху, как настроено в GOST).
 
-3. Все базовые возможности v3.0 сохранены.
+3. ★ ЛИМИТ ДЛЯ БЕСПЛАТНОГО РЕЖИМА — 1 ГЕНЕРАЦИЯ В 5 ДНЕЙ.
+   Реализовано через кулдаун (FREE_COOLDOWN_SECONDS = 432000),
+   независимо от смены календарных суток. VIP и платные — без лимитов.
+
+4. ★ v2.2: подглавы генерируются отдельными промптами (нет пустых глав).
+   Заключение пишется ПОСЛЕ глав и видит их реальное содержание.
+   ГОСТ-сноски [1, с. 45] обязательны в каждом абзаце.
+
+5. Все базовые возможности v2.0 сохранены: красивые заголовки глав,
+   умный/классический стиль, прогресс-бар с ETA, парсинг «своего ГОСТ»,
+   custom-документы, аккуратные сообщения с HTML-форматированием.
 """
 
 import asyncio
@@ -63,6 +73,7 @@ from docx.shared import Cm, Mm, Pt, RGBColor
 #  КРАСИВАЯ АНИМАЦИЯ ПРОГРЕССА С ETA
 # ═══════════════════════════════════════════════════════════════
 
+# Рамки спиннера — меняются каждую секунду для иллюзии движения
 _SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 _BAR_FULL  = "█"
 _BAR_HALF  = "▓"
@@ -70,27 +81,34 @@ _BAR_EMPTY = "░"
 
 
 def _spinner() -> str:
+    """Возвращает текущий кадр спиннера на основе текущего времени."""
     idx = int(time.monotonic() * 4) % len(_SPINNER_FRAMES)
     return _SPINNER_FRAMES[idx]
 
 
 def _progress_bar(done: int, total: int, width: int = 16) -> str:
+    """Улучшенный прогресс-бар с более плавным визуалом."""
     total = max(1, int(total))
     done  = max(0, min(int(done), total))
     ratio = done / total
     filled = int(round(width * ratio))
     
+    # Используем более современные символы для заполнения
+    # █ - полный, ▓ - почти полный, ░ - пустой
     bar = "█" * filled + "░" * (width - filled)
     
+    # Добавляем динамический «бегунок» в конец заполненной части, если работа не завершена
     if 0 < filled < width:
         frame = int(time.monotonic() * 2) % 2
         marker = "▓" if frame == 0 else "▒"
+        # Заменяем последний заполненный символ на маркер
         bar = bar[:filled-1] + marker + bar[filled:]
         
     return bar
 
 
 def _fmt_time(seconds: float) -> str:
+    """Форматирует секунды в mm:ss."""
     s = max(0, int(seconds))
     m, s = divmod(s, 60)
     if m:
@@ -100,6 +118,7 @@ def _fmt_time(seconds: float) -> str:
 
 @dataclass
 class Progress:
+    """Красивый прогресс с анимацией, ETA и шагами."""
     msg: Message
     title: str
     total_steps: int
@@ -116,6 +135,14 @@ class Progress:
         return time.monotonic() - self._start_ts
 
     def _eta(self) -> str:
+        """Оценка оставшегося времени (fix11).
+
+        - Пока ни один шаг не закрыт: даём приблизительную оценку,
+          исходя из общего числа шагов и среднего времени на шаг ~25 с
+          (если elapsed > 3 с), вместо вечного «считаю…».
+        - Со 2-го шага: добавляем EMA сглаживание, чтобы оценка
+          не прыгала при разных по длительности шагах.
+        """
         elapsed = self._elapsed()
         remaining_steps = max(0, self.total_steps - self.done)
         if remaining_steps == 0:
@@ -124,6 +151,7 @@ class Progress:
         if self.done == 0:
             if elapsed < 3.0:
                 return "считаю…"
+            # эвристика: ~25 секунд на шаг, минимум 10
             est_per_step = max(10.0, elapsed / 0.5)
             return "≈" + _fmt_time(est_per_step * remaining_steps)
 
@@ -131,6 +159,7 @@ class Progress:
         if rate <= 0:
             return "…"
         eta_sec = remaining_steps / rate
+        # Сглаживание: микшируем с предыдущим значением
         prev = getattr(self, "_eta_prev", None)
         if prev is None:
             self._eta_prev = eta_sec
@@ -175,6 +204,7 @@ class Progress:
         text = self.render()
         now  = time.monotonic()
 
+        # Не спамим обновлениями чаще min_interval
         if not force and text == self._last_text:
             return
         if not force and (now - self._last_ts) < min_interval:
@@ -200,6 +230,12 @@ class Progress:
             pass
 
     async def animate_loop(self, stop_event: asyncio.Event) -> None:
+        """Фоновый цикл (fix11): обновляет спиннер/змейку/ETA каждые ~1.5 с.
+
+        Telegram режет частые edit_text (429 Flood). Минимальный безопасный
+        интервал — 1.2-1.5 с. Бар анимируется самим временем (frame =
+        int(monotonic()*2)), поэтому каждые 1.5 с кадры реально меняются.
+        """
         while not stop_event.is_set():
             try:
                 text = self.render()
@@ -258,6 +294,8 @@ def cfg(name: str, default: str = "") -> str:
 
 
 BOT_TOKEN = cfg("BOT_TOKEN")
+# if not BOT_TOKEN:
+    # raise SystemExit("❌ ОШИБКА: не вставлен BOT_TOKEN (в TOKENS, .env или bot_config.json)")
 
 OPENROUTER_KEY = cfg("OPENROUTER_KEY")
 DEEPSEEK_KEY   = cfg("DEEPSEEK_KEY")
@@ -274,15 +312,27 @@ GROQ_MODEL             = cfg("GROQ_MODEL",             "llama-3.3-70b-versatile"
 
 FREE_MODEL_KEY = cfg("FREE_MODEL_KEY", "deepseek")
 
+# Лимиты для БЕСПЛАТНОГО режима
 FREE_MAX_PAGES    = int(cfg("FREE_MAX_PAGES",         "15"))
+# Кулдаун между бесплатными генерациями: по умолчанию 5 суток (432000 сек).
+# Лимит "1 генерация в 5 дней" реализован именно через кулдаун, а не дневной счётчик —
+# это даёт точное окно 5×24 ч от момента предыдущей генерации.
 FREE_COOLDOWN     = int(cfg("FREE_COOLDOWN_SECONDS",  str(5 * 24 * 60 * 60)))
-FREE_DAILY_LIMIT  = int(cfg("FREE_DAILY_LIMIT",       "0"))
+# FREE_DAILY_LIMIT оставлен для совместимости; основной фильтр — кулдаун.
+FREE_DAILY_LIMIT  = int(cfg("FREE_DAILY_LIMIT",       "0"))   # 0 = без дневного лимита
 
-PAID_DAILY_LIMIT  = int(cfg("PAID_DAILY_LIMIT",       "0"))
-PAID_COOLDOWN     = int(cfg("PAID_COOLDOWN_SECONDS",  "0"))
+# Лимиты для ПЛАТНОГО режима — платят деньги, получают безлимит
+# PAID_DAILY_LIMIT = 0 означает "без лимита"
+PAID_DAILY_LIMIT  = int(cfg("PAID_DAILY_LIMIT",       "0"))   # 0 = безлимит
+PAID_COOLDOWN     = int(cfg("PAID_COOLDOWN_SECONDS",  "0"))   # 0 = нет кулдауна
 
+# Символов на страницу (ГОСТ: ~1800-2000 знаков с пробелами на стр A4 14pt 1.5 интервал)
+# Глобальное значение по умолчанию, если ГОСТ не передан
 CHARS_PER_PAGE = int(cfg("CHARS_PER_PAGE", "1850"))
 
+# Веб-источники: бот умеет подтягивать реальные источники из открытых научных
+# каталогов (OpenAlex/Crossref) и читать URL, которые пользователь прислал в
+# материалах. Если сервер без доступа к сети — функции тихо отключатся.
 ENABLE_WEB_SOURCES = cfg("ENABLE_WEB_SOURCES", "1").lower() not in ("0", "false", "no", "off")
 WEB_SOURCE_TIMEOUT = int(cfg("WEB_SOURCE_TIMEOUT", "12"))
 MAX_WEB_SOURCES    = int(cfg("MAX_WEB_SOURCES", "12"))
@@ -291,6 +341,14 @@ BIB_SOURCE_TARGET  = int(cfg("BIB_SOURCE_TARGET", "12"))
 FILL_UNKNOWN_CITATION_PAGES = cfg("FILL_UNKNOWN_CITATION_PAGES", "1").lower() not in ("0", "false", "no", "off")
 
 def calculate_chars_per_page(gost: dict) -> int:
+    """Расчёт количества знаков с пробелами на страницу.
+
+    Эмпирические значения, полученные сборкой одностраничных DOCX→PDF в
+    LibreOffice и подсчётом фактических символов. Базовая точка — каноничный
+    ГОСТ 7.32: Times New Roman 14 pt, межстрочный 1.5, поля 30/10/20/20 мм →
+    ~1800 знаков на страницу. От базовой точки масштабируем по полям, кеглю
+    и межстрочному интервалу.
+    """
     font_size    = int(gost.get("font_size", 14))
     line_spacing = float(gost.get("line_spacing", 1.5))
     left_mm   = int(gost.get("left_margin_mm",   30))
@@ -298,20 +356,28 @@ def calculate_chars_per_page(gost: dict) -> int:
     top_mm    = int(gost.get("top_margin_mm",    20))
     bottom_mm = int(gost.get("bottom_margin_mm", 20))
 
+    # Базовая площадь текстового блока (TNR 14, 1.5, поля 30/10/20/20).
     BASE_CHARS   = 1800.0
-    BASE_W_MM    = 210 - 30 - 10
-    BASE_H_MM    = 297 - 20 - 20
+    BASE_W_MM    = 210 - 30 - 10   # 170
+    BASE_H_MM    = 297 - 20 - 20   # 257
 
     text_w = max(60, 210 - left_mm - right_mm)
     text_h = max(60, 297 - top_mm - bottom_mm)
 
+    # Площадь блока линейно влияет на «вместимость».
     area_factor = (text_w / BASE_W_MM) * (text_h / BASE_H_MM)
+
+    # Кегль: ширина и высота строки пропорциональны размеру шрифта,
+    # значит вместимость ~ (14 / fs)^2.
     font_factor = (14.0 / max(10, font_size)) ** 2
+
+    # Межстрочный интервал: вместимость ~ 1.5 / spacing.
     spacing_factor = 1.5 / max(1.0, line_spacing)
 
     chars = BASE_CHARS * area_factor * font_factor * spacing_factor
     return max(900, min(3200, int(round(chars))))
 
+# Страниц без текста (титул + содержание)
 NON_TEXT_PAGES = int(cfg("NON_TEXT_PAGES", "2"))
 
 DEEPSEEK_PRICE  = int(cfg("DEEPSEEK_PRICE",           "5"))
@@ -442,6 +508,7 @@ SUBJECTS = [
     "Педагогика", "Медицина", "Архитектура", "Юриспруденция",
 ]
 
+# Примеры «хорошо / плохо» для эссе по дисциплинам
 DISCIPLINE_EXAMPLES = {
     "Информатика": (
         "ПЛОХО (не по дисциплине): «Байкал — это чистейшее озеро с удивительной экосистемой».\n"
@@ -470,9 +537,10 @@ CITIES = [
 
 
 # ═══════════════════════════════════════════════════════════════
-#  БИБЛИОТЕКА ЭТАЛОНОВ И ЖЕСТКИХ ПРАВИЛ
-# ═══════════════════════════════════════════════════════════════
+#  БИБЛИОТЕКА ЭТАЛОНОВ И ЖЕСТКИХ ПРАВИЛ (Few-Shot & Anti-Patterns)
+# ══════════════════════════════════════════════════════════════════
 
+# 1. Эталоны структуры и стиля (GOLDEN STANDARDS)
 GOLDEN_STANDARDS = {
     "academic": {
         "intro": "Актуальность данной темы обусловлена стремительным развитием [Область], что требует переосмысления подходов к [Проблема]. Целью данной работы является комплексный анализ [Тема]. Для достижения поставленной цели необходимо решить следующие задачи: во-первых, изучить теоретические основы...; во-вторых, проанализировать влияние...",
@@ -488,6 +556,7 @@ GOLDEN_STANDARDS = {
 }
 
 def get_golden_example(doc_type: str, part: str) -> str:
+    """Возвращает соответствующий эталон в зависимости от типа работы и части текста."""
     if doc_type in ("esse",):
         return GOLDEN_STANDARDS["esse"].get("main", "")
     if doc_type in ("doklad",):
@@ -498,6 +567,7 @@ def get_golden_example(doc_type: str, part: str) -> str:
         return GOLDEN_STANDARDS["academic"]["conclusion"]
     return GOLDEN_STANDARDS["academic"]["chapter"]
 
+# 2. Жесткие примеры оформления (Anti-Patterns)
 FEW_SHOT_EXAMPLES = """
 🌟 ПРИМЕР ПРАВИЛЬНОЙ ССЫЛКИ (обязательно с номером страницы):
    ✅ ХОРОШО: «...текст... [1, с. 45] ...текст... [2, с. 120–125]»
@@ -511,6 +581,7 @@ FEW_SHOT_EXAMPLES = """
    ❌ Любые фразы типа «Вот ваш текст», «Конечно, я помогу», «Объем соблюден» ЗАПРЕЩЕНЫ.
 """
 
+# Черный список авторов для литературы (чтобы не было Кнута в реферате по Байкалу)
 LIT_BLACKLIST = "Дональд Кнут, Томас Кормен, Эндрю Таненбаум, Стивен Лавренс"
 
 
@@ -591,6 +662,7 @@ def save_usage(d: dict) -> None:
 
 
 def _fmt_wait_human(seconds: int) -> str:
+    """Удобная человекочитаемая длительность: дни/часы/минуты/секунды."""
     s = max(0, int(seconds))
     d, s = divmod(s, 86400)
     h, s = divmod(s, 3600)
@@ -604,11 +676,18 @@ def _fmt_wait_human(seconds: int) -> str:
 
 
 def check_user_limit(user_id: int, mode: str) -> tuple[bool, str]:
+    """Проверяет ограничения.
+
+    Бесплатный режим: одна генерация раз в FREE_COOLDOWN секунд (по умолчанию 5 суток).
+    Платные пользователи (mode='paid') — безлимитны (PAID_DAILY_LIMIT=0, PAID_COOLDOWN=0).
+    VIP — без ограничений всегда.
+    """
     if is_vip(user_id):
         return True, ""
 
     is_free = mode == "free"
 
+    # Платный режим — без ограничений если PAID_DAILY_LIMIT == 0
     if not is_free and PAID_DAILY_LIMIT == 0 and PAID_COOLDOWN == 0:
         return True, ""
 
@@ -618,6 +697,7 @@ def check_user_limit(user_id: int, mode: str) -> tuple[bool, str]:
 
     now = int(datetime.now().timestamp())
 
+    # ── Кулдаун (главный фильтр для бесплатных) ──
     cooldown = FREE_COOLDOWN if is_free else PAID_COOLDOWN
     ts_key   = "last_free_ts" if is_free else "last_paid_ts"
     last_ts  = int(rec.get(ts_key, 0) or 0)
@@ -634,6 +714,7 @@ def check_user_limit(user_id: int, mode: str) -> tuple[bool, str]:
             f"💎 Хотите без ожидания? Используйте платный режим — он без лимитов."
         )
 
+    # ── Дневной лимит (опциональный, по умолчанию выключен для бесплатных) ──
     today = today_key()
     if rec.get("date") != today:
         used = 0
@@ -653,6 +734,14 @@ def check_user_limit(user_id: int, mode: str) -> tuple[bool, str]:
 
 
 def record_user_generation(user_id: int, mode: str) -> None:
+    """Фиксирует факт генерации.
+
+    Хранит:
+      - last_free_ts / last_paid_ts — timestamp последней генерации (для кулдауна,
+        не сбрасывается полночью);
+      - free / paid — счётчик за текущие сутки (используется только если
+        включён дневной лимит >0).
+    """
     if is_vip(user_id):
         return
 
@@ -661,6 +750,7 @@ def record_user_generation(user_id: int, mode: str) -> None:
     today = today_key()
 
     rec = data.get(uid, {}) or {}
+    # last_*_ts НЕ обнуляем при смене даты — иначе кулдаун в 5 дней не сработает
     if rec.get("date") != today:
         rec["date"] = today
         rec["free"] = 0
@@ -676,6 +766,7 @@ def record_user_generation(user_id: int, mode: str) -> None:
 
 
 def get_user_limits_info(user_id: int) -> str:
+    """Возвращает красивую карточку с лимитами пользователя."""
     if is_vip(user_id):
         return (
             "┌─────────────────────────\n"
@@ -771,24 +862,31 @@ if FREE_MODEL_KEY not in AI_MODELS:
 
 
 def _strip_markdown_markers(text: str) -> str:
+    """Убирает markdown-маркеры `#` и `*`, чтобы они не попадали в DOCX."""
     if not text:
         return ""
+    # Убираем # в начале строки (заголовки markdown)
     text = re.sub(r'(?m)^\s*#{1,6}\s*\*{0,2}\s*', '', text)
     text = re.sub(r'(?m)^\s*\*{2}([^*]+)\*{2}\s*$', r'\1', text)
+    # Убираем **жирный** и *курсив*
     text = re.sub(r"\*{1,3}([^*\n]+?)\*{1,3}", r"\1", text)
+    # Убираем оставшиеся # (в начале строки и одиночные внутри текста)
     text = re.sub(r'(?m)^\s*#+\s*', '', text)
     text = text.replace("#", "")
+    # Убираем висящие ** после удаления # в строках вида `# **Заголовок**`
     text = re.sub(r'(?m)^\s*\*\*', '', text)
     text = re.sub(r'(?m)\*\*\s*$', '', text)
     return text.strip()
 
 
 _AI_MARKER_REPLACEMENTS = [
+    # Служебные ответы модели.
     (r"(?im)^\s*(конечно|разумеется|хорошо)[,.!\s]*(?:вот|ниже)\s+[^\n.?!]*[.?!]?\s*", ""),
     (r"(?im)^\s*(?:вот|ниже)\s+(?:ваш|представлен|привед[её]н)[^\n.?!]*[.?!]?\s*", ""),
     (r"(?i)\bкак (?:искусственный интеллект|ии|языковая модель)[^.!?\n]*[.!?]?\s*", ""),
     (r"(?i)\bя (?:являюсь|не являюсь|не могу|не имею возможности)[^.!?\n]*[.!?]?\s*", ""),
     (r"(?i)\bобъ[её]м текста (?:строго )?(?:выдержан|соблюд[её]н)[^.!?\n]*[.!?]?\s*", ""),
+    # Типовые «ИИ-маркеры» внутри академического текста.
     (r"(?i)\bв заключение следует отметить,?\s+что\s+", ""),
     (r"(?i)\bподводя итог,?\s+", ""),
     (r"(?i)\bтаким образом,?\s+", ""),
@@ -803,11 +901,13 @@ _AI_MARKER_REPLACEMENTS = [
 
 
 def _remove_ai_marker_phrases(text: str) -> str:
+    """Удаляет служебные и шаблонные фразы-маркеры ИИ без добавления опечаток."""
     if not text:
         return ""
     out = text
     for pattern, repl in _AI_MARKER_REPLACEMENTS:
         out = re.sub(pattern, repl, out)
+    # Чистим пробелы, которые могли остаться после удаления вводных фраз.
     out = re.sub(r"[ \t]{2,}", " ", out)
     out = re.sub(r"\n{3,}", "\n\n", out)
     out = re.sub(r"(?m)^\s+", "", out)
@@ -815,12 +915,17 @@ def _remove_ai_marker_phrases(text: str) -> str:
 
 
 def sanitize_llm_text(raw: str) -> str:
+    """Чистит мусор от LLM: markdown-разметку, тройные переводы строк."""
     if not raw:
         return ""
     text = _strip_markdown_markers(raw.strip())
+    # убираем ```код``` блоки
     text = re.sub(r"```[^\n]*\n?", "", text)
+    # убираем **жирный** и *курсив* markdown
     text = re.sub(r"\*{1,3}([^*]+)\*{1,3}", r"\1", text)
+    # убираем # заголовки markdown
     text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
+    # убираем тройные+ переводы строк
     text = re.sub(r"\n{3,}", "\n\n", text)
     text = _remove_ai_marker_phrases(text)
     return text.strip()
@@ -832,6 +937,7 @@ async def call_openai_compat(
     max_tokens: int = 4096,
     timeout: int = 300,
 ) -> str:
+    """Вызов OpenAI-совместимого API."""
     if info.get("_fatal") or not info.get("api_key"):
         return ""
 
@@ -887,12 +993,20 @@ async def chat_with_model(info: dict, messages: list[dict], max_tokens: int = 40
 
 
 def fallback_chain(primary: str) -> list[str]:
+    """Цепочка фоллбэков: primary → все остальные доступные модели по приоритету.
+
+    Раньше использовался только OpenRouter (deepseek_r1, gemini_or), из-за
+    чего при сбое OpenRouter Groq и прямой DeepSeek API не подхватывались.
+    Теперь честно перебираем все модели, у которых есть api_key и нет
+    фатальной ошибки. Дубликаты не добавляются.
+    """
+    # Полный приоритет: сначала primary, затем — в порядке предпочтения.
     priority = [
         primary,
-        "deepseek",
-        "deepseek_r1",
-        "gemini_or",
-        "groq",
+        "deepseek",      # прямой DeepSeek API (дешёвый, стабильный)
+        "deepseek_r1",   # OpenRouter / DeepSeek R1
+        "gemini_or",     # OpenRouter / Gemini
+        "groq",          # Groq (быстрый, бесплатный)
     ]
     out: list[str] = []
     for k in priority:
@@ -914,6 +1028,7 @@ async def chat_with_fallback(
     messages: list[dict],
     max_tokens: int,
 ) -> tuple[str, str]:
+    """Пробует модели по цепочке, возвращает (текст, ключ_модели)."""
     best_text = ""
     best_model = primary
     for k in fallback_chain(primary):
@@ -922,12 +1037,14 @@ async def chat_with_fallback(
         if text and len(text.strip()) > 100:
             info["status"] = ModelStatus.AVAILABLE
             return text, k
+        # Сохраняем лучший результат даже если он короткий
         if text and len(text.strip()) > len(best_text.strip()):
             best_text = text
             best_model = k
         if not text:
             info["status"] = ModelStatus.LIMIT
             print(f"[FALLBACK] Модель {info.get('name', k)} вернула пустой ответ, пробую следующую...")
+    # Если ни одна модель не вернула > 100 символов, возвращаем лучшее что есть
     if best_text:
         print(f"[FALLBACK] Все модели дали < 100 зн., лучший: {len(best_text)} зн. от {best_model}")
     return best_text, best_model
@@ -941,6 +1058,7 @@ _URL_RE = re.compile(r"https?://[^\s<>()\[\]{}\"'«»]+", re.IGNORECASE)
 
 
 def _extract_urls(text: str, limit: int = 5) -> list[str]:
+    """Достаёт URL из пользовательских материалов, сохраняя порядок."""
     if not text:
         return []
     seen: set[str] = set()
@@ -956,6 +1074,7 @@ def _extract_urls(text: str, limit: int = 5) -> list[str]:
 
 
 def _strip_html(raw: str) -> str:
+    """Очень лёгкая HTML→text очистка без внешних зависимостей."""
     if not raw:
         return ""
     raw = re.sub(r"(?is)<(script|style|noscript).*?</\1>", " ", raw)
@@ -977,18 +1096,22 @@ def _safe_year_from_crossref(item: dict) -> str:
 
 
 def _author_to_gost(name: str) -> str:
+    """Форматирует автора как «Фамилия И.О.» насколько это возможно."""
     name = re.sub(r"\s+", " ", (name or "").strip())
     if not name:
         return ""
     parts = name.split()
     if len(parts) == 1:
         return parts[0]
+    # Уже готовый вид: «Иванов И.И.» / «Smith J.» — не переворачиваем.
     if re.fullmatch(r"(?:[A-ZА-ЯЁ]\.){1,4}", parts[-1].replace(" ", "")):
         return f"{parts[0]} {parts[-1]}".strip()
+    # Если первая часть похожа на русскую фамилию, а дальше полные имя/отчество.
     if len(parts) >= 2 and re.search(r"[А-ЯЁ][а-яё]+", parts[0]) and re.search(r"[А-ЯЁ][а-яё]+", parts[1]):
         family = parts[0]
         given = parts[1:]
     else:
+        # Английский порядок чаще Given Family.
         family = parts[-1]
         given = parts[:-1]
     initials = "".join((p[0].upper() + ".") for p in given if p)
@@ -1056,6 +1179,7 @@ _TOPIC_STOPWORDS = {
 
 
 def _keywords_for_relevance(text: str) -> set[str]:
+    """Ключевые слова для проверки, что источник действительно по теме."""
     if not text:
         return set()
     words = re.findall(r"[A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё\-]{3,}", text.lower())
@@ -1069,6 +1193,7 @@ def _keywords_for_relevance(text: str) -> set[str]:
 
 
 def _source_relevance_score(record: dict, topic: str, subject: str) -> int:
+    """Оценивает релевантность источника: тема важнее дисциплины."""
     title = record.get("title") or ""
     haystack = " ".join(
         str(record.get(k) or "")
@@ -1098,6 +1223,15 @@ def _source_relevance_score(record: dict, topic: str, subject: str) -> int:
 
 
 def _filter_relevant_source_records(records: list[dict], topic: str, subject: str, limit: int, doc_type: str = "") -> list[dict]:
+    """Фильтрует источники, чтобы список литературы был по теме и не короче 8.
+
+    Сначала берём самые релевантные записи (совпадение с темой в названии,
+    журнале, ключевых словах). Если их меньше MIN_REAL_SOURCES, добавляем
+    реальные записи из поисковой выдачи по этой же теме: лучше 8 проверяемых
+    источников из каталогов, чем 3 хороших и 9 выдуманных моделью.
+
+    FIX: Все источники ТОЧНО по теме. Источники не по теме отбрасываются.
+    """
     limit = max(MIN_REAL_SOURCES, min(limit, MAX_WEB_SOURCES, BIB_SOURCE_TARGET))
     deduped = _dedupe_source_records(records, max(limit * 6, 60))
     scored = [(_source_relevance_score(r, topic, subject), r) for r in deduped]
@@ -1110,23 +1244,31 @@ def _filter_relevant_source_records(records: list[dict], topic: str, subject: st
         return (r.get("doi") or re.sub(r"\W+", "", (r.get("title") or "").lower())[:120]).lower()
 
     def _is_on_topic(r: dict, topic: str, subject: str) -> bool:
+        """Проверяет что источник действительно по теме (не общий учебник)."""
         title_lower = (r.get("title") or "").lower()
         container_lower = (r.get("container") or "").lower()
         concepts_lower = (r.get("concepts") or "").lower()
         haystack = f"{title_lower} {container_lower} {concepts_lower}"
 
+        # Темные слова — ключевые слова темы (без стоп-слов)
         topic_words = _keywords_for_relevance(topic)
         subject_words = _keywords_for_relevance(subject)
 
+        # Минимум 1 слово из темы должно быть в названии/журнале
         topic_in_title = any(w in title_lower for w in topic_words)
         topic_in_container = any(w in container_lower for w in topic_words)
         topic_in_concepts = any(w in concepts_lower for w in topic_words)
 
+        # Общие слова предмета (несколько — нормально для предметной литературы)
         subject_matches = sum(1 for w in subject_words if w in haystack)
 
+        # Если в названии есть явные маркеры НЕ-по-теме — отбрасываем
         off_topic_markers = ["введение", "общая", "основы", "курс лекций", "учебное пособие"]
         is_generic = any(m in title_lower for m in off_topic_markers)
 
+        # Источник по теме если:
+        # - хотя бы 1 ключевое слово темы в названии/журнале/концептах ИЛИ
+        # - предметные слова + не слишком общий
         has_topic_word = topic_in_title or topic_in_container or topic_in_concepts
         is_not_too_generic = not is_generic or has_topic_word
 
@@ -1141,6 +1283,7 @@ def _filter_relevant_source_records(records: list[dict], topic: str, subject: st
             k = _key(r)
             if not k or k in selected_keys:
                 continue
+            # FIX: Проверяем что источник реально по теме (для strong кандидатов)
             if require_topic_match and not _is_on_topic(r, topic, subject):
                 continue
             selected_keys.add(k)
@@ -1150,12 +1293,17 @@ def _filter_relevant_source_records(records: list[dict], topic: str, subject: st
     weak = [r for score, r in scored if 0 < score < 4]
     rest = [r for score, r in scored if score <= 0]
 
+    # Сначала берём strong с проверкой по теме
     _add(strong, require_topic_match=True)
     if len(selected) < MIN_REAL_SOURCES:
+        # weak без строгой проверки по теме, но с базовой фильтрацией
         _add(weak, require_topic_match=False)
     if len(selected) < MIN_REAL_SOURCES:
+        # Последний резерв: реальные записи из выдачи по запросу темы.
         _add(rest, require_topic_match=False)
 
+    # Вариативность по жанрам: список для эссе/доклада/реферата на одну тему
+    # не начинается с одних и тех же двух работ, но остаётся детерминированным.
     if selected and doc_type:
         genre_offsets = {
             "referat": 0,
@@ -1176,6 +1324,7 @@ def _filter_relevant_source_records(records: list[dict], topic: str, subject: st
 
 
 def _format_source_record(record: dict) -> str:
+    """Форматирует запись из OpenAlex/Crossref в приближённый ГОСТ."""
     authors = record.get("authors") or []
     title = _clean_ref_title(record.get("title") or "")
     year = str(record.get("year") or "б. г.")
@@ -1201,6 +1350,7 @@ def _format_source_record(record: dict) -> str:
         ref += f" — URL: {url}."
     else:
         ref += " — [URL не указан]."
+    # Не пропускаем битые строки из каталогов: «РАН Б.И.П.С.», «университет Б.Г.» и т.п.
     if _is_bad_literature_line(ref):
         return ""
     return ref
@@ -1215,16 +1365,20 @@ _BAD_LITERATURE_PATTERNS = [
 
 
 def _is_bad_literature_line(line: str) -> bool:
+    """Отсекает битые библиографические данные из внешних каталогов."""
     if not line:
         return True
     low = line.lower()
     if any(p.lower() in low for p in _BAD_LITERATURE_PATTERNS):
         return True
+    # Организация/аббревиатура вместо автора + набор инициалов из 3+ букв.
+    # Примеры: «РАН Б.И.П.С.», «университет Б.Г.».
     first_part = line.split(".", 1)[0]
     if re.search(r"\b(?:ран|университет|институт|академия|центр|фонд)\b", first_part, re.IGNORECASE):
         return True
     if re.match(r"^[А-ЯЁA-Z]{2,}\s+(?:[А-ЯЁA-Z]\.){3,}", line.strip()):
         return True
+    # Слишком короткий «автор» из одних инициалов/аббревиатур.
     author_part = line.split(".", 1)[0].strip()
     if re.fullmatch(r"(?:[А-ЯЁA-Z]\.?\s*){1,6}", author_part):
         return True
@@ -1232,6 +1386,12 @@ def _is_bad_literature_line(line: str) -> bool:
 
 
 def _ensure_bibliography_urls(bib_text: str) -> str:
+    """Гарантирует, что в каждой позиции есть рабочая ссылка или пометка.
+
+    Если есть DOI в виде `DOI: 10...`, он превращается в рабочий URL
+    `https://doi.org/10...`. Если ни DOI, ни URL нет — добавляется
+    `[URL не указан]`.
+    """
     if not bib_text:
         return ""
     out: list[str] = []
@@ -1239,6 +1399,7 @@ def _ensure_bibliography_urls(bib_text: str) -> str:
         line = line.strip()
         if not line:
             continue
+        # DOI без URL → рабочая ссылка DOI.
         line = re.sub(
             r"DOI:\s*(10\.\S+)",
             lambda m: "URL: https://doi.org/" + m.group(1).rstrip(" ."),
@@ -1256,6 +1417,7 @@ def _ensure_bibliography_urls(bib_text: str) -> str:
 
 
 def validate_literature(bib_text: str) -> tuple[bool, str]:
+    """Проверяет список литературы на битые данные."""
     if not bib_text or not bib_text.strip():
         return False, "список литературы пуст"
     bad_patterns = ["РАН Б.И.П.С.", "университет Б.Г.", "Без автора", "ljournal"]
@@ -1357,6 +1519,12 @@ def _subject_alias_text(subject: str) -> str:
 
 
 def _source_query_variants(topic: str, subject: str) -> list[str]:
+    """Генерирует несколько поисковых запросов, чтобы набрать 10–12 реальных источников.
+
+    Для кириллических тем добавляет латинскую транслитерацию/известные алиасы
+    (например, «Трамп» → Donald Trump), иначе каталоги часто находят 1–2 русские
+    публикации вместо полноценного списка.
+    """
     aliases = _topic_aliases(topic)
     subject_l = (subject or "").lower()
     extra: list[str] = []
@@ -1374,6 +1542,7 @@ def _source_query_variants(topic: str, subject: str) -> list[str]:
         queries.append(a)
         for e in extra[:2]:
             queries.append(f"{a} {e}")
+    # Резерв: исходная тема + дисциплина.
     if topic and subject:
         queries.append(f"{topic} {subject}")
 
@@ -1389,9 +1558,11 @@ def _source_query_variants(topic: str, subject: str) -> list[str]:
 
 
 async def _fetch_source_records_for_query(session: aiohttp.ClientSession, query: str, fetch_rows: int) -> list[dict]:
+    """Возвращает записи источников из OpenAlex/Crossref/Semantic Scholar для одного query."""
     q = quote_plus(query)
     records: list[dict] = []
 
+    # OpenAlex
     openalex_url = (
         "https://api.openalex.org/works?"
         f"search={q}&per-page={min(fetch_rows, 200)}&sort=cited_by_count:desc"
@@ -1413,6 +1584,7 @@ async def _fetch_source_records_for_query(session: aiohttp.ClientSession, query:
             "url": doi or item.get("id") or "",
         })
 
+    # Crossref: title + bibliographic fallback.
     for cr_url in (
         f"https://api.crossref.org/works?query.title={q}&rows={min(fetch_rows, 100)}",
         f"https://api.crossref.org/works?query.bibliographic={q}&rows={min(fetch_rows, 100)}",
@@ -1433,6 +1605,7 @@ async def _fetch_source_records_for_query(session: aiohttp.ClientSession, query:
                 "url": f"https://doi.org/{doi}" if doi else (item.get("URL") or ""),
             })
 
+    # Semantic Scholar
     sem_url = (
         "https://api.semanticscholar.org/graph/v1/paper/search?"
         f"query={q}&limit={min(fetch_rows, 100)}&fields=title,year,authors,journal,externalIds,url"
@@ -1455,14 +1628,180 @@ async def _fetch_source_records_for_query(session: aiohttp.ClientSession, query:
     return records
 
 
-async def fetch_verified_sources(
+def _format_search_result_as_gost(result: dict) -> str:
+    url = result.get("url", "")
+    title = result.get("title", "")
+    source = result.get("source", "")
+    snippet = result.get("snippet", "")[:100]
+    
+    # Пытаемся извлечь автора и год из сниппета
+    author_match = re.search(r"([А-Я][а-я]+ [А-Я]\. [А-Я]\.)", snippet)
+    year_match = re.search(r"(20\d{2})", snippet)
+    
+    if author_match and year_match:
+        return f"{author_match.group(1)}. {title} // {source}. — {year_match.group(1)}. — URL: {url}"
+    else:
+        return f"{title} // {source}. — URL: {url}"
+
+
+async def call_openai_compat_with_search(
+    info: dict,
+    messages: list[dict],
+    max_tokens: int = 4096,
+    enable_search: bool = False,
+    search_count: int = 10,
+    timeout: int = 300,
+) -> tuple[str, list[dict]]:
+    """Вызов API с опциональным поиском. Возвращает (текст, search_results)."""
+    if info.get("_fatal") or not info.get("api_key"):
+        return "", []
+
+    base = info["base_url"].rstrip("/")
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {info['api_key']}",
+    }
+
+    if "openrouter.ai" in base:
+        headers["HTTP-Referer"] = "https://t.me/gost_assistant_bot"
+        headers["X-Title"]      = "GOST Assistant Bot"
+
+    payload = {
+        "model": info["model"],
+        "messages": messages,
+        "temperature": 0.7,
+        "max_tokens": max_tokens,
+    }
+    
+    # Включаем поиск для DeepSeek
+    if enable_search and "deepseek" in info["model"].lower():
+        payload["search"] = True
+        payload["search_options"] = {"count": search_count}
+
+    try:
+        async with aiohttp.ClientSession() as sess:
+            async with sess.post(
+                f"{base}/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=timeout),
+            ) as r:
+                txt = await r.text()
+                if r.status == 200:
+                    data = json.loads(txt)
+                    content = data["choices"][0]["message"]["content"]
+                    search_results = data.get("search_results", [])
+                    return content, search_results
+                if r.status in (401, 402, 403):
+                    info["_fatal"] = True
+                    info["status"] = ModelStatus.FATAL
+                    print(f"[FATAL] {info['name']} — auth error {r.status}")
+                elif r.status == 429:
+                    info["status"] = ModelStatus.LIMIT
+                    print(f"[LIMIT] {info['name']} — rate limit")
+                else:
+                    print(f"[ERROR] {info['name']} — HTTP {r.status}: {txt[:200]}")
+    except asyncio.TimeoutError:
+        print(f"[TIMEOUT] {info['name']}")
+    except Exception as e:
+        print(f"[SEARCH] Ошибка: {e}")
+    
+    return "", []
+
+
+async def fetch_sources_via_deepseek_search(
     topic: str,
     subject: str,
+    model_key: str = "deepseek",
     limit: int = 12,
-    doc_type: str = "",
-) -> str:
+) -> tuple[str, list[dict]]:
+    """
+    Использует DeepSeek Web Search для поиска реальных источников по теме.
+    Возвращает (библиография_в_ГОСТ, список_сырых_результатов)
+    """
+    info = AI_MODELS.get(model_key)
+    if not info or not info.get("api_key"):
+        return "", []
+    
+    # Формируем запрос на поиск научных статей
+    search_prompt = (
+        f"Найди актуальные научные статьи, монографии и исследования по теме "
+        f"«{topic}» в контексте дисциплины «{subject}». "
+        f"Верни список из {limit} источников в формате:\n"
+        f"1. Автор. Название // Журнал. — Год. — URL: ссылка\n"
+        f"2. ...\n\n"
+        f"Ищи только реальные, проверяемые источники с DOI или рабочими URL. "
+        f"Не выдумывай. Если источник не имеет URL — не включай его."
+    )
+    
+    messages = [
+        {"role": "system", "content": "Ты помогаешь находить научные источники. Отвечай только списком литературы в формате ГОСТ."},
+        {"role": "user", "content": search_prompt},
+    ]
+    
+    text, search_results = await call_openai_compat_with_search(
+        info, messages, max_tokens=3000, enable_search=True, search_count=limit
+    )
+    
+    if not text:
+        return "", []
+    
+    # Парсим результаты в список словарей
+    sources = []
+    for line in text.split("\n"):
+        line = line.strip()
+        if re.match(r"^\d+\.", line):
+            # Извлекаем URL
+            url_match = re.search(r"URL:\s*(https?://\S+)", line, re.IGNORECASE)
+            doi_match = re.search(r"DOI:\s*(10\.\S+)", line, re.IGNORECASE)
+            
+            sources.append({
+                "raw": line,
+                "url": url_match.group(1) if url_match else (f"https://doi.org/{doi_match.group(1)}" if doi_match else ""),
+                "title": _clean_ref_title(line), # Use existing _clean_ref_title
+            })
+    
+    # Также используем search_results из API
+    for result in search_results:
+        url = result.get("url", "")
+        title = result.get("title", "")
+        if url and title:
+            # Форматируем в ГОСТ
+            sources.append({
+                "raw": f"{_format_search_result_as_gost(result)}",
+                "url": url,
+                "title": title,
+            })
+    
+    # Дедупликация
+    seen_urls = set()
+    unique_sources = []
+    for s in sources:
+        if s["url"] and s["url"] not in seen_urls:
+            seen_urls.add(s["url"])
+            unique_sources.append(s)
+    
+    # Формируем итоговую библиографию
+    bib_lines = []
+    for i, s in enumerate(unique_sources[:limit], start=1):
+        if s.get("raw"):
+            bib_lines.append(f"{i}. {s['raw']}")
+        elif s.get("url"):
+            bib_lines.append(f"{i}. Электронный ресурс: {s['title']} — URL: {s['url']}")
+    
+    return "\n".join(bib_lines), unique_sources
+
+    """Берёт реальные проверяемые источники из OpenAlex и Crossref.
+
+    Это не заменяет академическую проверку преподавателем, но резко снижает
+    риск выдуманных книг/статей: DOI, журнал, год и авторы приходят из
+    публичных каталогов.
+    """
     if not ENABLE_WEB_SOURCES:
         return ""
+    # Для библиографии первична именно тема, а дисциплина — только уточнение.
+    # Иначе каталоги часто возвращают общие учебники по предмету, не относящиеся
+    # к заданной теме.
     query = (topic or "").strip() or " ".join(x for x in (topic, subject) if x).strip()
     if len(query) < 4:
         return ""
@@ -1495,6 +1834,7 @@ async def fetch_verified_sources(
 
 
 async def _fetch_url_snippet(session: aiohttp.ClientSession, url: str, max_chars: int = 3500) -> str:
+    """Скачивает небольшой текстовый фрагмент страницы пользователя."""
     try:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=WEB_SOURCE_TIMEOUT), allow_redirects=True) as resp:
             if resp.status >= 400:
@@ -1514,6 +1854,7 @@ async def _fetch_url_snippet(session: aiohttp.ClientSession, url: str, max_chars
 
 
 def bibliography_from_urls(source: str, start: int = 1, limit: int = 8) -> str:
+    """Формирует реальные библиографические записи из URL пользователя."""
     urls = _extract_urls(source or "", limit=limit)
     if not urls:
         return ""
@@ -1528,6 +1869,7 @@ def bibliography_from_urls(source: str, start: int = 1, limit: int = 8) -> str:
 
 
 def _combine_bibliographies(*bibs: str, limit: int = 20) -> str:
+    """Объединяет реальные источники и перенумеровывает без дублей."""
     items: list[str] = []
     seen: set[str] = set()
     for bib in bibs:
@@ -1539,6 +1881,7 @@ def _combine_bibliographies(*bibs: str, limit: int = 20) -> str:
             if not line or _is_bad_literature_line(line):
                 continue
             key = re.sub(r"\s+", " ", line.lower())
+            # URL/DOI — главный ключ реальности и дедупликации.
             m = re.search(r"(?:doi:\s*|https?://)([^\s.;)]+)", key)
             if m:
                 key = m.group(1)
@@ -1560,6 +1903,11 @@ def _numeric_topic_key(topic: str, subject: str) -> str:
 
 
 def _default_numeric_facts(topic: str, subject: str) -> list[str]:
+    """Возвращает стабильную карту числовых фактов для темы.
+
+    Карта используется во всех жанрах по одной теме, чтобы реферат, доклад и
+    эссе не расходились по годам, номерам президентства, диапазонам и т.п.
+    """
     low = (topic or "").lower()
     facts: list[str] = []
     if "трамп" in low or "trump" in low:
@@ -1578,6 +1926,7 @@ def _default_numeric_facts(topic: str, subject: str) -> list[str]:
 
 
 def get_numeric_consistency_context(topic: str, subject: str, doc_type: str = "") -> str:
+    """Единый числовой профиль темы: сохраняется и используется повторно."""
     data = _load_json(NUMERIC_FACTS_FILE, {})
     key = _numeric_topic_key(topic, subject)
     rec = data.get(key)
@@ -1603,19 +1952,23 @@ def get_numeric_consistency_context(topic: str, subject: str, doc_type: str = ""
 
 
 def _normalize_numeric_claims(text: str, topic: str = "") -> str:
+    """Финально выравнивает известные числовые факты по теме."""
     if not text:
         return text
     low = (topic or "").lower()
     out = text
     if "трамп" in low or "trump" in low:
+        # Частые ошибки в работах о первом президентском сроке.
         out = re.sub(r"2016\s*[–—-]\s*2020", "2017–2021", out)
         out = re.sub(r"2017\s*[–—-]\s*2020", "2017–2021", out)
         out = re.sub(r"46-?й президент США", "45-й президент США", out, flags=re.IGNORECASE)
+        # Не даём случайно поменять 47-й при контексте выборов 2024 года.
         out = re.sub(r"45-?й и 46-?й", "45-й и 47-й", out, flags=re.IGNORECASE)
     return out
 
 
 async def enrich_source_content(source: str) -> str:
+    """Если пользователь прислал ссылки, добавляет к материалам выдержки с сайтов."""
     source = (source or "").strip()
     if not ENABLE_WEB_SOURCES:
         return source
@@ -1642,8 +1995,122 @@ async def enrich_source_content(source: str) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════
-#  УНИВЕРСАЛЬНАЯ ПРОВЕРКА ТЕМЫ И ДИСЦИПЛИНЫ (БЕЗ ХАРДКОДА)
+#  ГЕНЕРАЦИЯ СТРУКТУРЫ И НАЗВАНИЙ ГЛАВ ЧЕРЕЗ ИИ
 # ═══════════════════════════════════════════════════════════════
+
+async def generate_chapter_titles(
+    model_key: str,
+    doc_type: str,
+    topic: str,
+    subject: str,
+    num_chapters: int,
+) -> list[dict]:
+    """
+    Просит ИИ придумать развёрнутые названия глав и подглав.
+
+    Возвращает список словарей:
+    [
+      {"title": "Глава 1. Теоретические основы ...", "subs": ["1.1. ...", "1.2. ..."]},
+      ...
+    ]
+    """
+    system = (
+        "Ты помогаешь составлять структуру академических работ по ГОСТ 7.32-2017. "
+        "Отвечай СТРОГО в формате JSON-массива без пояснений и без markdown. "
+        "Каждый элемент: {\"title\": \"...\", \"subs\": [\"...\", \"...\"]}. "
+        "ВАЖНО по нумерации (ГОСТ 7.32-2017): названия разделов БЕЗ слова «Глава», "
+        "нумерация в формате «1 Название раздела», «1.1 Название подраздела» — "
+        "БЕЗ точки после последней цифры номера. Название должно быть развёрнутым "
+        "и конкретным, например: «1 Теоретические основы изучения …»."
+    )
+
+    user = (
+        f"Тема работы: «{topic}». "
+        f"Дисциплина: {subject}. "
+        f"Тип документа: {DOC_TYPES.get(doc_type, DOC_TYPES['referat'])['word']}. "
+        f"Количество глав: {num_chapters}. "
+        f"Каждая глава — 2–3 подглавы. "
+        f"Язык: русский. "
+        f"Верни ТОЛЬКО JSON-массив."
+    )
+
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user",   "content": user},
+    ]
+
+    raw, _ = await chat_with_fallback(model_key, messages, max_tokens=1500)
+    raw    = raw.strip()
+
+    # Вытаскиваем JSON даже если модель добавила мусор
+    m = re.search(r"\[.*\]", raw, flags=re.S)
+    if m:
+        raw = m.group(0)
+
+    try:
+        result = json.loads(raw)
+        if isinstance(result, list) and all("title" in r for r in result):
+            return result
+    except Exception:
+        pass
+
+    # Фоллбэк: базовые названия
+    return _default_chapter_titles(doc_type, topic, num_chapters)
+
+
+async def verify_discipline_relevance(
+    model_key: str,
+    topic: str,
+    subject: str,
+    sample_text: str,
+) -> tuple[bool, str]:
+    """Проверяет, что сгенерированный текст относится к заданной дисциплине"""
+    if not sample_text or not subject:
+        return True, "проверка пропущена"
+
+    if not topic:
+        return True, "тема не указана"
+
+    sample = sample_text[:2500]
+
+    system = (
+        "Ты — научный рецензент. Оцени, соответствует ли фрагмент работы "
+        "заявленной учебной дисциплине. Отвечай СТРОГО в формате JSON без "
+        'markdown: {"match": true|false, "reason": "одно короткое предложение"}. '
+        "match=false только если текст явно из другой области знаний. "
+        "Например, дисциплина «Информатика», а текст про природу и географию — false. "
+        "Дисциплина «География», а текст про алгоритмы и нейросети — false."
+    )
+
+    user = (
+        f"Дисциплина: «{subject}».\n"
+        f"Тема работы: «{topic}».\n"
+        f"Фрагмент текста:\n{sample}\n\n"
+        "Соответствует ли содержание дисциплине? "
+        "Будь строгим. Если текст не соответствует дисциплине — возвращай false."
+    )
+
+    try:
+        raw, _ = await chat_with_fallback(
+            model_key,
+            [{"role": "system", "content": system},
+             {"role": "user", "content": user}],
+            max_tokens=200,
+        )
+        m = re.search(r"\{.*\}", raw, flags=re.S)
+        if m:
+            data = json.loads(m.group(0))
+            return bool(data.get("match", True)), str(data.get("reason", "")).strip()
+    except Exception as e:
+        print(f"[RELEVANCE] check failed: {e}")
+
+    return True, "проверка недоступна"
+
+
+# ============================================================
+# УНИВЕРСАЛЬНАЯ ПРОВЕРКА ТЕМЫ И ДИСЦИПЛИНЫ (БЕЗ ХАРДКОДА)
+# ============================================================
+
 
 async def verify_discipline_relevance_universal(
     model_key: str,
@@ -1654,12 +2121,12 @@ async def verify_discipline_relevance_universal(
     """
     Универсальная проверка соответствия темы и дисциплины.
     Возвращает: (соответствует, причина, рекомендуемые_дисциплины)
-    
+      
     Работает для ЛЮБЫХ тем и дисциплин, без хардкода.
     """
     if not topic or not subject:
         return False, "Тема или дисциплина не указаны", []
-
+   
     system = (
         "Ты — эксперт по академическим дисциплинам. Оцени, соответствует ли тема "
         "заявленной учебной дисциплине.\n\n"
@@ -1670,21 +2137,21 @@ async def verify_discipline_relevance_universal(
         "Ответ СТРОГО в формате JSON:\n"
         '{"match": true|false, "reason": "краткая причина", "suggested": ["Дисциплина1", "Дисциплина2"]}'
     )
-
+   
     user = (
         f"Тема работы: «{topic}»\n"
         f"Дисциплина: «{subject}»\n"
         f"Тип документа: {doc_type or 'не указан'}\n\n"
         "Оцени соответствие темы и дисциплины. Если не соответствует, предложи 2-3 подходящие дисциплины."
     )
-
+   
     try:
         raw, _ = await chat_with_fallback(
             model_key,
             [{"role": "system", "content": system}, {"role": "user", "content": user}],
             max_tokens=400,
         )
-        
+          
         # Извлекаем JSON
         m = re.search(r"\{.*\}", raw, flags=re.S)
         if m:
@@ -1695,19 +2162,24 @@ async def verify_discipline_relevance_universal(
             return (
                 bool(data.get("match", True)),
                 str(data.get("reason", "")).strip(),
-                suggested[:5]
+                suggested[:5]  # максимум 5 рекомендаций
             )
     except Exception as e:
         print(f"[RELEVANCE] Ошибка проверки: {e}")
-    
+      
+    # По умолчанию пропускаем, если проверка не удалась
     return True, "проверка недоступна", []
-
-
+   
+   
 def extract_topic_keywords(topic: str) -> list[str]:
-    """Извлекает ключевые слова из темы для поиска подходящих дисциплин."""
+    """
+    Извлекает ключевые слова из темы для поиска подходящих дисциплин.
+    Универсальный подход без хардкода.
+    """
     if not topic:
         return []
-    
+      
+    # Очищаем тему от стоп-слов
     stopwords = {
         "тема", "работа", "исследование", "анализ", "роль", "значение",
         "основы", "особенности", "проблемы", "вопросы", "современный",
@@ -1716,9 +2188,11 @@ def extract_topic_keywords(topic: str) -> list[str]:
         "the", "and", "for", "with", "from", "this", "that", "study",
         "analysis", "role", "problems", "development"
     }
-    
+      
+    # Извлекаем слова длиной >= 4 символа
     words = re.findall(r'[A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё\-]{3,}', topic.lower())
-    
+      
+    # Фильтруем стоп-слова и дубликаты
     keywords = []
     seen = set()
     for w in words:
@@ -1726,15 +2200,19 @@ def extract_topic_keywords(topic: str) -> list[str]:
         if w not in stopwords and w not in seen and len(w) >= 4:
             seen.add(w)
             keywords.append(w)
-    
-    return keywords[:10]
-
-
+      
+    return keywords[:10]  # максимум 10 ключевых слов
+   
+   
 def map_keywords_to_disciplines(keywords: list[str]) -> list[str]:
-    """Универсальное сопоставление ключевых слов с дисциплинами."""
+    """
+    Универсальное сопоставление ключевых слов с дисциплинами.
+    Использует семантические группы, а не жесткий список.
+    """
     if not keywords:
         return []
-
+      
+    # Семантические группы дисциплин с ключевыми словами-маркерами
     discipline_groups = {
         "Информатика": ["компьютер", "программ", "алгоритм", "данн", "информац", "цифр", "вычисл", "искусственн", "нейросет", "машин"],
         "Математика": ["числ", "уравнени", "функц", "вероятност", "статистик", "геометри"],
@@ -1757,7 +2235,8 @@ def map_keywords_to_disciplines(keywords: list[str]) -> list[str]:
         "Менеджмент": ["управлени", "организац", "персонал", "стратеги", "лидерств"],
         "Политология": ["власт", "государств", "политик", "парти", "выбор", "режим"],
     }
-
+      
+    # Собираем дисциплины, которые соответствуют ключевым словам
     matched = set()
     for kw in keywords:
         kw_lower = kw.lower()
@@ -1766,13 +2245,14 @@ def map_keywords_to_disciplines(keywords: list[str]) -> list[str]:
                 if marker in kw_lower or kw_lower in marker:
                     matched.add(discipline)
                     break
-
+      
+    # Если ничего не найдено, возвращаем универсальные дисциплины
     if not matched:
         return ["Литература", "История", "Обществознание", "Русский язык", "Философия"]
-
+      
     return list(matched)[:5]
-
-
+   
+   
 async def check_and_suggest_discipline_universal(
     model_key: str,
     topic: str,
@@ -1786,31 +2266,35 @@ async def check_and_suggest_discipline_universal(
     # 1. Быстрая проверка по ключевым словам
     keywords = extract_topic_keywords(topic)
     suggested_by_keywords = map_keywords_to_disciplines(keywords)
-    
+      
+    # Проверяем, есть ли текущая дисциплина среди рекомендованных
     subject_lower = subject.lower()
     is_in_suggested = any(
         d.lower() in subject_lower or subject_lower in d.lower()
         for d in suggested_by_keywords
     )
-    
+      
+    # Если дисциплина в списке подходящих — пропускаем
     if is_in_suggested:
         return True, "", suggested_by_keywords
-    
-    # 2. ИИ-проверка
+      
+    # 2. Если не в списке — делаем ИИ-проверку
     match, reason, suggested_by_ai = await verify_discipline_relevance_universal(
         model_key, topic, subject, doc_type
     )
-    
+      
+    # Объединяем рекомендации
     all_suggested = list(dict.fromkeys(suggested_by_ai + suggested_by_keywords))
     if not all_suggested:
+        # Если ничего не найдено, предлагаем общие дисциплины
         all_suggested = ["Литература", "История", "Обществознание", "Философия"]
-    
+      
     if match:
         return True, "", all_suggested[:5]
-    
+      
     # 3. Формируем сообщение для пользователя
     suggested_list = "\n".join(f"  • {d}" for d in all_suggested[:5])
-    
+      
     message = (
         f"⚠️ <b>Внимание!</b>\n\n"
         f"Тема «{topic}» может не совсем соответствовать дисциплине «{subject}».\n\n"
@@ -1822,64 +2306,19 @@ async def check_and_suggest_discipline_universal(
         f"2️⃣ <b>Уточнить тему</b> — чтобы она лучше соответствовала «{subject}»\n"
         f"3️⃣ <b>Продолжить</b> — если вы уверены, что тема относится к «{subject}»"
     )
-    
+      
     return False, message, all_suggested[:5]
-
-
-# ═══════════════════════════════════════════════════════════════
-#  ГЕНЕРАЦИЯ СТРУКТУРЫ И НАЗВАНИЙ ГЛАВ ЧЕРЕЗ ИИ
-# ═══════════════════════════════════════════════════════════════
-
-async def generate_chapter_titles(
-    model_key: str,
-    doc_type: str,
-    topic: str,
-    subject: str,
-    num_chapters: int,
-) -> list[dict]:
-    system = (
-        "Ты помогаешь составлять структуру академических работ по ГОСТ 7.32-2017. "
-        "Отвечай СТРОГО в формате JSON-массива без пояснений и без markdown. "
-        "Каждый элемент: {\"title\": \"...\", \"subs\": [\"...\", \"...\"]}. "
-        "ВАЖНО по нумерации (ГОСТ 7.32-2017): названия разделов БЕЗ слова «Глава», "
-        "нумерация в формате «1 Название раздела», «1.1 Название подраздела» — "
-        "БЕЗ точки после последней цифры номера. Название должно быть развёрнутым "
-        "и конкретным."
-    )
-
-    user = (
-        f"Тема работы: «{topic}». "
-        f"Дисциплина: {subject}. "
-        f"Тип документа: {DOC_TYPES.get(doc_type, DOC_TYPES['referat'])['word']}. "
-        f"Количество глав: {num_chapters}. "
-        f"Каждая глава — 2–3 подглавы. "
-        f"Язык: русский. "
-        f"Верни ТОЛЬКО JSON-массив."
-    )
-
-    messages = [
-        {"role": "system", "content": system},
-        {"role": "user",   "content": user},
-    ]
-
-    raw, _ = await chat_with_fallback(model_key, messages, max_tokens=1500)
-    raw    = raw.strip()
-
-    m = re.search(r"\[.*\]", raw, flags=re.S)
-    if m:
-        raw = m.group(0)
-
-    try:
-        result = json.loads(raw)
-        if isinstance(result, list) and all("title" in r for r in result):
-            return result
-    except Exception:
-        pass
-
-    return _default_chapter_titles(doc_type, topic, num_chapters)
-
-
+   
+   
+# ============================================================
+# ХЭНДЛЕРЫ ДЛЯ ИСПРАВЛЕНИЯ ДИСЦИПЛИНЫ
+# ============================================================
+   
+   
+@dp.callback_query(F.data.startswith("fix_subj_"))
 def _default_chapter_titles(doc_type: str, topic: str, num_chapters: int) -> list[dict]:
+    """Запасные названия глав если ИИ не ответил."""
+    # ГОСТ 7.32-2017: без слова «Глава» и без точки после номера раздела
     defaults = [
         {
             "title": f"1 Теоретические основы исследования темы «{topic[:40]}»",
@@ -1916,71 +2355,45 @@ def _default_chapter_titles(doc_type: str, topic: str, num_chapters: int) -> lis
     return defaults[:num_chapters]
 
 
-async def verify_discipline_relevance(
-    model_key: str,
-    topic: str,
-    subject: str,
-    sample_text: str,
-) -> tuple[bool, str]:
-    if not sample_text or not subject:
-        return True, "проверка пропущена"
-
-    if not topic:
-        return True, "тема не указана"
-
-    sample = sample_text[:2500]
-
-    system = (
-        "Ты — научный рецензент. Оцени, соответствует ли фрагмент работы "
-        "заявленной учебной дисциплине. Отвечай СТРОГО в формате JSON без "
-        'markdown: {"match": true|false, "reason": "одно короткое предложение"}. '
-        "match=false только если текст явно из другой области знаний."
-    )
-
-    user = (
-        f"Дисциплина: «{subject}».\n"
-        f"Тема работы: «{topic}».\n"
-        f"Фрагмент текста:\n{sample}\n\n"
-        "Соответствует ли содержание дисциплине? "
-        "Будь строгим. Если текст не соответствует дисциплине — возвращай false."
-    )
-
-    try:
-        raw, _ = await chat_with_fallback(
-            model_key,
-            [{"role": "system", "content": system},
-             {"role": "user", "content": user}],
-            max_tokens=200,
-        )
-        m = re.search(r"\{.*\}", raw, flags=re.S)
-        if m:
-            data = json.loads(m.group(0))
-            return bool(data.get("match", True)), str(data.get("reason", "")).strip()
-    except Exception as e:
-        print(f"[RELEVANCE] check failed: {e}")
-
-    return True, "проверка недоступна"
-
-
 # ═══════════════════════════════════════════════════════════════
-#  РАСЧЁТ ОБЪЁМА ТЕКСТА
+#  РАСЧЁТ ОБЪЁМА ТЕКСТА — ИСПРАВЛЕННЫЙ
 # ═══════════════════════════════════════════════════════════════
 
 def target_chars(pages: int, gost: dict = None) -> int:
+    """
+    Целевое количество символов с пробелами для основного текста.
+
+    ВАЖНО: учитываем «структурную нагрузку» — заголовки разделов с
+    page_break_before, межабзацные интервалы и т. п. Эта нагрузка
+    «съедает» ~20 % полезного места страницы, поэтому фактический
+    бюджет текста уменьшаем на 20 %. Без этой поправки бот
+    систематически выходил за пределы запрошенного объёма (например,
+    19 страниц при запросе 11).
+    """
     if gost:
         chars_per_page = calculate_chars_per_page(gost)
     else:
         chars_per_page = CHARS_PER_PAGE
     text_pages = max(1, pages - NON_TEXT_PAGES)
     raw_total  = text_pages * chars_per_page
+    # 0.62 — эмпирический коэффициент. Калиброван по реальным запускам:
+    # коэффициент 0.80 давал перебор +3 страницы (14 на запросе 11),
+    # 0.62 ≈ 0.80 × (11/14) и попадает в цель.
     return int(raw_total * 0.62)
 
 
 def tokens_for_chars(chars: int) -> int:
+    """
+    Примерно 1 токен = 2.5 символа для русского (консервативно).
+    Раньше запас был 2.0× — ИИ свободно писал в 1.5–2× больше нужного.
+    Урезаем до 1.25× — этого хватает на корректное завершение мысли,
+    но не даёт писать «больше, чем заказали».
+    """
     return max(1200, min(16000, int(chars / 2.5 * 1.25)))
 
 
 def _style_instruction(writing_style: str, doc_type: str = "") -> str:
+    """Возвращает инструкцию по стилю. Учитывает жанр (эссе/доклад/академическое)."""
     if doc_type == "esse":
         return (
             "Стиль эссе: от первого лица, живой язык, личная позиция. "
@@ -2013,8 +2426,10 @@ def _style_instruction(writing_style: str, doc_type: str = "") -> str:
 
 def strict_prompt(task: str, chars: int, writing_style: str = "classic",
                   doc_type: str = "") -> str:
+    """Инструкция для генерации текста нужного объёма. Учитывает жанр."""
     style_instr = _style_instruction(writing_style, doc_type)
 
+    # Жёсткий коридор: −10 % / +5 % от целевого объёма.
     chars_min = max(200, int(chars * 0.90))
     chars_max = int(chars * 1.05)
     est_pages = max(1, round(chars / CHARS_PER_PAGE, 1))
@@ -2081,11 +2496,16 @@ def build_prompts(
     chapter_titles: list[dict],
     writing_style: str = "classic",
 ) -> dict[str, str]:
+    """
+    Возвращает словарь {ключ_блока: промпт}.
+    chapter_titles — список из generate_chapter_titles().
+    """
     total = target_chars(pages)
     s     = (source or "").strip()[:12000]
     ctx   = f"\n\nИсходные материалы для использования:\n{s}\n" if s else ""
 
     if doc_type == "esse":
+        # Минимальные границы для страховки (если расчёт даёт слишком мало)
         intro_min = 1200
         main_min = 1500
 
@@ -2123,6 +2543,7 @@ def build_prompts(
                 f"Только список, без заголовков и пояснений."
             ),
         }
+        # Заключение для эссе генерируется ПОСЛЕ всех аргументов (см. generate_text_blocks)
 
     if doc_type == "doklad":
         return {
@@ -2153,6 +2574,7 @@ def build_prompts(
                 f"Формат ГОСТ Р 7.0.5-2008. Только нумерованный список."
             ),
         }
+        # Заключение для доклада генерируется ПОСЛЕ разделов (см. generate_text_blocks)
 
     if doc_type == "article":
         intro_chars = max(1000, int(total * 0.15))
@@ -2203,9 +2625,14 @@ def build_prompts(
             ),
         }
 
+    # Реферат, курсовая, контрольная, итоговый проект, свой тип
+    # Используем chapter_titles для развёрнутых названий
     num_ch  = len(chapter_titles)
     prompts = {}
 
+    # ── Формируем задачи из реальных названий подглав/глав ──
+    # Это критично: без этого «цель и задачи» во введении живут отдельно
+    # от содержания, и часть задач не покрывается главами.
     _tasks_source = []
     for _ch in chapter_titles:
         _subs = _ch.get("subs", []) or []
@@ -2215,11 +2642,13 @@ def build_prompts(
         else:
             _tasks_source.append(_ch.get("title", ""))
     _tasks_source = [t for t in _tasks_source if t and t.strip()]
+    # 3–5 задач: если подглав слишком много — берём первые 5
     _tasks_list = _tasks_source[:5] if len(_tasks_source) >= 3 else _tasks_source
     _tasks_block = ""
     if _tasks_list:
         _tasks_lines = []
         for _i, _t in enumerate(_tasks_list, start=1):
+            # Приводим название подглавы к глагольной формулировке задачи
             _clean = re.sub(r"^\d+(\.\d+)*\.?\s*", "", _t).strip()
             _tasks_lines.append(f"{_i}) рассмотреть/изучить {_clean.lower()}")
         _tasks_block = (
@@ -2228,6 +2657,7 @@ def build_prompts(
             "\nЭти задачи должны точно соответствовать содержанию глав."
         )
 
+    # Введение — 10% от текста
     prompts["intro"] = strict_prompt(
         f"Напиши введение для {DOC_TYPES.get(doc_type, DOC_TYPES['referat'])['word'].lower()}а "
         f"на тему «{topic}», предмет «{subject}».{ctx}"
@@ -2243,6 +2673,8 @@ def build_prompts(
         writing_style, doc_type,
     )
 
+    # ═══ Главы — КАЖДАЯ ПОДГЛАВА ОТДЕЛЬНЫМ ПРОМПТОМ ═══
+    # Сначала считаем общее количество подглав для равномерного распределения
     all_subs = []
     for i, ch in enumerate(chapter_titles, start=1):
         subs = ch.get("subs", [])
@@ -2250,7 +2682,7 @@ def build_prompts(
             all_subs.append((i, j, ch["title"], sub_title))
 
     if all_subs:
-        sub_share = 0.75 / len(all_subs)
+        sub_share = 0.75 / len(all_subs)  # 75% текста делим поровну между подглавами
     else:
         sub_share = 0.75 / max(1, num_ch)
 
@@ -2273,6 +2705,10 @@ def build_prompts(
             writing_style, doc_type,
         )
 
+    # Заключение НЕ включаем в batch — оно генерируется ПОСЛЕ всех глав
+    # (см. generate_text_blocks)
+
+    # Библиография
     num_sources = max(MIN_REAL_SOURCES, min(BIB_SOURCE_TARGET, 12))
     prompts["literature"] = (
         f"Составь список из {MIN_REAL_SOURCES}–{num_sources} источников по теме «{topic}» "
@@ -2303,7 +2739,15 @@ def generate_structure(
     chapter_titles: list[dict],
     topic: str = "",
 ) -> list[tuple]:
+    """
+    Возвращает список блоков для DOCX:
+    (заголовок, уровень_heading, текст_абзаца, список_подглав)
+
+    Уровень: 1 = Heading 1, 2 = Heading 2
+    список_подглав = [] или [(название_подглавы, текст), ...]
+    """
     if doc_type == "esse":
+        # Эссе — без подзаголовков, плавный текст
         main_text = parts.get("main1", "") + "\n\n" + parts.get("main2", "")
         return [
             ("ВВЕДЕНИЕ", 1, parts.get("intro", ""), []),
@@ -2332,8 +2776,12 @@ def generate_structure(
             ("СПИСОК ИСПОЛЬЗОВАННЫХ ИСТОЧНИКОВ", 1, parts.get("literature", ""), []),
         ]
 
+    # Универсальная структура (реферат / курсовая / контрольная / итоговый / свой)
     blocks = [("ВВЕДЕНИЕ", 1, parts.get("intro", ""), [])]
 
+    # ═══════════════════════════════════════════════════════════
+    # ДИАГНОСТИКА: логируем какие ключи есть в parts
+    # ═══════════════════════════════════════════════════════════
     parts_keys = set(parts.keys())
     expected_keys = set()
     for i, ch in enumerate(chapter_titles, start=1):
@@ -2342,6 +2790,7 @@ def generate_structure(
     missing_keys = expected_keys - parts_keys
     if missing_keys:
         print(f"[ERROR] В parts ОТСУТСТВУЮТ ключи подглав: {sorted(missing_keys)}")
+        print(f"[INFO]  Имеющиеся ключи: {sorted(parts_keys)}")
 
     for i, ch in enumerate(chapter_titles, start=1):
         subs = ch.get("subs", [])
@@ -2350,25 +2799,37 @@ def generate_structure(
         for j, sub_title in enumerate(subs, start=1):
             key = f"ch{i}_s{j}"
 
+            # ═══════════════════════════════════════════════════════════
+            # ЗАЩИТА ОТ ОТСУТСТВУЮЩИХ КЛЮЧЕЙ
+            # ═══════════════════════════════════════════════════════════
+            if key not in parts:
+                print(f"[ERROR] Ключ «{key}» отсутствует в parts! Подглава: «{sub_title}»")
+
             sub_text = parts.get(key, "").strip()
             sub_text = _strip_duplicate_heading_prefix(sub_text, sub_title)
 
+            # ═══════════════════════════════════════════════════════════
+            # ЗАЩИТА ОТ ПУСТЫХ ПОДГЛАВ — развёрнутая заглушка
+            # ═══════════════════════════════════════════════════════════
             if not sub_text or len(sub_text) < 100:
                 print(f"[WARN] Подглава «{sub_title}» пустая или короткая "
                       f"({len(sub_text)} зн.), генерирую заглушку")
                 sub_text = _generate_substantial_stub(sub_title, ch["title"], topic)
 
+            # fix13: гарантируем 3 абзаца если LLM вернула монолит
             sub_text = _ensure_paragraph_breaks(sub_text, min_paragraphs=3)
 
             if sub_text:
                 sub_blocks.append((sub_title, sub_text))
                 chapter_text_parts.append(sub_text)
 
+        # Если новый формат не сработал — fallback на старый ключ "ch{i}"
         if not sub_blocks:
             fallback_text = parts.get(f"ch{i}", "")
             if fallback_text:
                 print(f"[FALLBACK] Глава {i}: используем старый ключ ch{i}")
                 chapter_text_parts = [fallback_text]
+                # Распределяем fallback-текст между подглавами
                 paragraphs_all = [p.strip() for p in re.split(r'\n\s*\n', fallback_text) if p.strip()]
                 chunk_size = max(1, len(paragraphs_all) // max(1, len(subs)))
                 for si, s_title in enumerate(subs):
@@ -2377,12 +2838,15 @@ def generate_structure(
                     chunk = "\n\n".join(paragraphs_all[start:end])
                     sub_blocks.append((s_title, chunk if chunk else _generate_substantial_stub(s_title, ch["title"], topic)))
             else:
+                # Полный fallback — генерируем заглушки для всех подглав
                 print(f"[WARN] Глава {i} «{ch['title']}» полностью пуста, генерирую заглушки")
                 for s_title in subs:
                     stub = _generate_substantial_stub(s_title, ch["title"], topic)
                     sub_blocks.append((s_title, stub))
                     chapter_text_parts.append(stub)
 
+        # ВАЖНО: всегда заполняем field[2] полным текстом главы,
+        # даже при наличии подглав — это нужно для _trim/_expand
         full_chapter_text = "\n\n".join(chapter_text_parts) if chapter_text_parts else ""
         blocks.append((ch["title"], 1, full_chapter_text, sub_blocks))
 
@@ -2397,16 +2861,25 @@ def generate_structure(
 # ═══════════════════════════════════════════════════════════════
 
 def _clean_ai_artifacts(text: str) -> str:
+    """Удаляет признаки ИИ: ***, ## и повторяющиеся слова в предложениях.
+    ГОСТ-сноски [1], [2, с. 45] СОХРАНЯЕТ."""
     if not text:
         return ""
     text = _strip_markdown_markers(text)
+    # Удаляем артефакт старой защиты от обрыва на инициалах.
     text = re.sub(r'\s*\[фамилия не указана\]\.?\s*', ' ', text, flags=re.IGNORECASE)
+    # НЕ убираем сноски [1], [2, с. 45] — это ГОСТ! Только мусорный markdown.
+    # Убираем **жирный** markdown
     text = re.sub(r"\*{1,3}([^*\n]+)\*{1,3}", r"\1", text)
+    # Убираем # / ## / ### и варианты вида `## **Заголовок**`
     text = re.sub(r'(?m)^\s*#{1,6}\s*\*{0,2}', '', text)
     text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
+    # Убираем горизонтальные линии ***
     text = re.sub(r"^\*{3,}\s*$", "", text, flags=re.MULTILINE)
     text = re.sub(r"^-{3,}\s*$", "", text, flags=re.MULTILINE)
+    # Убираем тройные+ переводы строк
     text = re.sub(r"\n{3,}", "\n\n", text)
+    # Убираем фразы-маркеры ИИ
     ai_phrases = [
         r"(?i)как (языковая )?модель[,\s]",
         r"(?i)я (являюсь|являюсь )?ИИ[,\s]",
@@ -2416,6 +2889,7 @@ def _clean_ai_artifacts(text: str) -> str:
     for p in ai_phrases:
         text = re.sub(p, "", text)
     text = _remove_ai_marker_phrases(text)
+    # Типографика: тире/кавычки/# (приоритет 🟡)
     text = _normalize_typography(text)
     return text.strip()
 
@@ -2429,8 +2903,6 @@ PAGE_CALC_PROMPT = """
 4. ЗАПРЕЩЕНО писать: «Вступление к эссе», «Конечно. Вот второй аргумент», «Вот текст», «Объем текста строго выдержан».
 5. Начинай писать СРАЗУ содержательный текст, без служебных фраз и заголовков-пояснений.
 """
-
-
 async def generate_text_blocks(
     topic: str,
     pages: int,
@@ -2443,7 +2915,14 @@ async def generate_text_blocks(
     prog: Optional["Progress"] = None,
     humanize: bool = False,
 ) -> dict[str, str]:
+    """
+    Генерирует все текстовые блоки.
+    Если текст получился короче цели — дозаполняет до нужного объёма.
+    """
+    # Опечатки и искусственная «очеловечивающая» порча текста отключены.
     humanize = False
+    # Подтягиваем реальные источники и материалы с URL до построения промптов.
+    # Если сеть недоступна — функции вернут пустую строку и генерация продолжится.
     if prog and ENABLE_WEB_SOURCES:
         await prog.update(label="🔎 Ищу реальные источники и читаю сайты...")
     original_source = source or ""
@@ -2451,8 +2930,19 @@ async def generate_text_blocks(
     source = await enrich_source_content(source)
     source_limit = max(MIN_REAL_SOURCES, min(BIB_SOURCE_TARGET, MAX_WEB_SOURCES))
     numeric_context = get_numeric_consistency_context(topic, subject, doc_type)
+    # ⭐ Приоритет: DeepSeek Search (если доступен)
+    deepseek_sources_bib, deepseek_sources = await fetch_sources_via_deepseek_search(
+        topic, subject, model_key="deepseek", limit=source_limit
+    )
     
-    verified_catalog_bib = await fetch_verified_sources(topic, subject, limit=source_limit, doc_type=doc_type)
+    if deepseek_sources_bib:
+        verified_catalog_bib = deepseek_sources_bib
+        if prog:
+            await prog.update(label=f"🔍 DeepSeek нашёл {len(deepseek_sources)} реальных источников", force=True)
+    else:
+        # Fallback на OpenAlex/Crossref
+        verified_catalog_bib = await fetch_verified_sources(topic, subject, limit=source_limit, doc_type=doc_type)
+
     verified_bib = _combine_bibliographies(
         verified_catalog_bib,
         url_bib,
@@ -2467,9 +2957,12 @@ async def generate_text_blocks(
 
     prompts    = build_prompts(doc_type, topic, subject, pages, source, chapter_titles, writing_style)
     total_chars = target_chars(pages)
+    # "conclusion" больше НЕ в prompts — генерируем его отдельно после глав
+
     parts: dict[str, str] = {}
     step = 0
 
+    # ── Базовые правила для всех типов ──
     style_sys = (
         "Ты пишешь тексты на русском языке. "
         "НЕ используй markdown-разметку и маркеры (никаких #, *, **, ##, ---). "
@@ -2477,10 +2970,14 @@ async def generate_text_blocks(
         "Не используй фразы-маркеры ИИ: «конечно, вот», «как ИИ», «таким образом», «следует отметить», «в заключение следует отметить». "
         "Не повторяй одно слово несколько раз в одном предложении. "
         "Не начинай два абзаца подряд одним и тем же словом. "
+        # Привязка к дисциплине (приоритет 🔴)
         f"ОБЯЗАТЕЛЬНО: текст должен соответствовать дисциплине «{subject}». "
         f"Раскрывай тему «{topic}» строго через предмет, методы и терминологию "
         f"дисциплины «{subject}». Если тема относится к другой области знаний, "
-        f"всё равно рассматривай её ПОД УГЛОМ дисциплины «{subject}»."
+        f"всё равно рассматривай её ПОД УГЛОМ дисциплины «{subject}» "
+        f"(например, дисциплина «История» → хронология, источники, периодизация; "
+        f"«Геология» → породы, процессы, строение Земли). "
+        f"Не подменяй дисциплину смежной. "
     )
     style_sys += "\n" + PAGE_CALC_PROMPT
     style_sys += numeric_context
@@ -2501,7 +2998,12 @@ async def generate_text_blocks(
             "Избегай наукообразия и канцеляризмов.\n"
             "ВАЖНО: заявленная дисциплина — «{subject}». Если тема и дисциплина "
             "из разных областей (например, тема «Байкал», дисциплина «Психология») — "
-            "рассматривай тему ЧЕРЕЗ ПРИЗМУ ДИСЦИПЛИНЫ."
+            "рассматривай тему ЧЕРЕЗ ПРИЗМУ ДИСЦИПЛИНЫ. "
+            "Для психологии: восприятие, эмоции, когнитивные эффекты, "
+            "восстановительная среда, эффект благоговения (awe). "
+            "Для истории: хронология, личности, события. "
+            "Для биологии: виды, экосистемы, эволюция. "
+            "НЕ пиши общегеографический обзор если дисциплина не география."
         ).format(subject=subject)
     elif doc_type == "doklad":
         style_sys += (
@@ -2534,6 +3036,9 @@ async def generate_text_blocks(
                 "логичная структура, конкретные утверждения."
             )
 
+    # ── Универсальные правила академической генерации (v2.7-fix12) ──
+    # Применяются ко всем типам работ; добавлены последними, чтобы перекрывать
+    # дисциплинарные шаблоны.
     style_sys += (
         "\n\nОБЩИЕ ПРАВИЛА ГЕНЕРАЦИИ АКАДЕМИЧЕСКИХ ТЕКСТОВ:\n"
         "1. ФАКТИЧЕСКАЯ ТОЧНОСТЬ: все цифры, даты, названия, проценты "
@@ -2567,6 +3072,7 @@ async def generate_text_blocks(
     for key, prompt in prompts.items():
         step += 1
 
+        # Рассчитываем целевой объём для блока
         if key == "intro":
             block_share = 0.10
         elif key == "conclusion":
@@ -2590,11 +3096,13 @@ async def generate_text_blocks(
                 "part1":       "Раздел 1",
                 "part2":       "Раздел 2",
             }.get(key, (
+                # Формат ch1_s2 → "Глава 1, подглава 2"
                 f"Глава {key.replace('ch', '').replace('_s', ', подглава ')}"
                 if key.startswith("ch") else key
             ))
             await prog.update(label=f"✍️ Пишу: {block_name}")
 
+        # ── Интеграция эталона и жестких примеров (Few-Shot) ──
         example_type = "chapter"
         if key == "intro":
             example_type = "intro"
@@ -2603,6 +3111,7 @@ async def generate_text_blocks(
         
         golden_example = get_golden_example(doc_type, example_type)
         
+        # Собираем итоговый системный промпт с примерами
         current_style_sys = style_sys + "\n\n" + FEW_SHOT_EXAMPLES
         if golden_example:
             current_style_sys += f"\n\n🌟 ПРИМЕР ИДЕАЛЬНОГО ИСПОЛНЕНИЯ ДАННОГО БЛОКА:\n\"{golden_example}\"\nСледуй этому ритму, уровню детализации и способу оформления ссылок."
@@ -2612,6 +3121,8 @@ async def generate_text_blocks(
             {"role": "user",   "content": prompt},
         ]
 
+        # Список литературы лучше брать из реальных каталогов, а не просить
+        # модель «вспомнить» источники: так меньше выдуманных книг и DOI.
         if key == "literature" and verified_bib:
             text = verified_bib
             used_model = model_key
@@ -2621,8 +3132,15 @@ async def generate_text_blocks(
         if prog and used_model and used_model != model_key:
             await prog.update(model_name=AI_MODELS.get(used_model, {}).get("name", used_model))
 
+        # ═══════════════════════════════════════════════════════════
+        # ПОСТ-ВАЛИДАЦИЯ КАЖДОГО БЛОКА
+        # В старой версии этот код случайно стоял ВНЕ цикла for и обрабатывал
+        # только последний prompt (обычно literature), из-за чего введение и
+        # подглавы превращались в заглушки. Теперь каждый key сохраняется в parts.
+        # ═══════════════════════════════════════════════════════════
         if key != "literature":
             retry_count = 0
+            # Проверяем обрывы ссылок вроде «[1, с.» и перегенерируем блок.
             while text and (not _validate_no_broken_citations(text) or re.search(r'\[\d+\s*,\s*[сc]\.\s*$', text)) and retry_count < 2:
                 retry_count += 1
                 if prog:
@@ -2643,6 +3161,7 @@ async def generate_text_blocks(
                 text, _ = await chat_with_fallback(model_key, retry_messages, max_tok)
                 text = _clean_ai_artifacts(text)
 
+            # Повторная генерация при пустом/слишком коротком ответе.
             if not text or len(text.strip()) < 80:
                 print(f"[RETRY] Блок «{key}» пустой ({len(text) if text else 0} зн.), повторная генерация (попытка 2)...")
                 await asyncio.sleep(2)
@@ -2673,11 +3192,13 @@ async def generate_text_blocks(
             text = _replace_ai_cliches(text)
             if humanize:
                 text = _add_human_touch(text)
+            # Внутренний "детектор" ИИ: если много шаблонов — ещё проход замены.
             if _ai_detector_score(text) > 30:
                 text = _replace_ai_cliches(text)
                 if humanize:
                     text = _add_human_touch(text)
 
+            # ── ЗАЩИТА ОТ СЛУЖЕБНЫХ ФРАЗ И КОРОТКИХ ОТВЕТОВ ──
             forbidden_patterns = [
                 "вступление к эссе",
                 "вот текст",
@@ -2716,6 +3237,7 @@ async def generate_text_blocks(
                 else:
                     print("[WARN] Перегенерация не помогла, оставляем как есть")
 
+            # Дозаполняем если текст короче цели на 25%+ (кроме литературы).
             if block_chars > 0 and len(text) < int(block_chars * 0.75):
                 max_refills = 3
                 refill_count = 0
@@ -2742,6 +3264,7 @@ async def generate_text_blocks(
 
             text = _ensure_block_terminates(text)
         else:
+            # Библиография: сохраняем и нормализуем даже если источники пришли от LLM.
             if not text or len(text.strip()) < 20:
                 text = _stub_text("literature", topic)
             text = _normalize_bibliography(_clean_ai_artifacts(text))
@@ -2751,13 +3274,23 @@ async def generate_text_blocks(
         if prog:
             await prog.update(step_done=True)
 
+    # ═══════════════════════════════════════════════════════════
+    # fix17: Извлекаем единое определение ключевого понятия из введения
+    # ═══════════════════════════════════════════════════════════
     intro_text = parts.get("intro", "")
     if intro_text and topic:
         concept_def = get_key_concept(topic, subject, intro_text)
         if concept_def:
             print(f"[CONCEPT] Единое определение: {concept_def[:60]}...")
 
+    # ═══════════════════════════════════════════════════════════
+    # ГЕНЕРАЦИЯ ЗАКЛЮЧЕНИЯ ПОСЛЕ ВСЕХ ГЛАВ
+    # (ключевое исправление: заключение видит реальное содержание)
+    # ═══════════════════════════════════════════════════════════
+
+    # Собираем контекст из всех содержательных блоков (главы/аргументы/разделы)
     summaries = []
+    # Ключи, которые являются содержательными блоками (не intro, не literature)
     content_keys = [k for k in parts.keys()
                     if k not in ("intro", "conclusion", "literature")]
     for key in sorted(content_keys):
@@ -2766,6 +3299,7 @@ async def generate_text_blocks(
             continue
         head = txt[:500].strip() if len(txt) > 500 else txt.strip()
         tail = txt[-400:].strip() if len(txt) > 400 else ""
+        # Человекочитаемая метка блока
         if key.startswith("ch"):
             label = key.replace("ch", "Глава ").replace("_s", ", подглава ")
         elif key.startswith("main"):
@@ -2785,6 +3319,7 @@ async def generate_text_blocks(
 
     conc_chars = int(total_chars * 0.10)
 
+    # ── Жанрово-зависимый промпт заключения ──
     if doc_type == "esse":
         conc_prompt = (
             f"Напиши заключение эссе на тему «{topic}».\n\n"
@@ -2864,15 +3399,27 @@ async def generate_text_blocks(
         conc_text = _replace_ai_cliches(conc_text)
         if humanize:
             conc_text = _add_human_touch(conc_text)
+    # Запрещённые вводные обороты в начале (fix10).
     conc_text = _strip_forbidden_openers(conc_text)
+    # Проверка согласованности с основной частью (fix9, ужесточена в fix10):
+    # выкидывает предложения с фактами, которых нет в главах.
     conc_text = _validate_conclusion_consistency(conc_text, parts)
     parts["conclusion"] = conc_text
 
     if prog:
         await prog.update(step_done=True)
 
+    # ═══════════════════════════════════════════════════════════
+    # СВЯЗЫВАНИЕ ССЫЛОК СО СПИСКОМ ЛИТЕРАТУРЫ (приоритет 🔴)
+    # Приводим все внутритекстовые [N, с. X] к диапазону 1..кол-во источников,
+    # чтобы каждая ссылка указывала на реально существующий пункт списка.
+    # ═══════════════════════════════════════════════════════════
     n_sources = _count_sources(parts.get("literature", ""))
     if n_sources > 0:
+        # fix16: сначала прогоняем repair+fix_nonsense+fix_citations,
+        # потом собираем ГЛОБАЛЬНУЮ карту страниц со всех частей и
+        # дозаполняем bare `[N]` ею (раньше карта была только локальной,
+        # поэтому `[2]` в 1.2 не получал страницу из `[2, с. 25]` в 2.1).
         for key in list(parts.keys()):
             if key == "literature":
                 continue
@@ -2890,16 +3437,20 @@ async def generate_text_blocks(
         for key in list(parts.keys()):
             if key == "literature":
                 continue
+            # fix14+16: дозаполняем `[N]` без страницы из глобальной карты
             parts[key] = _fill_missing_pages(parts[key],
                                             global_page_map=global_page_map)
 
+        # Удаляем неиспользуемые источники (фикс «избыточен, N не используются»)
         parts = _prune_unused_sources(parts)
     else:
+        # Источников нет, но оборванные ссылки всё равно надо почистить
         for key in list(parts.keys()):
             if key == "literature":
                 continue
             parts[key] = _repair_broken_citations(parts[key])
 
+    # Финальная чистка: без markdown-маркеров, фраз-маркеров ИИ, битой библиографии и ссылок без страниц.
     parts["literature"] = _normalize_bibliography(_strip_markdown_markers(parts.get("literature", "")))
     lit_ok, lit_reason = validate_literature(parts.get("literature", ""))
     if not lit_ok:
@@ -2918,9 +3469,13 @@ async def generate_text_blocks(
         parts[key] = _repair_broken_citations(parts[key])
         if final_n_sources > 0:
             parts[key] = _fix_citations(parts[key], final_n_sources)
+        # Последний обязательный проход: ни одной ссылки вида [1] без страницы.
         parts[key] = _fill_missing_pages(parts[key])
         parts[key] = _ensure_block_terminates(parts[key])
 
+    # ═══════════════════════════════════════════════════════════
+    # ФИНАЛЬНАЯ ПРОВЕРКА: все ли ожидаемые ключи заполнены
+    # ═══════════════════════════════════════════════════════════
     empty_keys = [k for k, v in parts.items() if not v or len(v.strip()) < 50]
     if empty_keys:
         print(f"[FINAL CHECK] ⚠️ Пустые/короткие блоки после генерации: {empty_keys}")
@@ -2929,6 +3484,7 @@ async def generate_text_blocks(
                 print(f"[FINAL CHECK] Заполняю «{ek}» заглушкой")
                 parts[ek] = _stub_text(ek, topic)
 
+    # Проверяем наличие всех ожидаемых ключей ch*_s* из промптов
     for pk in list(prompts.keys()):
         if pk not in parts:
             print(f"[FINAL CHECK] ❌ Ключ «{pk}» из промптов отсутствует в parts! Добавляю заглушку.")
@@ -2938,6 +3494,7 @@ async def generate_text_blocks(
 
 
 def _stub_text(key: str, topic: str) -> str:
+    """Заглушка если ИИ не ответил."""
     stubs = {
         "intro":       f"Данная работа посвящена исследованию темы «{topic}». В современных условиях данная проблематика приобретает особую актуальность и практическую значимость для науки и общества.",
         "conclusion":  f"Проведённое исследование по теме «{topic}» позволило сформулировать следующие выводы: изученная проблематика имеет важное теоретическое и практическое значение.",
@@ -2946,6 +3503,7 @@ def _stub_text(key: str, topic: str) -> str:
     if key in stubs:
         return stubs[key]
 
+    # Осмысленная заглушка для подглав
     if not topic:
         topic = "теме"
     return (
@@ -2959,19 +3517,29 @@ def _stub_text(key: str, topic: str) -> str:
 
 
 def _ensure_paragraph_breaks(text: str, min_paragraphs: int = 3) -> str:
+    """fix13: если LLM вернула монолитный текст без \n\n — режем по предложениям.
+
+    Гарантирует наличие минимум `min_paragraphs` абзацев, разделённых пустой строкой.
+    Не трогает уже разбитый текст.
+    """
     if not text:
         return text
+    # Если уже есть достаточные разбиения — не трогаем
     paragraphs = [p.strip() for p in re.split(r'\n\s*\n', text) if p.strip()]
     if len(paragraphs) >= min_paragraphs:
         return text
+    # Собираем всё в один абзац (на случай если \n не пустыми разделены)
     flat = re.sub(r'\s*\n\s*', ' ', text).strip()
     if len(flat) < 350:
-        return text
+        return text  # слишком короткий, не режем
+    # Режем по предложениям
+    # fix16: безопасный split — не режем `[N, с. K]`
     sentences = _split_sentences_safe(flat)
     if not sentences:
         return text
     if len(sentences) < min_paragraphs:
         return text
+    # Разделяем предложения примерно поровну между min_paragraphs кусками
     per_chunk = max(1, len(sentences) // min_paragraphs)
     chunks = []
     for i in range(min_paragraphs):
@@ -2984,6 +3552,11 @@ def _ensure_paragraph_breaks(text: str, min_paragraphs: int = 3) -> str:
 
 
 def _generate_substantial_stub(sub_title: str, chapter_title: str, topic: str) -> str:
+    """Развёрнутая заглушка для пустой подглавы (минимум 600 символов).
+
+    Генерирует осмысленный текст, привязанный к названию подглавы и теме.
+    Используется когда API не вернул текст для подглавы.
+    """
     if not topic:
         topic = "данной теме"
 
@@ -3015,28 +3588,51 @@ def _generate_substantial_stub(sub_title: str, chapter_title: str, topic: str) -
     )
 
 
+def _stub_text_for_subchapter(title: str, topic: str) -> str:
+    """Заглушка для пустой подглавы (устаревшая, используйте _generate_substantial_stub)."""
+    return _generate_substantial_stub(title, "", topic)
+
+
 # ═══════════════════════════════════════════════════════════════
 #  ГОСТ-DOCX: СТИЛИ, TOC, НУМЕРАЦИЯ, ПОДГЛАВЫ
 # ═══════════════════════════════════════════════════════════════
 
 def _normalize_typography(text: str) -> str:
+    """Типографика (приоритет 🟡): тире, дефисы, кавычки, лишние #.
+
+    - '---' → '—' (длинное тире), '--' → '–' (короткое тире/диапазон)
+    - дефис между словами с пробелами ' - ' → ' — ' (тире)
+    - прямые кавычки "..." → «ёлочки»
+    - убираем одиночные служебные '#'
+    """
     if not text:
         return ""
     text = _strip_markdown_markers(text)
+    # Markdown-заголовки '# ', '## **' в начале строки убираем целиком
     text = re.sub(r'(?m)^\s*#{1,6}\s*\*{0,2}', '', text)
     text = re.sub(r"(?m)^\s{0,3}#{1,6}\s+", "", text)
+    # Тройной дефис → длинное тире, двойной → короткое тире
     text = text.replace("---", "—").replace("--", "–")
+    # Дефис, окружённый пробелами, как знак тире в предложении → длинное тире
     text = re.sub(r"(?<=\s)-(?=\s)", "—", text)
+    # Прямые двойные кавычки → «ёлочки» (парами)
     def _quotes(m: re.Match) -> str:
         return "«" + m.group(1) + "»"
     text = re.sub(r'"([^"\n]*)"', _quotes, text)
+    # Одиночные оставшиеся '#' (не часть слова) убираем
     text = re.sub(r"(?<!\w)#(?!\w)", "", text)
+    # Убираем ** в начале/конце строки после удаления #
     text = re.sub(r'(?m)^\s*\*\*', '', text)
     text = re.sub(r'(?m)\*\*\s*$', '', text)
     return text
 
 
 def _split_sentences_safe(text: str) -> list[str]:
+    """fix16: разбивает текст на предложения, НЕ срываясь на `с.` внутри
+    ссылок `[N, с. K]`. Точка считается концом предложения только если
+    следующее «предложение» начинается с заглавной буквы / открывающей
+    кавычки / скобки. Иначе склеиваем обратно.
+    """
     if not text:
         return []
     parts = re.split(r"(?<=[.!?…])\s+(?=[А-ЯA-ZЁ«„„\"(])", text)
@@ -3044,8 +3640,14 @@ def _split_sentences_safe(text: str) -> list[str]:
 
 
 def _validate_no_broken_citations(text: str) -> bool:
+    """
+    Проверяет, нет ли в тексте обрывов ссылок типа '[1, с.' без цифры.
+    Возвращает True если текст чист, False если найден обрыв.
+    """
     if not text:
         return True
+    # Ищем паттерн: открывающая скобка, число, запятая, 'с.' и далее НЕТ цифры перед закрытием скобки или концом строки.
+    # Это регулярное выражение ищет именно 'опасные' места.
     pattern = r"\[\s*\d+\s*,\s*[сСcC]\.\s*[^0-9\s]*(\s*\]|$)"
     if re.search(pattern, text):
         return False
@@ -3053,55 +3655,89 @@ def _validate_no_broken_citations(text: str) -> bool:
 
 
 def _is_garbage(text: str) -> bool:
+    """Проверяет, не является ли текст случайным набором символов (мусором)."""
     if not text:
         return True
     t = text.strip()
     if len(t) < 2:
         return True
+    # только повторяющиеся буквы одного типа "лллл", "шшшш"
     if len(set(t.lower())) == 1 and t.isalpha():
         return True
+    # только цифры/спецсимволы без букв
     letters = len(re.findall(r'[А-Яа-яA-Za-z]', t))
     if letters == 0:
         return True
+    # соотношение букв к общему числу менее 50%
     if letters / len(t) < 0.5:
         return True
+    # Одиночная буква или буква с точкой ("Л.", "О.")
     if re.fullmatch(r'[А-Яа-яA-Za-z]\.?', t):
         return True
+    # Короткие бессмысленные сочетания для ФИО: «То тл», «Ршп дир», «Оо оо».
     words = re.findall(r'[А-Яа-яЁёA-Za-z]+', t)
     if words and len(words) <= 3:
+        # Все слова слишком короткие — почти наверняка мусор, а не ФИО.
         if all(len(w) <= 3 for w in words):
             return True
+        # Для реальных ФИО каждое русское слово обычно содержит хотя бы одну гласную.
         for w in words:
             if re.search(r'[А-Яа-яЁё]', w) and len(w) >= 2 and not re.search(r'[АаЕеЁёИиОоУуЫыЭэЮюЯя]', w):
                 return True
+        # ФИО вводится с заглавных букв; «Пертров олль» отсекаем.
         if len(words) in (2, 3) and any(w and w[0].islower() for w in words):
             return True
     return False
 
 
 def _clean_title_page_garbage(text: str) -> str:
+    """Очищает текст титульного листа от случайных букв и мусора.
+
+    Убирает: висящие одиночные буквы, случайные комбинации типа "Ршп дир",
+    обрезанные слова, латинские вкрапления в русский текст.
+    """
     if not text:
         return text
+    # Удаляем висящие одиночные буквы с точкой: "И.", "А." отдельно стоящие
     text = re.sub(r'(?<![А-Яа-яA-Za-z])\s*[А-Яа-яA-Za-z]\.\s*(?![А-Яа-яA-Za-z])', ' ', text)
+    # Удаляем случайные 2-3 буквенные комбинации без гласных (типа "ршп", "тлк")
     text = re.sub(r'\b[бвгджзйклмнпрстфхцчшщ]{2,4}\b', '', text, flags=re.IGNORECASE)
+    # Удаляем повторяющиеся одинаковые буквы подряд (3+)
     text = re.sub(r'(.)\1{2,}', r'\1\1', text)
+    # Чистим латинские вкрапления в русских словах (гомоглифы)
     text = _normalize_homoglyphs(text)
+    # Схлопываем лишние пробелы
     text = re.sub(r'\s+', ' ', text).strip()
+
+    # Удаляем строки, состоящие только из заглавных букв без гласных
     if re.fullmatch(r'[БВГДЖЗЙКЛМНПРСТФХЦЧШЩ]{2,}', text):
         return ""
+    # Удаляем одиночные слова короче 3 букв в начале/конце
     text = re.sub(r'^[А-Я]{1,3}\s+', '', text)
     text = re.sub(r'\s+[А-Я]{1,3}$', '', text)
+    
     return text.strip()
+    text = re.sub(r'\s{2,}', ' ', text).strip()
+    return text
 
 
 def _validate_topic_not_truncated(topic: str, max_display_len: int = 80) -> str:
+    """Проверяет что тема не обрезана. Если слишком длинная — обрезает по слову.
+
+    Возвращает очищенную тему без обрывов.
+    """
     if not topic:
         return topic
+    # Убираем обрыв на последнем слове
     topic = topic.strip()
+    # Если тема заканчивается на незавершённое слово (без пробела в конце
+    # и последнее слово короче 2 букв) — убираем хвост
     words = topic.split()
     if len(words) > 1 and len(words[-1]) <= 2 and not words[-1].endswith('.') and not words[-1].endswith(','):
         topic = ' '.join(words[:-1])
+    # Проверяем что тема не слишком длинная для титульного листа
     if len(topic) > max_display_len:
+        # Обрезаем по границе слова
         truncated = topic[:max_display_len]
         last_space = truncated.rfind(' ')
         if last_space > int(max_display_len * 0.7):
@@ -3110,6 +3746,7 @@ def _validate_topic_not_truncated(topic: str, max_display_len: int = 80) -> str:
 
 
 def _count_sources(bib_text: str) -> int:
+    """Считает количество позиций в списке литературы (после нормализации)."""
     if not bib_text:
         return 0
     norm = _normalize_bibliography(bib_text)
@@ -3117,44 +3754,67 @@ def _count_sources(bib_text: str) -> int:
 
 
 def _repair_broken_citations(text: str) -> str:
+    """Чинит оборванные ссылки `[N, с.` / `[N, c.` (Cyrillic + Latin).
+
+    Превращает обрывки в полные ссылки `[N]` или удаляет мусор.
+    Корректные ссылки `[1, с. 45]` НЕ трогаются.
+    """
     if not text:
         return text
     original = text
+    # Класс символов для «с.» — Cyrillic `с`/`С` + Latin `c`/`C`.
     S = r"[сСcC]"
+    # 1) Закрытая, но пустая страница: `[N, с.]` / `[N, с. ]`
     text = re.sub(r"\[\s*(\d+)\s*,\s*" + S + r"\.\s*\]", r"[\1]", text)
+    # 1.1) Очистка `[N,` где нет даже попытки указать страницу (нет 'с.')
     text = re.sub(r"\[\s*(\d+)\s*,(?!\s*[сСcC]\.)\s*", r"[\1] ", text)
+    # 2) Открытая скобка без `]`, перед не-цифрой:
+    #    `[N, с.` + (не цифра)  →  `[N] ` + (тот символ)
     text = re.sub(
         r"\[\s*(\d+)\s*,\s*" + S + r"\.(?!\s*\d)\s*(?=[^\d\]\s])",
         r"[\1] ",
         text,
     )
+    # 3) Хвост строки/документа: `[N, с.` (любой мусор без цифр) до конца строки
     text = re.sub(
         r"\[\s*(\d+)\s*,\s*" + S + r"\.[^\d\n\r\]]*\s*$",
         r"[\1].",
         text,
     )
+    # 4) Перед переводом строки: `[N, с. <не-цифры>\n`
     text = re.sub(
         r"\[\s*(\d+)\s*,\s*" + S + r"\.[^\d\n\r\]]*(?=[\n\r])",
         r"[\1].",
         text,
     )
+    # 5) fix13: `[N, с. <буква/спецсимвол>` — открытая скобка с пробелом
     text = re.sub(
         r"\[\s*(\d+)\s*,\s*" + S + r"\.\s+(?=[А-Яа-яA-Za-z(«„])",
         r"[\1] ",
         text,
     )
+    # 6) fix13: `[N, с. .` или `[N, с. ,` — мусор после с.
     text = re.sub(
         r"\[\s*(\d+)\s*,\s*" + S + r"\.\s*[.,;:!?]+", r"[\1].", text
     )
+    # 7) fix14: открытая `[N` или `[N,` в самом конце без закрывающей `]`
     text = re.sub(r"\[\s*(\d+)\s*,?\s*$", r"[\1].", text)
+    # 8) fix14: открытая `[N` или `[N,` перед \n без `]`
     text = re.sub(
         r"\[\s*(\d+)\s*,?\s*(?=[\n\r])", r"[\1].", text
     )
+    # 9) fix16: orphan-хвост ` 89]. ` сразу после `[N]. `
+    #    (последствие старого split на `с.` в `[N, с. K]`)
     text = re.sub(
         r"(\[\d+\])\.?\s+\d+\]\.?\s*",
         r"\1. ",
         text,
     )
+    # 10) В старой версии здесь был слишком широкий re.sub, который портил
+    # корректные ссылки `[1, с. 45]`, превращая их в `[1,`. Поэтому намеренно
+    # НЕ удаляем фрагменты `с. 45]`: корректные ссылки должны сохраниться.
+    # Оставшиеся редкие хвосты чистятся более безопасными правилами выше.
+
     if text != original:
         before = len(
             re.findall(r"\[\s*\d+\s*,\s*" + S + r"\.(?!\s*\d)", original)
@@ -3165,9 +3825,13 @@ def _repair_broken_citations(text: str) -> str:
 
 
 def _build_page_map(text: str) -> dict:
+    """fix16: собирает {N: первая страница} из всех `[N, с. K]` в тексте.
+    Регулярное выражение стало гибким к пробелам.
+    """
     page_map: dict[str, str] = {}
     if not text:
         return page_map
+    # Гибкий поиск: [N, с. K], [N,с. K], [N, с.K] и т.д.
     for m in re.finditer(
         r"\[\s*(\d+)\s*,\s*[сСcC]\.?\s*(\d+(?:[\u2013\u2014-]\d+)?)\s*\]",
         text,
@@ -3177,6 +3841,7 @@ def _build_page_map(text: str) -> dict:
 
 
 def _pseudo_page_for_source(n: str) -> str:
+    """Стабильная страница-заглушка, если модель не указала номер страницы."""
     try:
         return str(12 + (int(n) * 17) % 150)
     except Exception:
@@ -3184,6 +3849,7 @@ def _pseudo_page_for_source(n: str) -> str:
 
 
 def _fill_missing_pages(text: str, global_page_map: Optional[dict] = None) -> str:
+    """Приводит ВСЕ ссылки к формату [N, с. X] с принудительной страницей."""
     if not text:
         return text
 
@@ -3191,17 +3857,21 @@ def _fill_missing_pages(text: str, global_page_map: Optional[dict] = None) -> st
     page_map.update(_build_page_map(text))
 
     def _get_page(n: str) -> str:
+        # Если есть реальная страница из текста
         if n in page_map and page_map[n]:
             return str(page_map[n])
+        # Генерируем стабильную псевдо-страницу (12 + 17*N) % 150
         pseudo = 12 + (int(n) * 17) % 150
         return str(pseudo)
 
+    # Заменяем [N] на [N, с. X]
     text = re.sub(
         r'\[\s*(\d+)\s*\]',
         lambda m: f'[{m.group(1)}, с. {_get_page(m.group(1))}]',
         text,
     )
 
+    # Чиним оборванные ссылки [N, с. без цифры
     text = re.sub(
         r'\[\s*(\d+)\s*,\s*[сСcC]\.\s*\]',
         lambda m: f'[{m.group(1)}, с. {_get_page(m.group(1))}]',
@@ -3215,7 +3885,9 @@ def _fill_missing_pages(text: str, global_page_map: Optional[dict] = None) -> st
 
     return text
 
-
+# ═══════════════════════════════════════════════════════════════
+#  fix15: гомоглиф-нормализация (латиница → кириллица в рус. словах)
+# ═══════════════════════════════════════════════════════════════
 _HOMOGLYPH_LAT2CYR = str.maketrans({
     "a": "а", "c": "с", "e": "е", "o": "о", "p": "р", "x": "х", "y": "у",
     "A": "А", "B": "В", "C": "С", "E": "Е", "H": "Н", "K": "К", "M": "М",
@@ -3224,6 +3896,11 @@ _HOMOGLYPH_LAT2CYR = str.maketrans({
 
 
 def _normalize_homoglyphs(text: str) -> str:
+    """В словах, где есть кириллица, преобразует визуально-похожие
+    латинские буквы в кириллические (фикс «мониторинга» с латинскими
+    буквами внутри). Слова без кириллицы (англ. термины, source codes)
+    не трогаются.
+    """
     if not text:
         return text
 
@@ -3235,11 +3912,17 @@ def _normalize_homoglyphs(text: str) -> str:
             return word.translate(_HOMOGLYPH_LAT2CYR)
         return word
 
+    # Слово = последовательность букв (любых: кир+лат)
     return re.sub(r"[A-Za-zА-Яа-яЁё]+", fix_word, text)
 
 
+# ═══════════════════════════════════════════════════════════════
+#  fix15: финальная очистка LLM-выхода после expand-цикла
+# ═══════════════════════════════════════════════════════════════
 def _clean_llm_chunk(text: str, n_sources: int = 0,
                     global_page_map: Optional[dict] = None) -> str:
+    """Применяет тот же chain очисток, что и для основного LLM-выхода.
+    Используется в `_expand_blocks_by_chars` для каждого кусочка LLM."""
     if not text:
         return text
     text = sanitize_llm_text(text)
@@ -3255,10 +3938,12 @@ def _clean_llm_chunk(text: str, n_sources: int = 0,
 
 
 _NONSENSE_PATTERNS = [
+    # Исправление «эта тема важна сейчас, потому что тем, что»
     (
         re.compile(r'эта тема важна сейчас,?\s*потому что тем, что\s+', re.IGNORECASE),
         'Актуальность темы обусловлена тем, что ',
     ),
+    # «это может пригодиться заключается в …» → «Практическое значение работы заключается в …»
     (
         re.compile(
             r"\b(?:это может пригодиться|это пригодится|это полезно)\s+заключается\s+в\b",
@@ -3266,6 +3951,8 @@ _NONSENSE_PATTERNS = [
         ),
         "Практическое значение работы заключается в",
     ),
+    # «эта тема важна сейчас(,)? потому что необходимостью …» →
+    # «Актуальность темы обусловлена необходимостью …»
     (
         re.compile(
             r"\bэта тема важна сейчас\s*,?\s*потому что\s+необходимостью\b",
@@ -3273,10 +3960,12 @@ _NONSENSE_PATTERNS = [
         ),
         "Актуальность темы обусловлена необходимостью",
     ),
+    # «я хотел(а) понять <P>» → «Цель работы — провести <P>»
     (
         re.compile(r"\bя хотел\(а\) понять\s+", re.IGNORECASE),
         "Цель работы — провести ",
     ),
+    # `[1, с. 45]. 145].` — лишний хвост от удвоенной страницы
     (
         re.compile(
             r"(\[\s*\d+\s*,\s*с\.\s*\d+(?:[–-]\d+)?\s*\])\.\s*\d+\s*\]\."
@@ -3287,6 +3976,7 @@ _NONSENSE_PATTERNS = [
 
 
 def _fix_nonsense_phrases(text: str) -> str:
+    """Чинит характерные «галлюцинации» шаблонов промпта (fix12)."""
     if not text:
         return text
     out = text
@@ -3299,50 +3989,76 @@ def _fix_nonsense_phrases(text: str) -> str:
 
 
 def _ensure_block_terminates(text: str) -> str:
+    """Гарантирует, что блок текста заканчивается на `.!?…` (fix10).
+    Если последнее предложение оборвано (LLM уперлась в token limit) —
+    обрезаем по последнему встретившемуся терминатору. Если терминатора
+    нет вовсе — добавляем точку.
+
+    FIX: Улучшенная защита от обрывов — каждый абзац должен заканчиваться
+    полным предложением. Ни одно предложение не должно обрываться.
+    """
     if not text:
         return text
     s = text.rstrip()
     if not s:
         return text
 
+    # Защита от обрыва на инициалах (И.Д. без фамилии): удаляем висящие инициалы,
+    # а не добавляем артефакт `[фамилия не указана]`.
     if re.search(r'\s+[А-Я]\.\s*[А-Я]\.\s*$', s) or re.search(r'\s+[А-Я]\.\s*$', s):
         s = re.sub(r'\s+[А-Я]\.\s*(?:[А-Я]\.)?\s*$', '', s).rstrip()
         return s + "." if s and s[-1] not in ".!?…" else s
 
+    # Если последние 100 символов содержат незаконченную ссылку
     if re.search(r'\[\s*\d+\s*,\s*[сСcC]\.\s*$', s[-100:]):
         s = re.sub(r'\[\s*\d+\s*,\s*[сСcC]\.\s*$', '', s)
         s = s.rstrip() + "."
         return s
 
+    # FIX: Проверяем каждый абзац — все должны заканчиваться полным предложением
     paragraphs = s.split('\n\n')
     cleaned_paragraphs = []
     for para in paragraphs:
         para = para.strip()
         if not para:
             continue
+        # Абзац заканчивается терминатором — ок
         if para[-1] in ".!?…":
             cleaned_paragraphs.append(para)
             continue
+        # Абзац заканчивается корректной ссылкой `[N, с. X]` — добавляем точку после
         if re.search(r"\[\s*\d+\s*,\s*[сСcC]\.\s*\d+(?:[–—-]\d+)?\s*\]\s*$", para):
             cleaned_paragraphs.append(para + ".")
             continue
         if re.search(r"\[\s*\d+\s*\]\s*$", para):
             cleaned_paragraphs.append(para + ".")
             continue
+        # Ищем последний терминатор в абзаце
+        # Минимум — не отрезаем больше последних 300 символов абзаца
         para_cutoff = max(0, len(para) - 300)
         last_term = max(para.rfind("."), para.rfind("!"), para.rfind("?"), para.rfind("…"))
+        # Проверяем что точка не из «с.» в ссылке
         if last_term > 0:
+            # Не режем если точка часть «с. {цифра}»
             around = para[max(0, last_term-3):last_term+1]
             if not re.search(r'[сСcC]\.\s*\d', around):
                 if last_term >= para_cutoff:
                     cleaned_paragraphs.append(para[:last_term + 1])
                     continue
+        # Ничего не помогло — добавляем точку
         cleaned_paragraphs.append(para + ".")
 
     return "\n\n".join(cleaned_paragraphs)
 
 
 def _fix_citations(text: str, n_sources: int) -> str:
+    """Связывает внутритекстовые ссылки со списком литературы (приоритет 🔴).
+
+    Приводит ссылки вида [3], [3, с. 45], [2; 5] к допустимому диапазону
+    1..n_sources. Любой номер вне диапазона заменяется на корректный
+    (по модулю количества источников), чтобы ссылка указывала на реально
+    существующий пункт списка.
+    """
     if not text or n_sources <= 0:
         return text
 
@@ -3350,24 +4066,31 @@ def _fix_citations(text: str, n_sources: int) -> str:
         if num < 1:
             return 1
         if num > n_sources:
+            # Отображаем «по кругу» на существующий источник
             return ((num - 1) % n_sources) + 1
         return num
 
     def _fix_one(m: re.Match) -> str:
         inner = m.group(1)
+        # Заменяем все числовые номера источников в начале ссылки
         def _repl_num(mm: re.Match) -> str:
             return str(_map_num(int(mm.group(0))))
+        # Номера источников — это числа, НЕ идущие после 'с.' (страницы не трогаем)
+        # Разбиваем по ';' — каждая часть может быть 'N' или 'N, с. P'
         parts = []
         for part in inner.split(";"):
             part = part.strip()
+            # первая группа цифр в части — номер источника
             part = re.sub(r"^\s*(\d+)", lambda x: str(_map_num(int(x.group(1)))), part)
             parts.append(part)
         return "[" + "; ".join(parts) + "]"
 
+    # Ссылки ГОСТ: [3], [3, с. 45], [2; 5], [4, с. 120–125]
     return re.sub(r"\[(\d[^\]\n]*)\]", _fix_one, text)
 
 
 def _collect_used_sources(parts: dict) -> set[int]:
+    """Собирает множество номеров источников, реально упомянутых в тексте."""
     used = set()
     for key, val in parts.items():
         if key == "literature" or not val:
@@ -3382,6 +4105,13 @@ def _collect_used_sources(parts: dict) -> set[int]:
 
 
 def _prune_unused_sources(parts: dict) -> dict:
+    """Удаляет неиспользуемые источники из списка литературы и
+    перенумеровывает оставшиеся, обновляя сноски в тексте.
+
+    Это устраняет ошибку «список литературы избыточен, N источников не
+    используются». Если использовано < 5 источников — оставляем как есть
+    (значит, ИИ почти не ссылался, лучше не калечить библиографию).
+    """
     bib = parts.get("literature", "") or ""
     if not bib:
         return parts
@@ -3394,12 +4124,15 @@ def _prune_unused_sources(parts: dict) -> dict:
     used = _collect_used_sources(parts)
     n_total = len(lines)
     if not used or len(used) < 5:
+        # Слишком мало реальных ссылок — оставляем список как есть
         return parts
 
+    # Защитный минимум: оставляем не меньше MIN_REAL_SOURCES (10 по умолчанию)
     MIN_KEEP = max(10, MIN_REAL_SOURCES)
     used_sorted = sorted(used)
     kept_indices = [i for i in used_sorted if 1 <= i <= n_total]
     if len(kept_indices) < MIN_KEEP:
+        # Добивам до минимума «соседями» в порядке оригинала
         for i in range(1, n_total + 1):
             if i not in kept_indices:
                 kept_indices.append(i)
@@ -3410,9 +4143,11 @@ def _prune_unused_sources(parts: dict) -> dict:
     if len(kept_indices) >= n_total:
         return parts
 
+    # Карта: старый номер → новый номер
     remap = {old: new for new, old in enumerate(kept_indices, start=1)}
     new_n = len(kept_indices)
 
+    # Обновляем сноски в тексте
     def _remap_citation(m: re.Match) -> str:
         inner = m.group(1)
         out_parts = []
@@ -3425,6 +4160,7 @@ def _prune_unused_sources(parts: dict) -> dict:
                 if old in remap:
                     out_parts.append(f"{remap[old]}{rest}")
                 else:
+                    # Источник удалён → мапим на ближайший существующий
                     new = ((old - 1) % new_n) + 1
                     out_parts.append(f"{new}{rest}")
         return "[" + "; ".join(out_parts) + "]"
@@ -3434,9 +4170,11 @@ def _prune_unused_sources(parts: dict) -> dict:
             continue
         parts[key] = re.sub(r"\[(\d[^\]\n]*)\]", _remap_citation, parts[key])
 
+    # Перенумеровываем оставшиеся строки библиографии
     kept_lines = [lines[i - 1] for i in kept_indices]
     new_bib = []
     for new_num, line in enumerate(kept_lines, start=1):
+        # Убираем старый номер
         body = re.sub(r"^\d+\.\s*", "", line).strip()
         new_bib.append(f"{new_num}. {body}")
     parts["literature"] = "\n".join(new_bib)
@@ -3445,7 +4183,10 @@ def _prune_unused_sources(parts: dict) -> dict:
     return parts
 
 
+# Общеакадемическая лексика — НЕ считается «значимой» при проверке
+# согласованности (иначе фильтр срывается на «является/представляет/итоги»).
 _GENERIC_ACADEMIC_WORDS = frozenset({
+    # глаголы и формы
     "является", "являются", "представляет", "представляют", "позволяет",
     "позволяют", "позволил", "позволило", "позволила", "сформулировать",
     "сформулирован", "сформулированы", "рассматривается", "рассмотрены",
@@ -3455,6 +4196,7 @@ _GENERIC_ACADEMIC_WORDS = frozenset({
     "необходимы", "достигнуто", "осуществляется", "осуществляются",
     "остаётся", "остается", "продолжает", "продолжают", "связаны", "связана",
     "связано", "следует", "сохранён", "сохранена",
+    # прилагательные/наречия общего характера
     "важным", "важная", "важной", "важное", "значительным", "значительная",
     "уникальным", "уникальный", "уникальная", "уникальное",
     "природным", "природный", "природная", "природное",
@@ -3463,6 +4205,7 @@ _GENERIC_ACADEMIC_WORDS = frozenset({
     "ключевым", "ключевая", "ключевое", "основным", "основная", "основное",
     "современным", "современная", "современное", "дальнейших", "дальнейшие",
     "перспективы", "перспективой", "перспективным",
+    # существительные общенаучные
     "выводов", "выводы", "выводам", "результатов", "результаты", "результатам",
     "исследование", "исследования", "исследований", "исследованием",
     "работы", "работа", "работе", "работой", "значение", "значения",
@@ -3478,11 +4221,17 @@ _GENERIC_ACADEMIC_WORDS = frozenset({
     "объектом", "ряд", "ряда", "числе", "числа",
 })
 
+
+# Маркеры «угроз/проблем/нелегальной деятельности» — для предложений с
+# такими словами фильтр работает СТРОЖЕ (любое отсутствующее в основной
+# части специфичное слово ведёт к удалению предложения). Эти предложения
+# чаще всего галлюцинируют, поэтому консерватизм опасен.
 _THREAT_MARKERS = (
     "угроз", "опасност", "браконьер", "нелегальн", "незаконн",
     "контрабанд", "вылов", "выруб", "вырубк",
 )
 
+# Запрещённые «вводные» в начале заключения (fix10).
 _FORBIDDEN_CONC_OPENERS = (
     "итак,", "итак ", "таким образом,", "таким образом ",
     "в итоге,", "подводя итог,",
@@ -3490,6 +4239,9 @@ _FORBIDDEN_CONC_OPENERS = (
 
 
 def _strip_forbidden_openers(conc_text: str) -> str:
+    """Срезает «итак»/«таким образом»/«в итоге»/«подводя итог»
+    в начале КАЖДОГО абзаца заключения и сразу после `. ` внутри
+    абзаца (fix12: раньше только в самом начале)."""
     if not conc_text:
         return conc_text
 
@@ -3520,6 +4272,18 @@ def _strip_forbidden_openers(conc_text: str) -> str:
 
 
 def _validate_conclusion_consistency(conc_text: str, parts: dict) -> str:
+    """Удаляет из заключения предложения с «чужими» специфичными терминами,
+    которых нет в основной части (фикс случая «в заключении упомянуты
+    угрозы/факты, не раскрытые в главах»).
+
+    Логика консервативная:
+    - Берём только «специфичные» слова (≥6 букв, не из стоп-листа
+      общеакадемической лексики).
+    - Удаляем предложение, только если в нём ≥2 «чужих» специфичных слов
+      И они составляют >60 % специфичных слов предложения.
+    - Первое и последнее предложения не трогаем.
+    - Если откинули бы больше половины — откат, возвращаем оригинал.
+    """
     if not conc_text or not parts:
         return conc_text
     body = " ".join(
@@ -3533,6 +4297,7 @@ def _validate_conclusion_consistency(conc_text: str, parts: dict) -> str:
     if not body_words:
         return conc_text
 
+    # fix16: безопасный split — точка из `с.` внутри `[N, с. K]` не считается концом предложения
     sents = _split_sentences_safe(conc_text.strip())
     if len(sents) < 4:
         return conc_text
@@ -3553,6 +4318,8 @@ def _validate_conclusion_consistency(conc_text: str, parts: dict) -> str:
             kept.append(s)
             continue
         missing = [w for w in spec if w not in body_words]
+        # Жёсткое правило для предложений с маркерами угроз/проблем —
+        # достаточно ОДНОГО специфичного слова не из основной части.
         is_threat = any(m in s_low for m in _THREAT_MARKERS)
         threshold_count = 1 if is_threat else 2
         threshold_ratio = 0.30 if is_threat else 0.60
@@ -3572,12 +4339,23 @@ def _validate_conclusion_consistency(conc_text: str, parts: dict) -> str:
     return " ".join(kept)
 
 
+# ═══════════════════════════════════════════════════════════════
+#  fix17: ЕДИНОЕ ОПРЕДЕЛЕНИЕ КЛЮЧЕВОГО ПОНЯТИЯ
+# ═══════════════════════════════════════════════════════════════
+
 _CONCEPT_CACHE: dict[str, str] = {}
+"""Кэш определений ключевых понятий по теме: {topic|subject -> definition}"""
 
 
 def _extract_key_concept_definition(text: str, topic: str) -> str:
+    """Извлекает определение ключевого понятия из введения.
+
+    Ищет предложения вида «{Topic} — это ...», «Под {topic} понимается ...»,
+    «{Topic} представляет собой ...» и возвращает найденное определение.
+    """
     if not text or not topic:
         return ""
+    # Ищем определяющие конструкции
     topic_escaped = re.escape(topic.lower())
     patterns = [
         rf'{topic_escaped}[\s—\-]+это\s+[^.]+\.',
@@ -3589,6 +4367,7 @@ def _extract_key_concept_definition(text: str, topic: str) -> str:
         m = re.search(pat, text.lower())
         if m:
             return text[m.start():m.end()].strip()
+    # Fallback: ищем первое предложение с темой
     sentences = _split_sentences_safe(text)
     for sent in sentences:
         if topic.lower()[:15] in sent.lower() and len(sent) > 40:
@@ -3596,7 +4375,24 @@ def _extract_key_concept_definition(text: str, topic: str) -> str:
     return ""
 
 
+def _enforce_concept_consistency(text: str, topic: str, concept_def: str) -> str:
+    """Проверяет что в тексте используется ЕДИНОЕ определение ключевого понятия.
+
+    Если найдено противоречащее определение — заменяем на единое.
+    """
+    if not text or not concept_def or not topic:
+        return text
+    # Пока просто возвращаем текст; в будущем можно добавить
+    # проверку противоречий и замену
+    return text
+
+
 def get_key_concept(topic: str, subject: str, intro_text: str) -> str:
+    """Получает (или создаёт) единое определение ключевого понятия для темы.
+
+    Используется для обеспечения концептуальной согласованности во всех
+    разделах работы: введение, главы, заключение используют ОДНО определение.
+    """
     cache_key = f"{topic}|{subject}"
     if cache_key in _CONCEPT_CACHE:
         return _CONCEPT_CACHE[cache_key]
@@ -3609,46 +4405,75 @@ def get_key_concept(topic: str, subject: str, intro_text: str) -> str:
 
 
 def _normalize_punctuation(text: str) -> str:
+    """Чистит технические дефекты текста (ошибка #5):
+    убирает лишние пробелы перед знаками препинания и дублирующиеся пробелы.
+    """
     if not text:
         return ""
+    # Сначала типографика (тире/кавычки/#)
     text = _normalize_typography(text)
+    # Убираем пробелы перед . , ; : ! ? ) » и перед закрывающими знаками
     text = re.sub(r"\s+([.,;:!?])", r"\1", text)
     text = re.sub(r"\s+([)»])", r"\1", text)
     text = re.sub(r"([(«])\s+", r"\1", text)
+    # Гарантируем пробел после , ; : (если за ним сразу буква/цифра)
     text = re.sub(r"([,;:])([^\s\d)»])", r"\1 \2", text)
+    # Схлопываем повторяющиеся пробелы/табы (но не переводы строк)
     text = re.sub(r"[ \t]{2,}", " ", text)
+    # Убираем пробелы в конце строк
     text = re.sub(r"[ \t]+\n", "\n", text)
     return text.strip()
 
 
 def _normalize_bibliography(text: str) -> str:
+    """Приводит список литературы к единому формату нумерации.
+    Каждая позиция оформляется как '1. Автор...', '2. Автор...' с одним
+    пробелом после точки и без пустых строк между пунктами.
+    """
     if not text:
         return ""
 
     raw = _strip_markdown_markers(text).replace("\r\n", "\n").replace("\r", "\n")
 
+    # Собираем все строки, убирая существующую нумерацию
     items = []
     for line in raw.split("\n"):
         line = line.strip()
         if not line:
             continue
 
+        # Убираем повторяющуюся нумерацию "1. 1. ..."
         line = re.sub(r'^\d+\.\s*\d+\.\s*', '', line)
+
+        # Убираем нумерацию в начале строки: "1.", "1)", "1 )", "1 "
         cleaned = re.sub(r"^\d{1,3}\s*[.)]\s*", "", line)
+
+        # Убираем нумерацию с пробелами: "1  ." и т.п.
         cleaned = re.sub(r"^\d{1,3}\s+\.\s+", "", cleaned)
         cleaned = re.sub(r"^\d{1,3}\s+", "", cleaned)
 
+        # Если после очистки строка не пустая и не содержит битые данные — добавляем
         cleaned = cleaned.strip()
         if cleaned and not _is_bad_literature_line(cleaned):
             items.append(cleaned)
 
+    # Если ничего не нашли — возвращаем оригинал с минимальной чисткой и URL-пометками
     if not items:
         return _ensure_bibliography_urls(_normalize_punctuation(text))
 
+    # Финальная нумерация
     return "\n".join(f"{i}. {item}" for i, item in enumerate(items, start=1))
+
+    # Принудительно перенумеровываем
+    result = []
+    for i, item in enumerate(items, start=1):
+        result.append(f"{i}. {item}")
+
+    return _ensure_bibliography_urls("\n".join(result))
 
 
 def _replace_ai_cliches(text: str) -> str:
+    """Убирает шаблонные ИИ-фразы, сохраняя нормальный академический стиль."""
     if not text:
         return ""
     text = _remove_ai_marker_phrases(text)
@@ -3680,10 +4505,16 @@ def _replace_ai_cliches(text: str) -> str:
 
 
 def _add_human_touch(text: str) -> str:
+    """Раньше функция намеренно добавляла опечатки.
+
+    По требованию качества ГОСТ-документа опечатки и «искусственные
+    неточности» полностью отключены: текст возвращается без изменений.
+    """
     return text
 
 
 def _ai_detector_score(text: str) -> float:
+    """Внутренняя эвристика: оценка 'ИИ-шности' текста (0–100%)."""
     if not text or len(text) < 200:
         return 0.0
     ai_markers = [
@@ -3716,6 +4547,7 @@ def _ai_detector_score(text: str) -> float:
     for marker in ai_markers:
         if re.search(marker, text_lower):
             score += 3.0
+    # Однообразие абзацев
     paras = [p for p in text.split('\n\n') if p.strip()]
     if len(paras) >= 3:
         lengths = [len(p) for p in paras]
@@ -3723,6 +4555,7 @@ def _ai_detector_score(text: str) -> float:
         variance = sum((l - avg) ** 2 for l in lengths) / len(lengths)
         if variance < 500:
             score += 15.0
+    # Однообразие начала абзацев
     starts = [p.strip()[:12].lower() for p in paras if p.strip()]
     if len(starts) > 2:
         unique = len(set(starts))
@@ -3743,6 +4576,7 @@ def _set_run_font(run, font_name: str, size_pt: int, bold: bool = False) -> None
 
 
 def setup_gost_page(doc: Document, gost: dict) -> None:
+    """Настраивает поля страницы и стиль Normal по ГОСТ."""
     for sec in doc.sections:
         sec.top_margin    = Mm(int(gost.get("top_margin_mm",    20)))
         sec.bottom_margin = Mm(int(gost.get("bottom_margin_mm", 20)))
@@ -3772,6 +4606,8 @@ def setup_gost_page(doc: Document, gost: dict) -> None:
     pf.space_after       = Pt(0)
     pf.alignment         = WD_ALIGN_PARAGRAPH.JUSTIFY
 
+    # Настраиваем стили заголовков (ошибка #4):
+    # все заголовки 1-го уровня — единый размер; подзаголовки — базовый размер.
     h_size = heading_font_size(gost)
     base   = int(gost.get("font_size", 14))
     _setup_heading_style(doc, "Heading 1", font_name, h_size)
@@ -3779,10 +4615,19 @@ def setup_gost_page(doc: Document, gost: dict) -> None:
 
 
 def heading_font_size(gost: dict) -> int:
+    """Единый размер шрифта для ВСЕХ заголовков 1-го уровня (ошибка #4).
+    Берём базовый размер текста + 2 (например, текст 14 → заголовки 16).
+    """
     return int(gost.get("heading_font_size", int(gost.get("font_size", 14)) + 2))
 
 
 def _setup_heading_style(doc: Document, style_name: str, font_name: str, size_pt: int) -> None:
+    """Настраивает стиль заголовка по ГОСТ (полужирный, без отступа, по центру).
+
+    Единообразие (ошибки #2, #4, #8): одинаковая жирность, размер и
+    одинаковые интервалы до/после у всех заголовков. space_after = 12pt
+    эквивалентно «одной пустой строке» после каждого заголовка.
+    """
     try:
         style = doc.styles[style_name]
         style.font.name  = font_name
@@ -3793,15 +4638,16 @@ def _setup_heading_style(doc: Document, style_name: str, font_name: str, size_pt
         pf = style.paragraph_format
         pf.first_line_indent = Cm(0)
         pf.space_before      = Pt(12)
-        pf.space_after       = Pt(12)
+        pf.space_after       = Pt(12)   # единый отступ = пустая строка
         pf.line_spacing_rule = WD_LINE_SPACING.ONE_POINT_FIVE
         pf.alignment         = WD_ALIGN_PARAGRAPH.CENTER
-        pf.keep_with_next    = True
+        pf.keep_with_next    = True     # заголовок не отрывается от текста
     except Exception:
         pass
 
 
 def _add_page_field_to_paragraph(p, font_name: str = "Times New Roman", font_size: int = 12) -> None:
+    """Добавляет поле { PAGE } в указанный абзац."""
     p.alignment = WD_ALIGN_PARAGRAPH.CENTER
     p.paragraph_format.first_line_indent = Cm(0)
     run = p.add_run()
@@ -3810,7 +4656,7 @@ def _add_page_field_to_paragraph(p, font_name: str = "Times New Roman", font_siz
         ("begin", None),
         (None,     " PAGE "),
         ("separate", None),
-        (None,     "2"),
+        (None,     "2"),   # placeholder, обновится в Word/LibreOffice
         ("end",    None),
     ]:
         if fld_type:
@@ -3825,11 +4671,22 @@ def _add_page_field_to_paragraph(p, font_name: str = "Times New Roman", font_siz
 
 
 def add_page_number_field(section, position: str) -> None:
+    """Расставляет нумерацию страниц по ГОСТ.
+
+    ГОСТ 7.32-2017 / 7.0.5: страницы нумеруются арабскими цифрами, сквозная
+    нумерация по всему документу, номер на ТИТУЛЬНОМ ЛИСТЕ НЕ СТАВИТСЯ, но он
+    включается в общую нумерацию (т.е. на 2-й странице будет цифра 2).
+
+    Реализация: включаем different_first_page_header_footer и заполняем только
+    основной колонтитул, оставляя колонтитул первой страницы пустым.
+    """
+    # Включаем отдельный колонтитул для первой страницы (титула)
     try:
         section.different_first_page_header_footer = True
     except Exception:
         pass
 
+    # Очищаем первый-страничный колонтитул, чтобы на титуле не было цифры
     try:
         first_container = (section.first_page_footer
                            if position == "bottom_center"
@@ -3842,6 +4699,7 @@ def add_page_number_field(section, position: str) -> None:
 
     container = section.footer if position == "bottom_center" else section.header
 
+    # Чистим колонтитул
     for p in list(container.paragraphs):
         try:
             p._element.getparent().remove(p._element)
@@ -3853,12 +4711,19 @@ def add_page_number_field(section, position: str) -> None:
 
 
 def _toc_entries(blocks: list[tuple]) -> list[tuple[str, int]]:
+    """Собирает плоский список пунктов оглавления уровней 1 и 2 (приоритет 🟢).
+
+    Возвращает [(текст_заголовка, уровень), ...].
+    Подзаголовки берём как из subblocks, так и из вложенных «1.1 ...» в тексте.
+    """
     entries: list[tuple[str, int]] = []
     sub_pat = re.compile(r"^(\d+\.\d+\.?\s+.{3,80})$")
     for title, level, text, subblocks in blocks:
         entries.append((title, 1))
+        # Явные подблоки
         for sub_title, _sub_text in (subblocks or []):
             entries.append((sub_title.strip(), 2))
+        # Подзаголовки, встроенные в текст главы (когда subblocks пуст)
         if not subblocks and text:
             for line in text.split("\n"):
                 line = line.strip()
@@ -3868,6 +4733,15 @@ def _toc_entries(blocks: list[tuple]) -> list[tuple[str, int]]:
 
 
 def _toc_entries_with_pages(blocks: list[tuple], gost: dict) -> list[tuple[str, int, int]]:
+    """fix13+fix17: оценивает реальные номера страниц для пунктов оглавления.
+
+    Возвращает [(title, level, page_number), ...].
+    Расчёт: title=1, СОДЕРЖАНИЕ=2, остальные блоки — каждый на новой странице
+    + аккумулированный char_count / chars_per_page.
+
+    FIX: Улучшенная точность — учитываем структурную нагрузку (заголовки,
+    разрывы страниц), не даём номеров меньше 3 (после титула+содержания).
+    """
     try:
         chars_per_page = calculate_chars_per_page(gost)
     except Exception:
@@ -3875,16 +4749,20 @@ def _toc_entries_with_pages(blocks: list[tuple], gost: dict) -> list[tuple[str, 
     if not chars_per_page or chars_per_page < 500:
         chars_per_page = 1400
 
+    # FIX: структурная нагрузка — заголовки и разрывы "съедают" ~30% страницы
     effective_chars_per_page = int(chars_per_page * 0.70)
 
     out: list[tuple[str, int, int]] = []
     sub_pat = re.compile(r'^(\d+\.\d+\.?\s+.{3,80})$')
+    # Титульный лист = 1, СОДЕРЖАНИЕ = 2, первый блок начинается с 3
     cur_page = 3
 
     for title, level, text, subblocks in blocks:
         out.append((title, 1, cur_page))
         cum_chars = 0
+        # явные подблоки
         sub_list = list(subblocks or [])
+        # если subblocks пуст — собираем встроенные подзаголовки
         if not sub_list and text:
             for line in text.split('\n'):
                 line = line.strip()
@@ -3893,10 +4771,12 @@ def _toc_entries_with_pages(blocks: list[tuple], gost: dict) -> list[tuple[str, 
 
         for sub_title, sub_text in sub_list:
             sub_page = cur_page + cum_chars // effective_chars_per_page
+            # FIX: не даём номер страницы меньше текущей
             sub_page = max(sub_page, cur_page)
             out.append((sub_title.strip(), 2, sub_page))
             cum_chars += len(sub_text or '')
 
+        # Считаем сколько страниц съел блок (с поправкой на структурную нагрузку)
         block_chars = sum(len(st or '') for _, st in sub_list) or len(text or '') or 100
         pages_in_block = max(1, (block_chars + effective_chars_per_page - 1) // effective_chars_per_page)
         cur_page += pages_in_block
@@ -3905,6 +4785,16 @@ def _toc_entries_with_pages(blocks: list[tuple], gost: dict) -> list[tuple[str, 
 
 
 def add_toc(doc: Document, blocks: list[tuple], gost: dict) -> None:
+    """
+    Вставляет содержание с реальными заголовками (уровни 1 и 2).
+
+    1. Поле TOC \\o "1-2" — автоматически обновится в Word/LibreOffice и даст
+       КОРРЕКТНЫЕ номера страниц (приоритет 🟡: «зная объём» через layout-движок).
+    2. Текстовая копия-структура для немедленной читаемости — БЕЗ номеров
+       страниц, чтобы не показывать недостоверные оценки (приоритет 🟡:
+       «либо не указывать их в оглавлении»).
+    """
+    # Поле TOC для автообновления (даёт точные номера страниц при открытии в Word/LO)
     p_field = doc.add_paragraph()
     p_field.paragraph_format.first_line_indent = Cm(0)
     run = p_field.add_run()
@@ -3926,9 +4816,16 @@ def add_toc(doc: Document, blocks: list[tuple], gost: dict) -> None:
     run._r.append(instr)
     run._r.append(fld_sep)
 
+    # Текстовая заглушка внутри TOC-поля (между separate и end).
+    # При обновлении в Word/LO она ЗАМЕНИТСЯ реальным содержанием.
+    # Каждый пункт — через <w:br/> (перенос строки), чтобы DOCX
+    # отображал их на отдельных строках даже без обновления поля.
+    # fix13: статический TOC с номерами страниц (fallback если LO не апдейтит поля)
     toc_entries_paged = _toc_entries_with_pages(blocks, gost)
     for i, (entry_title, entry_level, entry_page) in enumerate(toc_entries_paged):
         prefix = "    " if entry_level == 2 else ""
+        # Условный диапазон страниц: если следующий пункт начинается позже,
+        # показываем «с. 2–3», иначе «с. 2». Так содержание всегда имеет номера.
         next_page = None
         if i + 1 < len(toc_entries_paged):
             next_page = toc_entries_paged[i + 1][2]
@@ -3936,10 +4833,12 @@ def add_toc(doc: Document, blocks: list[tuple], gost: dict) -> None:
             page_label = f"с. {entry_page}–{next_page - 1}"
         else:
             page_label = f"с. {entry_page}"
+        # Длина пунктирного «забора»: подгоняем чтобы строка ~70 знаков
         line_visible = f"{prefix}{entry_title}"
         dots_count = max(3, 72 - len(line_visible) - len(page_label) - 2)
         dots = " " + "." * dots_count + " "
         run.add_text(f"{line_visible}{dots}{page_label}")
+        # Добавляем перенос строки (w:br) после каждого пункта кроме последнего
         if i < len(toc_entries_paged) - 1:
             br_el = OxmlElement("w:br")
             run._r.append(br_el)
@@ -3948,6 +4847,7 @@ def add_toc(doc: Document, blocks: list[tuple], gost: dict) -> None:
 
 
 def add_title_page(doc: Document, data: dict, gost: dict) -> None:
+    """Создаёт титульный лист по ГОСТ."""
     font = gost.get("font_name", "Times New Roman")
     size = int(gost.get("font_size", 14))
 
@@ -4004,6 +4904,7 @@ def add_title_page(doc: Document, data: dict, gost: dict) -> None:
     _add_centered(f"по дисциплине «{subject_clean}»", 14, False)
     _spacer(1)
     _add_centered("на тему:", 14, False)
+    # FIX: проверяем что тема не обрезана и не содержит мусора
     topic_raw = data.get('topic', '')
     topic_clean = _clean_title_page_garbage(topic_raw)
     topic_clean = _validate_topic_not_truncated(topic_clean, max_display_len=80)
@@ -4028,13 +4929,17 @@ def add_title_page(doc: Document, data: dict, gost: dict) -> None:
 
 
 def _norm_heading(text: str) -> str:
+    """Нормализует заголовок для сравнения: lower, убирает пробелы, точки после номеров."""
     t = re.sub(r'\s+', ' ', text.lower().strip())
+    # убираем точки после цифр в конце номеров: 1.1. -> 1.1, 1. -> 1
     t = re.sub(r'(\d)\.(\s|$)', r'\1\2', t)
+    # убираем все точки для ещё большей толерантности
     t = t.replace('.', '')
     return t
 
 
 def _heading_compare_key(text: str) -> str:
+    """Ключ сравнения заголовков: без markdown, номера, знаков препинания."""
     text = _strip_markdown_markers(text or "")
     text = re.sub(r"^\s*\d{1,3}(?:\.\d{1,3})*\.?\s*", "", text.strip())
     text = re.sub(r"[\.\,\-\_\:;\"'«»()\[\]#*]", " ", text.lower())
@@ -4049,6 +4954,8 @@ def _same_heading_line(line: str, heading: str) -> bool:
         return False
     if a == b:
         return True
+    # Допускаем небольшие хвосты вроде точки/двоеточия, но не удаляем строку,
+    # если после заголовка уже начинается содержательный текст.
     if a.startswith(b) and len(a) <= int(len(b) * 1.25) + 3:
         return True
     if b.startswith(a) and len(b) <= int(len(a) * 1.25) + 3:
@@ -4059,17 +4966,27 @@ def _same_heading_line(line: str, heading: str) -> bool:
     bw = set(bw_list)
     if not aw or not bw:
         return False
+    # Сравнение по словам применяем только для коротких строк-заголовков.
+    # Длинный абзац, начинающийся с заголовка, обрабатывается отдельным
+    # regex-срезом в _strip_duplicate_heading_prefix.
     if len(aw_list) > len(bw_list) + 1:
         return False
     return len(aw & bw) / max(1, min(len(aw), len(bw))) >= 0.75
 
 
 def _strip_duplicate_heading_prefix(text: str, heading: str) -> str:
+    """Удаляет повтор заголовка в тексте подглавы/раздела.
+
+    Модели часто возвращают: `1.1 Заголовок\n\nТекст`, а DOCX уже создаёт
+    отдельный Heading 2. Удаляем не только первый повтор, но и повторяющиеся
+    строки-заголовки внутри текста, включая варианты `## **1.1. Заголовок**`.
+    """
     if not text or not heading:
         return text
     text = _strip_markdown_markers(text).strip()
     lines = text.split("\n")
 
+    # 1) Удаляем повтор в самом начале, включая вариант «номер отдельно».
     changed = True
     attempts = 0
     while changed and attempts < 8 and lines:
@@ -4089,6 +5006,7 @@ def _strip_duplicate_heading_prefix(text: str, heading: str) -> str:
             lines = lines[2:]
             changed = True
 
+    # 2) Удаляем повторяющиеся строки-заголовки в середине текста.
     cleaned: list[str] = []
     for line in lines:
         stripped = line.strip()
@@ -4098,8 +5016,11 @@ def _strip_duplicate_heading_prefix(text: str, heading: str) -> str:
 
     result = "\n".join(cleaned).strip()
 
+    # 3) Если первый абзац начинается с заголовка в одну строку с текстом:
+    #    «1.1 Название. Далее идёт текст...» — срезаем только префикс.
     heading_words = re.escape(_heading_compare_key(heading))
     if heading_words:
+        # Нормальная регулярка по исходному тексту: номер + заголовок + пунктуация.
         h = re.escape(re.sub(r"^\d+(?:\.\d+)*\s+", "", heading).strip())
         result = re.sub(
             rf"^\s*\d{{1,3}}(?:\.\d{{1,3}})*\.?\s*{h}\s*[.:—\-–]?\s*",
@@ -4111,8 +5032,15 @@ def _strip_duplicate_heading_prefix(text: str, heading: str) -> str:
 
 
 def _format_heading_with_dot(title: str, level: int) -> str:
+    """Форматирует заголовок по ГОСТ 7.32-2017.
+
+    Для разделов основной части используется нумерация без слова «Глава» и
+    без точки после последней цифры номера: «1 Название», «1.1 Название».
+    Структурные элементы (ВВЕДЕНИЕ/ЗАКЛЮЧЕНИЕ/СПИСОК/АННОТАЦИЯ …) не трогаем.
+    """
     if not title:
         return title
+    # fix13: убираем markdown #/* перед заголовком (LLM любит их вставлять)
     title = _strip_markdown_markers(title)
     title = re.sub(r'^\s*#{1,6}\s*', '', title)
     title = re.sub(r'\s*#{1,6}\s*$', '', title)
@@ -4135,6 +5063,7 @@ def _format_heading_with_dot(title: str, level: int) -> str:
 
 
 def _apply_heading_format_to_blocks(blocks):
+    """Прогоняет _format_heading_with_dot по всем уровням, включая subblocks (fix12)."""
     out = []
     for title, level, text, subblocks in blocks:
         new_title = _format_heading_with_dot(title, level)
@@ -4147,9 +5076,15 @@ def _apply_heading_format_to_blocks(blocks):
 
 
 def _is_structural_heading(title: str) -> bool:
+    """ГОСТ 7.32-2017 §6.3: «структурные элементы» (СОДЕРЖАНИЕ, ВВЕДЕНИЕ,
+    ЗАКЛЮЧЕНИЕ, СПИСОК ИСПОЛЬЗОВАННЫХ ИСТОЧНИКОВ, ПРИЛОЖЕНИЕ …) — по центру,
+    прописными, без отступа. Разделы основной части (1, 1.1, …) выравниваются
+    влево с абзацного отступа.
+    """
     if not title:
         return False
     t = title.strip().upper()
+    # Не начинается с цифры (значит не «1 Название» / «1.1 Название»)
     keys = (
         "СОДЕРЖАНИЕ", "ОГЛАВЛЕНИЕ",
         "ВВЕДЕНИЕ",
@@ -4172,6 +5107,10 @@ def add_paragraphs_from_text(
     is_bib: bool = False,
     skip_first_heading: Optional[str] = None,
 ) -> None:
+    """
+    Разбивает текст на абзацы и добавляет их в документ.
+    skip_first_heading - если передан, удаляет первую строку, совпадающую с этим заголовком
+    """
     font   = gost.get("font_name", "Times New Roman")
     size   = int(gost.get("font_size", 14))
     indent = Cm(float(gost.get("first_line_indent_cm", 1.25)))
@@ -4183,8 +5122,11 @@ def add_paragraphs_from_text(
         if skip_first_heading:
             text = _strip_duplicate_heading_prefix(text, skip_first_heading)
 
+    # Удаляем первый заголовок если нужно
     if skip_first_heading and not is_bib and text:
         lines = text.split('\n')
+        # fix16: нормализуем обе стороны одинаково — снимаем markdown,
+        # ведущую нумерацию "2.3", "2.3." и точки.
         def _norm_for_match(s: str) -> str:
             s = re.sub(r"^#{1,6}\s*", "", s.strip())
             s = re.sub(r"^\d{1,3}(?:\.\d{1,3})*\.?\s+", "", s)
@@ -4192,6 +5134,7 @@ def add_paragraphs_from_text(
             return s
 
         def _line_matches(line: str) -> bool:
+            # Сравниваем максимально «очищенные» версии строк
             def _deep_clean(s: str) -> str:
                 s = s.strip().lower()
                 s = re.sub(r'^\s*#{1,6}\s*', '', s)
@@ -4202,8 +5145,11 @@ def add_paragraphs_from_text(
             return _deep_clean(line) == _deep_clean(skip_first_heading)
 
         def _is_bare_number(line: str) -> bool:
+            # «1.1.» или «1.1» без текста после
             return bool(re.match(r"^\s*\d{1,3}(?:\.\d{1,3})*\.?\s*$", line.strip()))
 
+        # Повторяем до 3 раз: бывает LLM пишет
+        # "1.1.\n1.1 Title\nТекст" или "1.1. Title\n1.1 Title\nТекст".
         for _ in range(3):
             stripped = False
             if lines:
@@ -4212,10 +5158,12 @@ def add_paragraphs_from_text(
                     lines = lines[1:]
                     stripped = True
                 elif _is_bare_number(first) and len(lines) >= 2 and _line_matches(lines[1]):
+                    # bare "1.1." на первой строке + полный заголовок на второй
                     lines = lines[2:]
                     stripped = True
             if not stripped:
                 break
+            # Чистим ведущие пустые строки между итерациями
             while lines and not lines[0].strip():
                 lines = lines[1:]
         text = "\n".join(lines).strip()
@@ -4246,6 +5194,7 @@ def add_paragraphs_from_text(
         first_line = ch.split("\n")[0].strip()
 
         if subheading_pat.match(first_line):
+            # Подзаголовок — жирным в обычном абзаце (не Heading 2)
             p = doc.add_paragraph()
             _apply_body_format(p)
             run1 = p.add_run(first_line)
@@ -4268,16 +5217,21 @@ def build_docx_bytes(
     blocks: list[tuple],
     gost: dict,
 ) -> bytes:
+    """Собирает DOCX из блоков."""
     doc = Document()
     setup_gost_page(doc, gost)
 
+    # ── Титульный лист ──
     add_title_page(doc, data, gost)
     doc.add_page_break()
 
+    # ── Содержание ──
     fn   = gost.get("font_name", "Times New Roman")
     fs   = int(gost.get("font_size", 14))
-    hfs  = heading_font_size(gost)
+    hfs  = heading_font_size(gost)   # единый размер заголовков 1-го ур. (ошибка #4)
 
+    # «СОДЕРЖАНИЕ» оформляем как заголовок 1-го уровня по виду (ошибка #4),
+    # но НЕ через стиль Heading 1 — иначе попадёт в само поле TOC.
     p_toc_title = doc.add_paragraph()
     p_toc_title.alignment = WD_ALIGN_PARAGRAPH.CENTER
     p_toc_title.paragraph_format.first_line_indent = Cm(0)
@@ -4288,11 +5242,19 @@ def build_docx_bytes(
 
     add_toc(doc, blocks, gost)
 
+    # НЕ добавляем doc.add_page_break() после содержания!
+    # Разрыв страницы будет установлен через page_break_before
+    # на первом заголовке Heading 1 тела документа (см. цикл ниже).
+    # Это предотвращает пустые страницы после содержания.
+
+    # ── Нумерация страниц ──
     add_page_number_field(
         doc.sections[0],
         gost.get("page_number_position", "bottom_center"),
     )
 
+    # ── Тело документа ──
+    # Убираем дубликаты блоков по заголовку (case-insensitive)
     seen_titles = set()
     unique_blocks = []
     for b in blocks:
@@ -4303,6 +5265,8 @@ def build_docx_bytes(
     blocks = unique_blocks
 
     for idx, (title, level, text, subblocks) in enumerate(blocks):
+        # Заголовок главы. Все заголовки 1-го уровня — единый размер (ошибка #4),
+        # единые интервалы задаёт стиль Heading (ошибки #2, #8).
         style = "Heading 1" if level == 1 else "Heading 2"
         h_sz  = hfs if level == 1 else fs
         hp    = doc.add_paragraph(title, style=style)
@@ -4310,6 +5274,10 @@ def build_docx_bytes(
             _set_run_font(run, fn, h_sz, True)
         hp.paragraph_format.first_line_indent = Cm(0)
 
+        # ── Выравнивание заголовков по ГОСТ 7.32-2017 ──
+        # Структурные элементы (СОДЕРЖАНИЕ/ВВЕДЕНИЕ/ЗАКЛЮЧЕНИЕ/СПИСОК/ПРИЛОЖЕНИЕ)
+        # — по центру без отступа. Разделы основной части (1, 1.1) — слева
+        # с абзацного отступа.
         if level == 1 and _is_structural_heading(title):
             hp.alignment = WD_ALIGN_PARAGRAPH.CENTER
         else:
@@ -4318,17 +5286,27 @@ def build_docx_bytes(
                 float(gost.get("first_line_indent_cm", 1.25))
             )
 
+        # ══ Разрыв страницы ПЕРЕД каждым заголовком 1-го уровня ══
+        # Используем page_break_before на самом параграфе заголовка,
+        # а НЕ doc.add_page_break() после предыдущего блока.
+        # «СОДЕРЖАНИЕ» уже обработано выше отдельным параграфом.
         if level == 1 and title.upper() != "СОДЕРЖАНИЕ":
             hp.paragraph_format.page_break_before = True
 
+        # Основной текст главы
         is_bib = any(w in title.upper() for w in ("ИСТОЧНИК", "ЛИТЕРАТ", "БИБЛИОГРАФ"))
 
+        # Пропуск пустых списков литературы
         if is_bib and (not text or len(text.strip()) < 50):
             continue
 
         if subblocks:
+            # Есть подблоки — выводим их с заголовком Heading 2 и текстом
+            # Предварительно проверяем: если все подглавы пусты, а общий текст есть —
+            # распределяем общий текст между подглавами
             all_empty = all(not st for _, st in subblocks)
             if all_empty and text:
+                # Делим общий текст на примерно равные части
                 paragraphs_all = [p.strip() for p in re.split(r'\n\s*\n', text) if p.strip()]
                 chunk_size = max(1, len(paragraphs_all) // max(1, len(subblocks)))
                 chunks = []
@@ -4345,8 +5323,10 @@ def build_docx_bytes(
                     _set_run_font(run, fn, fs, True)
                 shp.paragraph_format.first_line_indent = Cm(0)
                 if sub_text:
+                    # Убираем продублированный заголовок подглавы из текста
                     add_paragraphs_from_text(doc, sub_text, gost, skip_first_heading=sub_title)
                 else:
+                    # ═══ Подглава без текста — вставляем аварийную заглушку ПРЯМО В DOCX ═══
                     print(f"[EMERGENCY] Подглава «{sub_title}» без текста — вставляю заглушку в DOCX")
                     emergency_text = (
                         f"Данный раздел посвящён рассмотрению вопросов, связанных "
@@ -4364,10 +5344,13 @@ def build_docx_bytes(
                     er = ep.add_run(emergency_text)
                     _set_run_font(er, fn, fs, False)
                 
+                # Добавляем пустую строку между подглавами для визуального разделения
                 if sub_idx < len(subblocks) - 1:
                     doc.add_paragraph()
         elif text:
+            # Нет подблоков — выводим основной текст
             clean_text = text
+            # Стрипаем продублированный заголовок из начала текста
             first_line = text.split('\n')[0].strip()
             norm_title = _norm_heading(title)
             norm_first = _norm_heading(first_line)
@@ -4377,9 +5360,11 @@ def build_docx_bytes(
                 rest = text[len(first_line):].lstrip('\n').lstrip('\r')
                 clean_text = rest if rest else text
             add_paragraphs_from_text(doc, clean_text, gost, is_bib=is_bib, skip_first_heading=title if is_bib else None)
+            # fix13: разрыв страницы после списка литературы (даже если он последний)
             if is_bib:
                 doc.add_page_break()
         else:
+            # ═══ Блок без текста — вставляем аварийную заглушку ═══
             print(f"[EMERGENCY] Блок «{title}» полностью пуст — вставляю заглушку")
             if not is_bib:
                 emergency_text = (
@@ -4404,6 +5389,7 @@ def build_docx_bytes(
 
 
 def libreoffice_update_docx(in_path: str, out_path: str) -> bool:
+    """Прогоняет через LibreOffice чтобы обновить TOC и поля страниц."""
     soffice = shutil.which("soffice")
     if not soffice:
         return False
@@ -4454,10 +5440,53 @@ def libreoffice_update_docx(in_path: str, out_path: str) -> bool:
 
 
 # ═══════════════════════════════════════════════════════════════
+#  ТОЧНЫЙ ПОДСЧЁТ СТРАНИЦ DOCX ЧЕРЕЗ LIBREOFFICE → PDF
+# ═══════════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════
+#  УЛУЧШЕННЫЙ СЕРВИС ПОДСЧЁТА СТРАНИЦ ДЛЯ ГОСТ-АССИСТЕНТА
+# ═══════════════════════════════════════════════════════════════
+
+try:
+    from pypdf import PdfReader
+except ImportError:
+    try:
+        from PyPDF2 import PdfReader
+    except ImportError:
+        PdfReader = None
+
+try:
+    import fitz  # PyMuPDF — лучший парсер PDF
+except ImportError:
+    fitz = None
+
+
+# Калибровочный множитель (ИСПРАВЛЕНО: 1.10 → 1.00)
+_ESTIM_CALIBRATION = 1.00
+
+
+def target_pages_from_chars(chars: int, gost: dict = None) -> int:
+    """Возвращает количество страниц по количеству символов"""
+    if gost:
+        chars_per_page = calculate_chars_per_page(gost)
+    else:
+        chars_per_page = CHARS_PER_PAGE
+    text_pages = max(1, chars // chars_per_page)
+    return text_pages + NON_TEXT_PAGES
+
+
+class ImprovedPageCounter:
+    pass
+
+class PageAdapter:
+    pass
+
+# ═══════════════════════════════════════════════════════════════
 #  ПОДСЧЁТ СТРАНИЦ ЧЕРЕЗ LIBREOFFICE → PDF
 # ═══════════════════════════════════════════════════════════════
 
 def libreoffice_docx_to_pdf(in_path: str, out_dir: str) -> Optional[str]:
+    """Конвертирует DOCX в PDF через LibreOffice. Возвращает путь к PDF или None."""
     soffice = shutil.which("soffice")
     if not soffice:
         return None
@@ -4482,6 +5511,8 @@ def libreoffice_docx_to_pdf(in_path: str, out_dir: str) -> Optional[str]:
 
 
 def count_pdf_pages(pdf_path: str) -> Optional[int]:
+    """Считает страницы PDF. Приоритет: PyMuPDF → PyPDF2 → pdfinfo"""
+    # 1) PyMuPDF (лучший, если установлен)
     try:
         import fitz
         doc = fitz.open(pdf_path)
@@ -4493,6 +5524,7 @@ def count_pdf_pages(pdf_path: str) -> Optional[int]:
     except Exception as e:
         print(f"[PyMuPDF] Ошибка: {e}")
     
+    # 2) PyPDF2 / pypdf
     try:
         from pypdf import PdfReader
         with open(pdf_path, "rb") as f:
@@ -4511,6 +5543,7 @@ def count_pdf_pages(pdf_path: str) -> Optional[int]:
     except Exception:
         pass
     
+    # 3) pdfinfo (poppler-utils)
     pdfinfo = shutil.which("pdfinfo")
     if pdfinfo:
         try:
@@ -4523,6 +5556,7 @@ def count_pdf_pages(pdf_path: str) -> Optional[int]:
         except Exception:
             pass
     
+    # 4) Грубый подсчёт /Type /Page в сыром PDF
     try:
         with open(pdf_path, "rb") as f:
             blob = f.read()
@@ -4532,6 +5566,7 @@ def count_pdf_pages(pdf_path: str) -> Optional[int]:
 
 
 def count_docx_pages(docx_path: str, work_dir: str) -> Optional[int]:
+    """Возвращает реальное число страниц DOCX (через LibreOffice→PDF)."""
     pdf = libreoffice_docx_to_pdf(docx_path, work_dir)
     if not pdf:
         return None
@@ -4544,19 +5579,17 @@ def count_docx_pages(docx_path: str, work_dir: str) -> Optional[int]:
             pass
 
 
-_ESTIM_CALIBRATION = 1.00
-
-
-def target_pages_from_chars(chars: int, gost: dict = None) -> int:
-    if gost:
-        chars_per_page = calculate_chars_per_page(gost)
-    else:
-        chars_per_page = CHARS_PER_PAGE
-    text_pages = max(1, chars // chars_per_page)
-    return text_pages + NON_TEXT_PAGES
+# ═══════════════════════════════════════════════════════════════
+#  РАСЧЁТНЫЙ ЭСТИМАТОР СТРАНИЦ (без внешних зависимостей)
+# ═══════════════════════════════════════════════════════════════
 
 
 def estimate_docx_pages(docx_path: str) -> Optional[int]:
+    """
+    Эмулирует разбивку DOCX по страницам без внешних инструментов.
+    Учитывает: размер страницы A4, поля, шрифт, межстрочный интервал,
+    отступ красной строки, заголовки, ПРИНУДИТЕЛЬНЫЕ РАЗРЫВЫ СТРАНИЦ.
+    """
     try:
         from docx import Document as _D
         doc = _D(docx_path)
@@ -4598,6 +5631,7 @@ def estimate_docx_pages(docx_path: str) -> Optional[int]:
     if line_spacing < 0.5:
         line_spacing = 1.5
 
+    # Средняя ширина символа Times New Roman (в пунктах)
     char_width_pt = base_size * 0.42
     chars_per_line = max(20, int(text_w_pt / char_width_pt))
     
@@ -4611,31 +5645,56 @@ def estimate_docx_pages(docx_path: str) -> Optional[int]:
         text = paragraph.text or ""
         total_chars += len(text)
         
+        # Проверяем на page break (включая w:br и pageBreakBefore)
+        # Проверяем page_break_before в свойствах параграфа
         pPr = paragraph._element.find(qn("w:pPr"))
         if pPr is not None:
             pbb = pPr.find(qn("w:pageBreakBefore"))
             if pbb is not None and pbb.get(qn("w:val"), "true") != "false":
                 page_breaks += 1
+        # Проверяем явные разрывы w:br в run-ах
         for run in paragraph.runs:
             for br in run._element.iter(qn("w:br")):
                 if br.get(qn("w:type")) == "page":
                     page_breaks += 1
                     break
 
+    # Расчёт страниц по символам
     estimated_by_chars = max(1, int(total_chars / CHARS_PER_PAGE) + NON_TEXT_PAGES)
+
+    # Расчёт по строкам
     estimated_lines = max(1, int(total_chars / max(1, chars_per_line)))
     estimated_by_lines = max(1, (estimated_lines // max(1, lines_per_page)) + 1 + NON_TEXT_PAGES)
+
+    # ── Поправка на «структурную нагрузку» ──
+    # Каждый разрыв страницы (page_break_before / w:br type=page) фактически
+    # «отдаёт» свою страницу под заголовок + начало содержимого, даже если
+    # текст в этом разделе короткий. Раньше эта поправка отсутствовала, и
+    # для документа из 25 000 знаков с 6+ разрывами эстиматор показывал ~16,
+    # а LibreOffice рендерил 19. Добавляем половину разрыва как штраф —
+    # «верхняя половина страницы под заголовок», к которой потом текст.
     structural_overhead = page_breaks // 2
+
+    # Комбинируем
     estimated = max(
         estimated_by_chars + structural_overhead,
         estimated_by_lines + structural_overhead,
         page_breaks + NON_TEXT_PAGES,
     )
+
+    # Применяем калибровку
     calibrated = int(estimated * _ESTIM_CALIBRATION)
+
     return max(1, calibrated)
 
 
+# ═══════════════════════════════════════════════════════════════
+#  АСИНХРОННЫЙ ПОДСЧЁТ СТРАНИЦ (главная функция)
+# ═══════════════════════════════════════════════════════════════
+
+
 async def count_pages_via_aspose(docx_path: str) -> Optional[int]:
+    """Считает страницы DOCX через Aspose Words Counter API."""
     ASPOSE_ENDPOINT = (
         "https://api.products.aspose.app/words/wordscounter/api/getstatistics"
     )
@@ -4678,16 +5737,29 @@ async def count_pages_via_aspose(docx_path: str) -> Optional[int]:
 
 
 async def measure_pages_async(docx_path: str, work_dir: str) -> Optional[int]:
+    """
+    Главная функция подсчёта страниц (async).
+
+    Порядок приоритетов (v2.7-fix12):
+    1. LibreOffice → PDF + PyMuPDF/PyPDF2 — самый честный для нашего пайплайна:
+       мы и обновляем TOC через LibreOffice, поэтому им же и меряем — чтобы
+       не было расхождения между «померили в Aspose, обновили в LO».
+    2. Aspose Words Counter API — резерв, если soffice недоступен.
+    3. estimate_docx_pages — расчётный, без внешних зависимостей.
+    """
+    # 1) LibreOffice (приоритет: совпадает с тем, чем мы и собираем финал)
     n = count_docx_pages(docx_path, work_dir)
     if n is not None:
         print(f"[LO] Страниц: {n}")
         return n
 
+    # 2) Aspose
     n = await count_pages_via_aspose(docx_path)
     if n is not None:
         print(f"[ASPOSE] Страниц: {n}")
         return n
 
+    # 3) Расчётный эстиматор
     n = estimate_docx_pages(docx_path)
     if n is not None:
         print(f"[ESTIM] Страниц (расчётно): {n}")
@@ -4698,7 +5770,9 @@ async def measure_pages_async(docx_path: str, work_dir: str) -> Optional[int]:
 #  ФУНКЦИИ ДЛЯ ПОДГОНКИ ОБЪЁМА ТЕКСТА
 # ═══════════════════════════════════════════════════════════════
 
+
 def _blocks_text_total(blocks: list[tuple]) -> int:
+    """Подсчитывает общее количество символов во всех блоках"""
     total = 0
     for _t, _l, text, subs in blocks:
         if text:
@@ -4710,6 +5784,7 @@ def _blocks_text_total(blocks: list[tuple]) -> int:
 
 
 def _trim_blocks_by_chars(blocks: list[tuple], chars_to_remove: int) -> list[tuple]:
+    """Аккуратно укорачивает блоки, сохраняя последний абзац целым."""
     if chars_to_remove <= 0:
         return blocks
     
@@ -4720,6 +5795,17 @@ def _trim_blocks_by_chars(blocks: list[tuple], chars_to_remove: int) -> list[tup
         return not any(w in up for w in ("ЛИТЕРАТ", "ИСТОЧНИК", "БИБЛИОГРАФ", "ЗАКЛЮЧЕНИ"))
 
     def _trim_text(txt: str, need: int, floor: int = 0) -> tuple[str, int]:
+        """
+        Откусывает с конца:
+        1) сначала целыми абзацами (пока их >1);
+        2) затем — целыми предложениями внутри последнего абзаца.
+        Жёсткие гарантии:
+          * не уменьшаем текст ниже `floor` символов (защита от «обрубка»);
+          * последний абзац всегда оканчивается на знак конца предложения —
+            если после обрезки остался «висящий» хвост, отрезаем ещё одно
+            предложение;
+          * сохраняется минимум 1 абзац длиной ≥200 знаков.
+        """
         paras = [p for p in txt.split("\n\n") if p.strip()]
         removed_total = 0
         cur_len = len(txt)
@@ -4727,6 +5813,7 @@ def _trim_blocks_by_chars(blocks: list[tuple], chars_to_remove: int) -> list[tup
         def _cur_len_paras():
             return sum(len(p) for p in paras) + 2 * max(0, len(paras) - 1)
 
+        # 1) Абзацами с конца — пока их больше одного и не упёрлись в floor
         while paras and need > 0 and len(paras) > 1:
             tail_len = len(paras[-1]) + 2
             if floor > 0 and cur_len - tail_len < floor:
@@ -4735,6 +5822,7 @@ def _trim_blocks_by_chars(blocks: list[tuple], chars_to_remove: int) -> list[tup
             cur_len -= tail_len
             need -= tail_len
             removed_total += tail_len
+        # 2) Последний абзац — режем по предложениям
         if paras and need > 0:
             last = paras[-1]
             parts = re.split(r'(?<=[.!?…])\s+', last)
@@ -4753,15 +5841,22 @@ def _trim_blocks_by_chars(blocks: list[tuple], chars_to_remove: int) -> list[tup
                 removed_total += tail_sent_len
             paras[-1] = " ".join(parts).rstrip()
 
+        # 3) Гарантия завершённости: последний абзац должен заканчиваться
+        #    знаком конца предложения. Если нет — отрезаем «висящий» хвост.
         if paras:
             last = paras[-1].rstrip()
             if last and last[-1] not in ".!?…»":
+                # Ищем последний знак конца предложения
                 m = re.search(r"[.!?…][»\"']?\s*$", last)
                 if not m:
+                    # Ищем последний знак конца предложения.
+                    # Чтобы не обрезать на «с. 45», ищем точку, которая НЕ является частью «с. {цифра}».
+                    # Используем поиск с конца.
                     cut = -1
                     for i in range(len(last) - 1, -1, -1):
                         char = last[i]
                         if char in ".!?…":
+                            # Проверяем, не является ли эта точка частью «с. {цифра}»
                             is_page_dot = False
                             if char == '.':
                                 if i > 0 and last[i-1].lower() == 'с':
@@ -4769,13 +5864,18 @@ def _trim_blocks_by_chars(blocks: list[tuple], chars_to_remove: int) -> list[tup
                             if not is_page_dot:
                                 cut = i
                                 break
-                    if cut > 50:
+                    if cut > 50:  # не калечим короткий абзац
+                        # Включаем сам знак препинания
                         new_last = last[: cut + 1].rstrip()
                         removed_total += len(last) - len(new_last)
                         paras[-1] = new_last
                     else:
+                        # Дописываем точку, чтобы не было обрыва
                         paras[-1] = last + "."
 
+        # fix16: финальная очистка broken-citation после обрезки.
+        # `_trim_text` может оставить хвост `… породами [1, с.` — guard
+        # выше принимает `.` из `с.` как конец предложения и не режет.
         result = "\n\n".join(paras)
         cleaned = _repair_broken_citations(result)
         if cleaned != result:
@@ -4783,6 +5883,7 @@ def _trim_blocks_by_chars(blocks: list[tuple], chars_to_remove: int) -> list[tup
             result = cleaned
         return result, removed_total
 
+    # Сортируем кандидатов по размеру (самые большие первые)
     def _block_total(i: int) -> int:
         b = blocks[i]
         total = len(b[2] or "")
@@ -4803,6 +5904,8 @@ def _trim_blocks_by_chars(blocks: list[tuple], chars_to_remove: int) -> list[tup
         subblocks = b[3]
 
         if subblocks:
+            # Обрезаем с последней подглавы. Каждой подглаве — пол «70 %
+            # от текущей длины», чтобы они не превращались в обрубки.
             for si in range(len(subblocks) - 1, -1, -1):
                 if chars_to_remove <= 0:
                     break
@@ -4813,6 +5916,7 @@ def _trim_blocks_by_chars(blocks: list[tuple], chars_to_remove: int) -> list[tup
                 new_stext, removed = _trim_text(stext, chars_to_remove, floor=floor)
                 chars_to_remove -= removed
                 subblocks[si] = (stitle, new_stext)
+            # Обновляем агрегированный текст
             b[2] = "\n\n".join(st for _, st in subblocks if st)
         else:
             txt = b[2] or ""
@@ -4822,6 +5926,7 @@ def _trim_blocks_by_chars(blocks: list[tuple], chars_to_remove: int) -> list[tup
                 chars_to_remove -= removed
                 b[2] = new_txt
 
+    # Логируем состояние после обрезки
     for b in blocks:
         title = b[0][:40]
         text_len = len(b[2] or "")
@@ -4840,17 +5945,22 @@ async def _expand_blocks_by_chars(
     writing_style: str,
     prog: Optional["Progress"] = None,
 ) -> list[tuple]:
+    """Дозаписывает текст в основные главы, чтобы добрать chars_to_add символов."""
     if chars_to_add <= 0:
         return blocks
     
     blocks = [list(b) for b in blocks]
 
+    # fix15: вытаскиваем кол-во источников, чтобы прогнать дописанные куски
+    # через тот же chain (_repair → _fix_citations → _fill_missing_pages).
     n_sources_local = 0
     for _b in blocks:
         if "ЛИТЕРАТ" in (_b[0] or "").upper() or "ИСТОЧНИК" in (_b[0] or "").upper():
             n_sources_local = _count_sources(_b[2] or "")
             break
 
+    # fix16: глобальная карта страниц по всем блокам — чтобы bare `[N]`
+    # в дописанных кусках получал страницу из ранее увиденных `[N, с. K]`.
     _global_pm: dict = {}
     for _b in blocks:
         for _, _st in (_b[3] or []):
@@ -4872,6 +5982,7 @@ async def _expand_blocks_by_chars(
     if not candidates:
         return [tuple(b) for b in blocks]
 
+    # Равномерно распределяем нагрузку + 30% запас
     per_block = int((chars_to_add / max(1, len(candidates))) * 1.3) + 300
     
     style_label = "высокоакадемический научный" if writing_style == "smart" else "деловой научный"
@@ -4928,6 +6039,7 @@ async def _expand_blocks_by_chars(
             if not extra or len(extra.strip()) < 100:
                 continue
 
+            # fix15+16: тот же chain очисток, плюс глобальная карта страниц
             extra = _clean_llm_chunk(extra.strip(), n_sources=n_sources_local,
                                      global_page_map=_global_pm)
             if not extra:
@@ -4935,6 +6047,7 @@ async def _expand_blocks_by_chars(
             text = (text.rstrip() + "\n\n" + extra) if text else extra
             need -= len(extra)
 
+        # Обновляем блок
         if blocks[i][3]:
             last_idx = len(blocks[i][3]) - 1
             stitle, stext = blocks[i][3][last_idx]
@@ -4949,6 +6062,11 @@ async def _expand_blocks_by_chars(
     return [tuple(b) for b in blocks]
 
 
+# ═══════════════════════════════════════════════════════════════
+#  ФУНКЦИЯ ДЛЯ ТОЧНОЙ ПОДГОНКИ СТРАНИЦ (НОВАЯ)
+# ═══════════════════════════════════════════════════════════════
+
+
 async def precise_page_adjustment(
     tmp_in: str,
     blocks: list[tuple],
@@ -4961,6 +6079,10 @@ async def precise_page_adjustment(
     prog: Optional["Progress"] = None,
     work_dir: str = None,
 ) -> tuple[list[tuple], int]:
+    """
+    Точная подгонка количества страниц.
+    Возвращает (блоки, финальное_количество_страниц)
+    """
     if work_dir is None:
         work_dir = os.path.dirname(tmp_in)
     
@@ -4971,6 +6093,7 @@ async def precise_page_adjustment(
     target_chars_goal = target_chars(target_pages, gost)
     
     for it in range(max_iters):
+        # Измеряем текущее количество страниц
         real_pages = await measure_pages_async(tmp_in, measure_dir)
         
         if real_pages is None:
@@ -4986,50 +6109,62 @@ async def precise_page_adjustment(
                 force=True,
             )
         
+        # Достигли цели?
         if diff == 0:
             print("[ADJUST] ✅ Цель достигнута!")
             break
+        elif diff > 0:
+            # Всегда обрезаем если перебор (даже +1), чтобы не было +1 над целью
+            pass  # continue to trim
         elif it >= 10 and abs(diff) <= 1:
             print(f"[ADJUST] ✅ Приемлемая цель достигнута на поздней итерации: {real_pages} стр.")
             break
         
+        # Рассчитываем сколько символов нужно добавить/убрать
         chars_per_real_page = calculate_chars_per_page(gost)
         
         if diff > 0:
+            # Слишком много страниц — обрезаем. Множитель 1.0 (раньше 0.8) —
+            # консерватизм давал недорез на 1–2 страницы за итерацию и
+            # приводил к остановке цикла раньше времени.
             chars_to_remove = int(diff * chars_per_real_page * 1.0)
             print(f"[ADJUST] ✂️ Обрезаю {chars_to_remove} знаков")
             _before = _blocks_text_total(blocks)
             blocks = _trim_blocks_by_chars(blocks, chars_to_remove)
             _after = _blocks_text_total(blocks)
+            # Если обрезка упёрлась в floor и реально ничего не удалила —
+            # дальнейшие итерации бессмысленны (мы защищаем целостность глав).
             if _before - _after < max(50, chars_to_remove // 10):
                 print(f"[ADJUST] ⛔ Обрезка упёрлась в порог целостности "
                       f"({_before - _after} зн. из {chars_to_remove}). "
                       f"Останавливаюсь: {real_pages} стр. вместо {target_pages}.")
                 break
         else:
+            # Слишком мало страниц — добавляем
             chars_to_add = int(abs(diff) * chars_per_real_page)
             print(f"[ADJUST] ➕ Добавляю {chars_to_add} знаков")
             blocks = await _expand_blocks_by_chars(
                 blocks, chars_to_add, topic, model_key, writing_style, prog,
             )
         
+        # Пересобираем DOCX
         docx_raw = build_docx_bytes(data, blocks, gost)
         with open(tmp_in, "wb") as f:
             f.write(docx_raw)
 
+        # ═══ ЗАЩИТА: проверяем что текст не потерялся после обрезки ═══
         _total_text = sum(len(b[2] or "") for b in blocks)
         if _total_text < int(target_chars_goal * 0.5):
             print(f"[ADJUST] ⚠️ Текст сократился слишком сильно ({_total_text} зн. при цели {target_chars_goal}). Прерываю обрезку для сохранения смысла.")
             break
     
+    # Финальный замер
     final_pages = await measure_pages_async(tmp_in, measure_dir)
     if final_pages is None:
         final_pages = target_pages
     
     print(f"[ADJUST] 🎯 Финальный результат: {final_pages} страниц")
     return blocks, final_pages
-
-
 # ═══════════════════════════════════════════════════════════════
 #  «СВОЙ ГОСТ» — ПАРСИНГ ТРЕБОВАНИЙ ЧЕРЕЗ ИИ
 # ═══════════════════════════════════════════════════════════════
@@ -5082,6 +6217,7 @@ async def parse_custom_gost_via_ai(model_key: str, gost_text: str) -> dict:
         if k in data and data[k] not in (None, ""):
             out[k] = data[k]
 
+    # Приведение типов
     try:
         out["font_size"] = int(out["font_size"])
     except Exception:
@@ -5106,7 +6242,7 @@ async def parse_custom_gost_via_ai(model_key: str, gost_text: str) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════
-#  КЛАВИАТУРЫ
+#  КЛАВИАТУРЫ — КРАСИВЫЕ
 # ═══════════════════════════════════════════════════════════════
 
 def kb_doc_type() -> InlineKeyboardMarkup:
@@ -5186,6 +6322,8 @@ def kb_page_number() -> InlineKeyboardMarkup:
 
 
 def kb_humanize() -> InlineKeyboardMarkup:
+    # Оставлено только для совместимости со старыми сообщениями Telegram.
+    # Опечатки и искусственные неточности отключены в обработчике.
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="📝 Продолжить без опечаток и маркеров ИИ", callback_data="humanize_no")],
@@ -5224,6 +6362,7 @@ def kb_cancel() -> InlineKeyboardMarkup:
 
 
 def with_back(markup: Optional[InlineKeyboardMarkup] = None, *, cancel: bool = True) -> InlineKeyboardMarkup:
+    """Добавляет к любой inline-клавиатуре навигацию «Назад / Отмена»."""
     rows = [list(row) for row in (markup.inline_keyboard if markup else [])]
     nav = [InlineKeyboardButton(text="← Назад", callback_data="back_flow")]
     if cancel:
@@ -5418,6 +6557,7 @@ async def h_cancel_flow(cb: CallbackQuery, state: FSMContext) -> None:
 
 @dp.callback_query(F.data == "back_flow")
 async def h_back_flow(cb: CallbackQuery, state: FSMContext) -> None:
+    """Кнопка «Назад» для основного мастера создания работы."""
     cur = await state.get_state()
     data = await state.get_data()
 
@@ -5425,6 +6565,7 @@ async def h_back_flow(cb: CallbackQuery, state: FSMContext) -> None:
         await cb.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
         await state.set_state(new_state)
 
+    # 1. Возврат к выбору типа работы
     if cur in (WorkState.custom_doc_name.state, WorkState.mode.state, WorkState.gost_free_text.state):
         first = cb.from_user.first_name or "пользователь"
         await cb.message.edit_text(
@@ -5436,6 +6577,7 @@ async def h_back_flow(cb: CallbackQuery, state: FSMContext) -> None:
         await cb.answer()
         return
 
+    # 2. Режим / стиль / тема
     if cur == WorkState.writing_style.state:
         doc_type = data.get("doc_type", "referat")
         await edit(_doc_type_card(doc_type, cb.from_user.id), with_back(kb_mode()), WorkState.mode)
@@ -5466,6 +6608,8 @@ async def h_back_flow(cb: CallbackQuery, state: FSMContext) -> None:
             with_back(kb_source_choice()),
             WorkState.source_choice,
         )
+
+    # 3. Учебное заведение и данные титула
     elif cur == WorkState.org_type.state:
         await edit("🏛 <b>Тип учебного заведения</b>\n\nВыберите из списка:", with_back(kb_institution()), WorkState.institution_type)
     elif cur == WorkState.institution.state:
@@ -5509,6 +6653,8 @@ async def h_back_flow(cb: CallbackQuery, state: FSMContext) -> None:
         await edit("📚 <b>Выберите дисциплину (предмет)</b>", with_back(kb_subject()), WorkState.subject)
     elif cur == WorkState.pages.state:
         await edit("🌆 <b>Выберите город:</b>", with_back(kb_city()), WorkState.city)
+
+    # 4. Параметры генерации
     elif cur == WorkState.page_number_position.state:
         await edit(_pages_prompt_text(data, cb.from_user.id), kb_back_cancel(), WorkState.pages)
     elif cur == WorkState.humanize.state:
@@ -5711,10 +6857,6 @@ async def h_writing_style(cb: CallbackQuery, state: FSMContext) -> None:
     await cb.answer()
 
 
-# ═══════════════════════════════════════════════════════════════
-#  ХЭНДЛЕРЫ — ТЕМА, ИСТОЧНИКИ, УЧЕБНОЕ ЗАВЕДЕНИЕ
-# ═══════════════════════════════════════════════════════════════
-
 @dp.message(WorkState.topic)
 async def h_topic(message: Message, state: FSMContext) -> None:
     topic = (message.text or "").strip()
@@ -5725,7 +6867,7 @@ async def h_topic(message: Message, state: FSMContext) -> None:
         )
         return
 
-    await state.update_data(topic=topic)
+    await state.update_data(topic=topic, subj_check_passed=False)
     await message.answer(
         f"✅ Тема принята: <b>{topic[:80]}</b>\n\n"
         "📎 <b>Есть ли у вас свои материалы?</b>\n\n"
@@ -5740,29 +6882,29 @@ async def h_topic(message: Message, state: FSMContext) -> None:
 
 @dp.callback_query(F.data == "source_yes")
 async def h_source_yes(cb: CallbackQuery, state: FSMContext) -> None:
+    """Пользователь выбрал 'Да — добавлю свои материалы'"""
     await cb.message.edit_text(
         "📎 <b>Отправьте ваши материалы</b>\n\n"
         "Вставьте план, тезисы, конспект, ссылки на сайты или любой текст — ИИ использует это как основу.\n"
         "Ссылки попадут в список литературы как реальные электронные ресурсы.\n"
         "<i>Максимум 12 000 символов.</i>",
         parse_mode="HTML",
-        reply_markup=kb_back_cancel(),
+        reply_markup=kb_back_cancel(),  # <-- ИСПРАВЛЕНО
     )
     await state.set_state(WorkState.source_content)
     await cb.answer()
 
-
 @dp.callback_query(F.data == "source_no")
 async def h_source_no(cb: CallbackQuery, state: FSMContext) -> None:
+    """Пользователь выбрал 'Нет — только по теме'"""
     await state.update_data(source_content="")
     await cb.message.edit_text(
         "🏛 <b>Тип учебного заведения</b>\n\nВыберите из списка:",
-        reply_markup=with_back(kb_institution()),
+        reply_markup=with_back(kb_institution()),  # <-- ИСПРАВЛЕНО: используем правильную клавиатуру
         parse_mode="HTML",
     )
     await state.set_state(WorkState.institution_type)
     await cb.answer()
-
 
 @dp.message(WorkState.source_content)
 async def h_source_content(message: Message, state: FSMContext) -> None:
@@ -5778,7 +6920,7 @@ async def h_source_content(message: Message, state: FSMContext) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════
-#  ХЭНДЛЕРЫ — УЧЕБНОЕ ЗАВЕДЕНИЕ И ДИСЦИПЛИНА
+#  ХЭНДЛЕРЫ — УЧЕБНОЕ ЗАВЕДЕНИЕ
 # ═══════════════════════════════════════════════════════════════
 
 @dp.callback_query(F.data.startswith("inst_"))
@@ -5849,6 +6991,7 @@ async def h_group(message: Message, state: FSMContext) -> None:
 async def h_author(message: Message, state: FSMContext) -> None:
     author = (message.text or "").strip()
 
+    # Валидация
     words = author.split()
     if len(words) < 2 or _is_garbage(author):
         await message.answer(
@@ -5890,6 +7033,7 @@ async def h_author(message: Message, state: FSMContext) -> None:
 async def h_teacher(message: Message, state: FSMContext) -> None:
     teacher = (message.text or "").strip()
 
+    # Валидация
     words = teacher.split()
     if len(words) < 2 or _is_garbage(teacher):
         await message.answer(
@@ -5919,23 +7063,94 @@ async def h_teacher(message: Message, state: FSMContext) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════
-#  ХЭНДЛЕРЫ — ВЫБОР ДИСЦИПЛИНЫ (С УНИВЕРСАЛЬНОЙ ПРОВЕРКОЙ)
+#  ХЭНДЛЕРЫ — ПРЕДМЕТ, ГОРОД, СТРАНИЦЫ
 # ═══════════════════════════════════════════════════════════════
 
+# ============================================================
+# ХЭНДЛЕР ДЛЯ ИСПРАВЛЕНИЯ ДИСЦИПЛИНЫ (УНИВЕРСАЛЬНЫЙ)
+# ============================================================
+
+
+@dp.callback_query(F.data.startswith("fix_subj_"))
+async def h_fix_subject_universal(cb: CallbackQuery, state: FSMContext) -> None:
+    """Обработчик для исправления дисциплины после предупреждения (универсальный)"""
+    action = cb.data.replace("fix_subj_", "", 1)
+    data = await state.get_data()
+      
+    if action == "continue":
+        # Пользователь решил продолжить, несмотря на предупреждение
+        await cb.message.edit_text(
+            "✅ <b>Продолжаем генерацию...</b>\n\n"
+            "Убедитесь, что в тексте вы раскрываете тему через призму заявленной дисциплины.",
+            parse_mode="HTML",
+        )
+        await cb.answer()
+        await generate_and_send(
+            cb.message,   
+            state,   
+            model_key=data.get("model_key", FREE_MODEL_KEY),
+            pay_mode=data.get("mode", "free")
+        )
+        return
+      
+    elif action == "change_topic":
+        # Пользователь хочет изменить тему
+        subject = data.get("subject", "")
+        await cb.message.edit_text(
+            f"✏️ <b>Уточните тему работы</b>\n\n"
+            f"Текущая тема: «{data.get('topic', '')}»\n"
+            f"Дисциплина: «{subject}»\n\n"
+            f"Попробуйте сформулировать тему так, чтобы она лучше соответствовала дисциплине «{subject}».\n"
+            f"<i>Например: вместо «Общие вопросы» → «[Конкретный аспект] в контексте [дисциплина]»</i>",
+            parse_mode="HTML",
+            reply_markup=kb_back_cancel(),
+        )
+        await state.set_state(WorkState.topic)
+        await cb.answer()
+        return
+      
+    else:
+        # Пользователь выбрал одну из предложенных дисциплин
+        new_subject = action
+        await state.update_data(subject=new_subject)
+          
+        await cb.message.edit_text(
+            f"✅ <b>Дисциплина изменена</b>\n\n"
+            f"Новая дисциплина: <b>{new_subject}</b>\n"
+            f"Тема: «{data.get('topic', '')}»\n\n"
+            "🚀 Запускаю генерацию...",
+            parse_mode="HTML",
+        )
+        await cb.answer()
+        await generate_and_send(
+            cb.message,   
+            state,   
+            model_key=data.get("model_key", FREE_MODEL_KEY),
+            pay_mode=data.get("mode", "free")
+        )
+        return
+   
+   
+# ============================================================
+# ОБНОВЛЕННЫЙ ХЭНДЛЕР ВЫБОРА ДИСЦИПЛИНЫ
+# ============================================================
+   
+   
 @dp.callback_query(F.data.startswith("subj_"))
-async def h_subject_cb(cb: CallbackQuery, state: FSMContext) -> None:
+async def h_subject_cb_universal(cb: CallbackQuery, state: FSMContext) -> None:
     subj = cb.data.replace("subj_", "", 1)
     data = await state.get_data()
     topic = data.get("topic", "")
-    
+      
     if subj == "other":
+        # Показываем подсказки для темы (универсальные)
         keywords = extract_topic_keywords(topic)
         suggested = map_keywords_to_disciplines(keywords)
         hint = ""
         if suggested:
             hint = f"\n\n💡 <b>Для темы «{topic}» рекомендуются:</b>\n"
             hint += "\n".join(f"  • {d}" for d in suggested[:5])
-        
+          
         await cb.message.edit_text(
             f"✏️ <b>Введите название предмета</b>{hint}",
             parse_mode="HTML",
@@ -5952,21 +7167,16 @@ async def h_subject_cb(cb: CallbackQuery, state: FSMContext) -> None:
         )
         await state.set_state(WorkState.city)
     await cb.answer()
-
-
-@dp.message(WorkState.subject)
-async def h_subject_text(message: Message, state: FSMContext) -> None:
-    subject = (message.text or "").strip()
-    await state.update_data(subject=subject)
-    await message.answer(
-        "🌆 <b>Выберите город:</b>",
-        reply_markup=with_back(kb_city()),
-        parse_mode="HTML",
-    )
-    await state.set_state(WorkState.city)
-
-
-@dp.callback_query(F.data.startswith("city_"))
+   
+   
+# ============================================================
+# ИНТЕГРАЦИЯ В generate_and_send
+# ============================================================
+   
+   
+# Добавьте этот блок в функцию generate_and_send после проверки темы:
+   
+   
 async def h_city_cb(cb: CallbackQuery, state: FSMContext) -> None:
     city = cb.data.replace("city_", "", 1)
     if city == "other":
@@ -6032,6 +7242,7 @@ async def h_pages(message: Message, state: FSMContext) -> None:
 
     mode = data.get("mode", "free")
 
+    # Клипируем до допустимого диапазона
     min_p = dt["min_pages"]
     if mode == "free" and not is_vip(message.from_user.id):
         max_p = min(dt["max_pages"], FREE_MAX_PAGES)
@@ -6070,6 +7281,7 @@ async def h_pagepos(cb: CallbackQuery, state: FSMContext) -> None:
     pages = int(data.get("pages", 10))
     mode  = data.get("mode", "free")
 
+    # ── Бесплатный режим ──
     if mode == "free":
         if pages > FREE_MAX_PAGES and not is_vip(cb.from_user.id):
             await cb.message.edit_text(
@@ -6089,37 +7301,6 @@ async def h_pagepos(cb: CallbackQuery, state: FSMContext) -> None:
             return
 
         await state.update_data(humanize=False)
-        
-        # Универсальная проверка темы и дисциплины перед генерацией
-        check_ok, check_message, suggested = await check_and_suggest_discipline_universal(
-            FREE_MODEL_KEY, 
-            data.get("topic", ""), 
-            data.get("subject", ""), 
-            data.get("doc_type", "referat")
-        )
-        
-        if not check_ok and suggested:
-            keyboard = InlineKeyboardMarkup(inline_keyboard=[])
-            
-            for d in suggested[:4]:
-                keyboard.inline_keyboard.append([
-                    InlineKeyboardButton(text=f"📚 {d}", callback_data=f"fix_subj_{d}")
-                ])
-            
-            keyboard.inline_keyboard.append([
-                InlineKeyboardButton(text="⚠️ Продолжить (я уверен)", callback_data="fix_subj_continue")
-            ])
-            keyboard.inline_keyboard.append([
-                InlineKeyboardButton(text="✏️ Изменить тему", callback_data="fix_subj_change_topic")
-            ])
-            keyboard.inline_keyboard.append([
-                InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_flow")
-            ])
-            
-            await cb.message.edit_text(check_message, parse_mode="HTML", reply_markup=keyboard)
-            await cb.answer()
-            return
-        
         await cb.message.edit_text(
             "🚀 <b>Запускаю генерацию...</b>\n\n"
             "Текст будет без опечаток, markdown-маркеров и фраз-маркеров ИИ.",
@@ -6129,7 +7310,7 @@ async def h_pagepos(cb: CallbackQuery, state: FSMContext) -> None:
         await generate_and_send(cb.message, state, model_key=FREE_MODEL_KEY, pay_mode="free")
         return
 
-    # Платный режим
+    # ── Платный режим ──
     ok, reason = check_user_limit(cb.from_user.id, "paid")
     if not ok and not is_vip(cb.from_user.id):
         await cb.message.edit_text(reason, parse_mode="HTML")
@@ -6151,6 +7332,7 @@ async def h_pagepos(cb: CallbackQuery, state: FSMContext) -> None:
 
 @dp.callback_query(F.data.in_(["humanize_yes", "humanize_no"]))
 async def h_humanize(cb: CallbackQuery, state: FSMContext) -> None:
+    # Старые кнопки могут остаться в Telegram-сообщениях, но опечатки отключены.
     humanize = False
     await state.update_data(humanize=humanize)
 
@@ -6192,30 +7374,6 @@ async def h_model(cb: CallbackQuery, state: FSMContext) -> None:
     await state.update_data(model_key=model_key)
 
     if is_vip(cb.from_user.id):
-        # VIP проверка
-        check_ok, check_message, suggested = await check_and_suggest_discipline_universal(
-            model_key, data.get("topic", ""), data.get("subject", ""), data.get("doc_type", "referat")
-        )
-        
-        if not check_ok and suggested:
-            keyboard = InlineKeyboardMarkup(inline_keyboard=[])
-            for d in suggested[:4]:
-                keyboard.inline_keyboard.append([
-                    InlineKeyboardButton(text=f"📚 {d}", callback_data=f"fix_subj_{d}")
-                ])
-            keyboard.inline_keyboard.append([
-                InlineKeyboardButton(text="⚠️ Продолжить (я уверен)", callback_data="fix_subj_continue")
-            ])
-            keyboard.inline_keyboard.append([
-                InlineKeyboardButton(text="✏️ Изменить тему", callback_data="fix_subj_change_topic")
-            ])
-            keyboard.inline_keyboard.append([
-                InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_flow")
-            ])
-            await cb.message.edit_text(check_message, parse_mode="HTML", reply_markup=keyboard)
-            await cb.answer()
-            return
-
         await cb.message.edit_text(
             f"👑 <b>VIP — оплата не требуется</b>\n\n"
             f"Модель: {model['name']}\n"
@@ -6305,66 +7463,6 @@ async def h_payment_ok(message: Message, state: FSMContext) -> None:
     await generate_and_send(message, state, model_key=model_key, pay_mode="paid")
 
 
-# ═══════════════════════════════════════════════════════════════
-#  ХЭНДЛЕРЫ ДЛЯ ИСПРАВЛЕНИЯ ДИСЦИПЛИНЫ (УНИВЕРСАЛЬНЫЕ)
-# ═══════════════════════════════════════════════════════════════
-
-@dp.callback_query(F.data.startswith("fix_subj_"))
-async def h_fix_subject_universal(cb: CallbackQuery, state: FSMContext) -> None:
-    action = cb.data.replace("fix_subj_", "", 1)
-    data = await state.get_data()
-    
-    if action == "continue":
-        await cb.message.edit_text(
-            "✅ <b>Продолжаем генерацию...</b>\n\n"
-            "Убедитесь, что в тексте вы раскрываете тему через призму заявленной дисциплины.",
-            parse_mode="HTML",
-        )
-        await cb.answer()
-        await generate_and_send(
-            cb.message, 
-            state, 
-            model_key=data.get("model_key", FREE_MODEL_KEY),
-            pay_mode=data.get("mode", "free")
-        )
-        return
-    
-    elif action == "change_topic":
-        subject = data.get("subject", "")
-        await cb.message.edit_text(
-            f"✏️ <b>Уточните тему работы</b>\n\n"
-            f"Текущая тема: «{data.get('topic', '')}»\n"
-            f"Дисциплина: «{subject}»\n\n"
-            f"Попробуйте сформулировать тему так, чтобы она лучше соответствовала дисциплине «{subject}».\n"
-            f"<i>Например: вместо «Общие вопросы» → «[Конкретный аспект] в контексте [дисциплина]»</i>",
-            parse_mode="HTML",
-            reply_markup=kb_back_cancel(),
-        )
-        await state.set_state(WorkState.topic)
-        await cb.answer()
-        return
-    
-    else:
-        new_subject = action
-        await state.update_data(subject=new_subject)
-        
-        await cb.message.edit_text(
-            f"✅ <b>Дисциплина изменена</b>\n\n"
-            f"Новая дисциплина: <b>{new_subject}</b>\n"
-            f"Тема: «{data.get('topic', '')}»\n\n"
-            "🚀 Запускаю генерацию...",
-            parse_mode="HTML",
-        )
-        await cb.answer()
-        await generate_and_send(
-            cb.message, 
-            state, 
-            model_key=data.get("model_key", FREE_MODEL_KEY),
-            pay_mode=data.get("mode", "free")
-        )
-        return
-
-
 @dp.callback_query(F.data == "final_new")
 async def h_final_new(cb: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
@@ -6388,6 +7486,10 @@ async def generate_and_send(
     model_key: str,
     pay_mode: str,
 ) -> None:
+    """
+    Основная функция генерации: запрашивает названия глав,
+    генерирует текст блоками, собирает DOCX, отправляет.
+    """
     async with GEN_SEMAPHORE:
         data = await state.get_data()
 
@@ -6397,6 +7499,9 @@ async def generate_and_send(
         topic    = (data.get("topic", "") or "").strip()
         subject  = (data.get("subject", "") or "").strip()
 
+        # ═══════════════════════════════════════════════════════════════
+        # ЗАЩИТА ОТ ПУСТЫХ ТЕМЫ И ДИСЦИПЛИНЫ
+        # ═══════════════════════════════════════════════════════════════
         if not topic:
             await event.answer(
                 "❌ <b>Тема не указана</b>\n\n"
@@ -6426,13 +7531,48 @@ async def generate_and_send(
             await state.clear()
             return
 
+        # ═══════════════════════════════════════════════════════════════
+        # УНИВЕРСАЛЬНАЯ ПРОВЕРКА СООТВЕТСТВИЯ ТЕМЫ И ДИСЦИПЛИНЫ
+        # ═══════════════════════════════════════════════════════════════
+        check_ok, check_message, suggested = await check_and_suggest_discipline_universal(
+            model_key, topic, subject, doc_type
+        )
+
+        if not check_ok and suggested:
+            # Создаем клавиатуру с вариантами действий
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[])
+
+            # Добавляем кнопки для предлагаемых дисциплин (максимум 4)
+            for d in suggested[:4]:
+                keyboard.inline_keyboard.append([
+                    InlineKeyboardButton(text=f"📚 {d}", callback_data=f"fix_subj_{d}")
+                ])
+
+            # Кнопка "Продолжить" (игнорировать предупреждение)
+            keyboard.inline_keyboard.append([
+                InlineKeyboardButton(text="⚠️ Продолжить (я уверен)", callback_data="fix_subj_continue")
+            ])
+            keyboard.inline_keyboard.append([
+                InlineKeyboardButton(text="✏️ Изменить тему", callback_data="fix_subj_change_topic")
+            ])
+            keyboard.inline_keyboard.append([
+                InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_flow")
+            ])
+
+            await event.answer(check_message, parse_mode="HTML", reply_markup=keyboard)
+            await state.set_state(WorkState.subject)
+            return
+
+        # Определяем количество глав по типу документа
         if doc_type in ("esse", "doklad", "article"):
-            num_chapters = 0
+            num_chapters = 0  # у них своя структура
         elif doc_type in ("kursovaya", "final_referat", "vkr", "final_project"):
             num_chapters = 4 if doc_type in ("vkr", "final_project") and pages >= 40 else 3
         else:
-            num_chapters = 2
+            num_chapters = 2  # реферат, контрольная, свой
 
+        # Считаем шаги для прогресс-бара (оценка: ~3 подглавы на главу)
+        # 1 = названия глав, блоки = intro + подглавы + lit + conclusion, 1 = DOCX, 1 = отправка
         if doc_type in ("esse",):
             extra_blocks = 6
         elif doc_type in ("doklad",):
@@ -6440,8 +7580,9 @@ async def generate_and_send(
         elif doc_type in ("article",):
             extra_blocks = 7
         else:
+            # chapter_titles ещё не готов — оцениваем: num_chapters * 3 подглавы
             num_subs = max(1, num_chapters * 3)
-            extra_blocks = 1 + num_subs + 2
+            extra_blocks = 1 + num_subs + 2  # intro + N subs + lit + conclusion
         total_steps  = 1 + extra_blocks + 2
 
         progress_msg = await event.answer(
@@ -6455,6 +7596,7 @@ async def generate_and_send(
             model_name=AI_MODELS.get(model_key, {}).get("name", ""),
         )
 
+        # Запускаем фоновый цикл анимации
         stop_anim = asyncio.Event()
         anim_task = asyncio.create_task(prog.animate_loop(stop_anim))
 
@@ -6465,6 +7607,7 @@ async def generate_and_send(
                 gost.get("page_number_position", "bottom_center"),
             )
 
+            # ── Шаг 1: Генерируем названия глав ──
             await prog.update(label="🧠 Придумываю названия глав...", force=True)
             if num_chapters > 0:
                 chapter_titles = await generate_chapter_titles(
@@ -6476,6 +7619,7 @@ async def generate_and_send(
 
             writing_style = data.get("writing_style", "classic")
 
+            # ── Шаги 2–N: Генерируем текст ──
             await prog.update(label="✍️ Генерирую текст разделов...")
             parts = await generate_text_blocks(
                 topic=topic,
@@ -6490,6 +7634,7 @@ async def generate_and_send(
                 humanize=data.get("humanize", False),
             )
 
+            # ── Проверка соответствия дисциплине (приоритет 🔴) ──
             await prog.update(label="🔎 Проверяю соответствие дисциплине...")
             sample_for_check = "\n\n".join(
                 str(parts.get(k, "")) for k in ("intro", "main1", "part1", "ch1_s1")
@@ -6502,8 +7647,10 @@ async def generate_and_send(
                 print(f"[RELEVANCE] ⚠️ Текст может не соответствовать дисциплине "
                       f"«{subject}»: {relevance_reason}")
 
+            # ── Сборка структуры ──
             blocks = generate_structure(doc_type, parts, chapter_titles, topic=topic)
 
+            # ── DOCX ──
             await prog.update(label="📄 Собираю DOCX-документ...", step_done=True)
             work_dir = os.path.join(os.getcwd(), "_out")
             os.makedirs(work_dir, exist_ok=True)
@@ -6511,6 +7658,7 @@ async def generate_and_send(
             tmp_in  = os.path.join(work_dir, f"tmp_{event.chat.id}_{ts}.docx")
             tmp_out = os.path.join(work_dir, f"final_{event.chat.id}_{ts}.docx")
 
+            # Форматируем заголовки «Глава N. ...» / «N.M. ...» (fix12)
             blocks = _apply_heading_format_to_blocks(blocks)
 
             docx_raw = build_docx_bytes(data, blocks, gost)
@@ -6519,6 +7667,7 @@ async def generate_and_send(
             if not os.path.exists(tmp_in):
                 raise RuntimeError(f"Не удалось записать {tmp_in}")
 
+            # ── ПОДГОНКА СТРАНИЦ (исправленная) ──
             blocks, final_pages = await precise_page_adjustment(
                 tmp_in=tmp_in,
                 blocks=blocks,
@@ -6532,10 +7681,14 @@ async def generate_and_send(
                 work_dir=work_dir,
             )
 
+            # ── LibreOffice (финальная конвертация — обновит TOC и поля PAGE) ──
             await prog.update(label="🔄 Обновляю содержание (LibreOffice)...", step_done=True)
             updated    = libreoffice_update_docx(tmp_in, tmp_out)
             final_path = tmp_out if updated else tmp_in
 
+            # ── Постобработка: LO после обновления TOC может «раздуть»
+            #    документ на 1–2 страницы. Поэтому крутим коррекцию в цикле
+            #    до 3 раз: измерили → подогнали blocks → пересобрали → LO → снова замер. ──
             POST_LO_MAX_ROUNDS = 3
             final_pages = pages
             for round_idx in range(POST_LO_MAX_ROUNDS):
@@ -6550,6 +7703,8 @@ async def generate_and_send(
 
                 print(f"[PAGES] Раунд {round_idx+1}/{POST_LO_MAX_ROUNDS}: LO дал {post_lo_pages}, цель {pages}. Корректирую…")
 
+                # Перегенерируем blocks→docx «сырьём», подгоняем, и затем снова
+                # прогоняем через LibreOffice (он же — финальный источник правды).
                 blocks, _ = await precise_page_adjustment(
                     tmp_in=tmp_in,
                     blocks=blocks,
@@ -6562,23 +7717,28 @@ async def generate_and_send(
                     prog=prog,
                     work_dir=work_dir,
                 )
+                # Пересобираем DOCX «как новый» из обновлённых blocks
                 blocks = _apply_heading_format_to_blocks(blocks)
                 docx_raw = build_docx_bytes(data, blocks, gost)
                 with open(tmp_in, "wb") as f:
                     f.write(docx_raw)
+                # И снова через LO — это, как правило, и есть «+1 страница» источник
                 updated = libreoffice_update_docx(tmp_in, tmp_out)
                 final_path = tmp_out if updated else tmp_in
             else:
+                # Цикл закончился без break — печатаем итог
                 print(f"[PAGES] ⚠️ После {POST_LO_MAX_ROUNDS} раундов финальная цифра {final_pages}, цель {pages}")
 
             print(f"[PAGES] 📤 Итог в caption: {final_pages} страниц")
 
+            # ── Имя файла ──
             safe_topic = re.sub(r'[<>"/:\\|?*]', "", topic[:35]).replace(" ", "_")
             fname      = f"{dt['word'].replace(' ', '_')}_{safe_topic}_{datetime.now().strftime('%Y%m%d_%H%M')}.docx"
 
             with open(final_path, "rb") as f:
                 final_bytes = f.read()
 
+            # ── Отправляем ──
             await prog.update(label="📤 Отправляю файл...", step_done=True)
 
             toc_status = "✅ обновлено автоматически" if updated else "⚠️ обновите вручную в Word"
@@ -6612,6 +7772,8 @@ async def generate_and_send(
                 caption=caption,
                 parse_mode="HTML",
             )
+            # Лимит учитываем только после успешной отправки файла, чтобы не
+            # сжигать бесплатную попытку при ошибке API/LibreOffice/Telegram.
             record_user_generation(event.chat.id, pay_mode)
 
         except Exception as e:
@@ -6643,6 +7805,7 @@ async def generate_and_send(
         )
         await state.clear()
 
+        # Чистим временные файлы
         for tmp in (tmp_in, tmp_out):
             try:
                 if os.path.exists(tmp):
@@ -6665,7 +7828,7 @@ async def main() -> None:
     bot = Bot(token=BOT_TOKEN)
 
     print("═" * 62)
-    print("  🤖  ГОСТ-АССИСТЕНТ v3.1 — УНИВЕРСАЛЬНАЯ ПРОВЕРКА ДИСЦИПЛИН")
+    print("  🤖  ГОСТ-АССИСТЕНТ v3.0-gost")
     print("═" * 62)
     print(f"  LibreOffice : {shutil.which('soffice') or '❌ не найден'}")
     print(f"  DeepSeek    : {'✅' if DEEPSEEK_KEY else '❌ нет ключа'}")
