@@ -68,6 +68,13 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Cm, Mm, Pt, RGBColor
 
+try:
+    from PIL import Image as PILImage, ImageDraw, ImageFont
+except Exception:  # Pillow может быть не установлен на старом деплое
+    PILImage = None
+    ImageDraw = None
+    ImageFont = None
+
 
 # ═══════════════════════════════════════════════════════════════
 #  КРАСИВАЯ АНИМАЦИЯ ПРОГРЕССА С ETA
@@ -5299,6 +5306,94 @@ async def search_wikipedia_page_images(query: str, limit: int = 2) -> list[dict]
     return out
 
 
+def _image_bytes_for_docx(img_bytes: bytes, *, max_width: int = 1200, max_height: int = 900) -> bytes:
+    """Нормализует изображение в PNG, чтобы python-docx точно смог вставить его."""
+    if not img_bytes or PILImage is None:
+        return img_bytes
+    try:
+        with PILImage.open(io.BytesIO(img_bytes)) as im:
+            im.thumbnail((max_width, max_height))
+            if im.mode not in ("RGB", "RGBA"):
+                im = im.convert("RGBA" if "A" in im.getbands() else "RGB")
+            out = io.BytesIO()
+            im.save(out, format="PNG")
+            return out.getvalue()
+    except Exception as e:
+        print(f"[IMAGES] normalize error: {e}")
+        return img_bytes
+
+
+def create_local_topic_image(topic: str, subject: str = "") -> Optional[dict]:
+    """Последний резерв: создаёт локальную PNG-иллюстрацию, чтобы DOCX не остался без картинок."""
+    if PILImage is None or ImageDraw is None:
+        return None
+    try:
+        w, h = 1200, 800
+        im = PILImage.new("RGB", (w, h), (245, 247, 250))
+        draw = ImageDraw.Draw(im)
+        # Простая академичная обложка/схема без внешнего интернета.
+        draw.rectangle((0, 0, w, 120), fill=(28, 75, 128))
+        draw.rectangle((70, 180, w - 70, h - 90), outline=(28, 75, 128), width=4)
+        draw.ellipse((90, 220, 310, 440), fill=(220, 232, 246), outline=(28, 75, 128), width=4)
+        draw.rectangle((360, 240, 1080, 295), fill=(220, 232, 246))
+        draw.rectangle((360, 330, 960, 385), fill=(220, 232, 246))
+        draw.rectangle((360, 420, 1030, 475), fill=(220, 232, 246))
+        draw.line((190, 440, 190, 610, 780, 610), fill=(28, 75, 128), width=6)
+        for x, y in ((420, 560), (610, 500), (800, 535), (990, 465)):
+            draw.ellipse((x - 22, y - 22, x + 22, y + 22), fill=(28, 75, 128))
+        try:
+            font_big = ImageFont.truetype("DejaVuSans-Bold.ttf", 44)
+            font_mid = ImageFont.truetype("DejaVuSans.ttf", 30)
+        except Exception:
+            font_big = None
+            font_mid = None
+        draw.text((70, 35), "Иллюстрация к учебной работе", fill="white", font=font_big)
+        topic_text = " ".join((topic or "Тема исследования").split())[:90]
+        subject_text = " ".join((subject or "").split())[:70]
+        draw.text((100, 650), topic_text, fill=(20, 45, 75), font=font_mid)
+        if subject_text:
+            draw.text((100, 700), f"Дисциплина: {subject_text}", fill=(70, 90, 110), font=font_mid)
+        out = io.BytesIO()
+        im.save(out, format="PNG")
+        return {
+            "bytes": out.getvalue(),
+            "caption": f"Иллюстративная схема по теме «{topic_text}»",
+            "source": "Сформировано автоматически средствами бота",
+        }
+    except Exception as e:
+        print(f"[IMAGES] local fallback error: {e}")
+        return None
+
+
+async def search_pollinations_images(query: str, limit: int = 1) -> list[dict]:
+    """Бесплатная генерация изображения без ключа через Pollinations как резерв."""
+    if not ENABLE_IMAGE_SEARCH or limit <= 0:
+        return []
+    query = " ".join((query or "").split()).strip()
+    if not query:
+        return []
+
+    out: list[dict] = []
+    prompts = [
+        f"realistic academic illustration, {query}, high quality, no text, no watermark",
+        f"documentary photo style illustration of {query}, high quality, no text",
+    ]
+    for prompt in prompts[:limit]:
+        url = "https://image.pollinations.ai/prompt/" + quote_plus(prompt) + "?width=1200&height=800&nologo=true&private=true&safe=true"
+        img_bytes = await _download_image_bytes(url, timeout=45)
+        if not img_bytes:
+            continue
+        out.append({
+            "bytes": img_bytes,
+            "caption": f"Иллюстрация по теме «{query}»",
+            "source": f"Pollinations AI, prompt: {prompt[:160]}",
+        })
+        if len(out) >= limit:
+            break
+    print(f"[IMAGES] Pollinations query={query!r}: найдено {len(out)}/{limit}")
+    return out
+
+
 async def search_duckduckgo_images(query: str, limit: int = 2) -> list[dict]:
     """Бесплатный no-key поиск картинок DuckDuckGo (неофициальный)."""
     if not ENABLE_IMAGE_SEARCH or limit <= 0:
@@ -5377,6 +5472,7 @@ async def prepare_work_images(topic: str, subject: str, pages: int, model_key: s
         ("wikipedia", search_wikipedia_page_images),
         ("wikimedia", search_wikimedia_images),
         ("duckduckgo", search_duckduckgo_images),
+        ("pollinations", search_pollinations_images),
     )
 
     for q in queries:
@@ -5392,6 +5488,22 @@ async def prepare_work_images(topic: str, subject: str, pages: int, model_key: s
         if len(images) >= count:
             break
 
+    # Абсолютный резерв: если все внешние API/поиски не дали результата или хостинг
+    # блокирует часть запросов, создаём локальную PNG-схему. Так пользователь,
+    # оплативший режим с изображениями, гарантированно получает DOCX с картинкой.
+    if not images:
+        fallback = create_local_topic_image(topic, subject)
+        if fallback:
+            images.append(fallback)
+            print("[IMAGES] использован локальный fallback PNG")
+
+    # Нормализуем все картинки в PNG для python-docx: это исправляет случаи,
+    # когда API отдаёт WebP/прогрессивный JPEG/битый thumbnail, из-за чего Word
+    # не показывал изображение.
+    for img in images:
+        if img.get("bytes"):
+            img["bytes"] = _image_bytes_for_docx(img["bytes"])
+
     print(f"[IMAGES] итог: {len(images)}/{count}, queries={queries}")
     return images
 
@@ -5401,6 +5513,7 @@ def add_gost_image(doc: Document, image: dict, number: int, gost: dict) -> None:
     img_bytes = image.get("bytes")
     if not img_bytes:
         return
+    img_bytes = _image_bytes_for_docx(img_bytes)
 
     fn = gost.get("font_name", "Times New Roman")
     fs = int(gost.get("font_size", 14))
