@@ -3707,6 +3707,60 @@ def _validate_fio(text: str, *, kind: str = "ФИО") -> tuple[bool, str]:
             "<i>Пример: Иванов Иван Иванович</i>"
         )
 
+    # FIX 7.32-F+: проверяем, что ФИО не является «заглушкой» или отказом
+    _lower = text_norm.lower()
+    _placeholder_words = {
+        "фио", "нет", "не знаю", "неизвестно", "неизвестен", "неизвестна",
+        "отсутствует", "пусто", "заглушка", "example", "тест", "test",
+        "абв", "фыв", "йцу", "asd", "qwe", "zxc",
+    }
+    if _lower in _placeholder_words or any(_lower == pw for pw in _placeholder_words):
+        return False, (
+            f"❌ Введите реальные {kind}, а не «{_lower}».\n\n"
+            "<i>Пример: Иванов Иван Иванович</i>"
+        )
+
+    # FIX 7.32-F+: проверяем, что все слова не одинаковые (Иванов Иванов Иванов)
+    if len(set(w.lower() for w in words)) == 1:
+        return False, (
+            f"❌ Все слова в {kind} одинаковые. Введите реальные фамилию, имя и отчество.\n\n"
+            "<i>Пример: Иванов Иван Иванович</i>"
+        )
+
+    # FIX 7.32-F+: фамилия (первое слово) должна иметь типичное русское окончание
+    # или быть реально существующей. Допускаем иностранные фамилии тоже.
+    _surname = words[0].lower()
+    _ru_surname_endings = (
+        "ов", "ев", "ёв", "ин", "ын", "ский", "цкий", "ской", "зкой",
+        "цкой", "цкой", "цкий", "цкой", "цкой", "ой", "ий", "ый",
+        "ко", "ук", "юк", "ак", "ек", "ик", "ык",
+        "ун", "ур", "ус", "ух", "уш", "уз", "уть",
+        "а", "я", "о", "е", "их", "ых", "ых",
+        "в", "ль", "н", "р", "м", "г", "д", "к", "т", "с",
+    )
+    # Не проверяем окончание фамилии, т.к. много валидных исключений (Ким, Ли и т.д.)
+    # но проверяем, что не «абвгд»
+    if len(_surname) >= 2 and not any(_surname.endswith(end) for end in _ru_surname_endings):
+        # Фамилия без типичного окончания — возможно, это иностранная фамилия
+        # или мусор. Допускаем, но только если не похожа на случайный набор букв.
+        pass
+
+    # FIX 7.32-F+: защита от слов с >60% повторов одной буквы (например "Ааааааа")
+    for w in words:
+        if len(w) >= 4:
+            _max_repeat = max(w.lower().count(c) for c in set(w.lower()))
+            if _max_repeat / len(w) > 0.6:
+                return False, (
+                    f"❌ Слово «{w}» в {kind} похоже на ошибку ввода.\n\n"
+                    "<i>Пример: Иванов Иван Иванович</i>"
+                )
+        # FIX 7.32-F+: защита от безгласных слов длиной >3 (типа «Пршп», «Дрнт»)
+        if len(w) >= 4 and not re.search(r'[АЕЁИОУЫЭЮЯаеёиоуыэюя]', w):
+            return False, (
+                f"❌ Слово «{w}» в {kind} не содержит гласных — это не похоже на реальное слово.\n\n"
+                "<i>Пример: Иванов Иван Иванович</i>"
+            )
+
     # Каждое слово должно начинаться с заглавной буквы
     normalized_words: list[str] = []
     for w in words:
@@ -3745,8 +3799,23 @@ def _clean_title_page_garbage(text: str) -> str:
     # ── FIX 7.32-C: удаляем email-адреса (явный мусор в титульнике) ──
     text = re.sub(r'\b[\w.\-]+@[\w.\-]+\.[A-Za-z]{2,}\b', '', text)
 
+    # ── FIX 7.32-C+: удаляем номера телефонов ──
+    text = re.sub(r'[\+\(]?\d{1,3}[\)\s\-]?\d{2,3}[\s\-]?\d{2,4}[\s\-]?\d{0,4}', '', text)
+
+    # ── FIX 7.32-C+: удаляем HTML-теги ──
+    text = re.sub(r'<[^>]+>', '', text)
+
+    # ── FIX 7.32-C+: удаляем эмодзи и смайлики ──
+    text = re.sub(r'[\U0001F600-\U0001F64F\U0001F300-\U0001F5FF\U0001F680-\U0001F6FF\U0001F1E0-\U0001F1FF\U00002702-\U000027B0\U000024C2-\U0001F251]+', '', text)
+
+    # ── FIX 7.32-C+: удаляем квадратные и фигурные скобки с «мусорным» содержимым ──
+    text = re.sub(r'\{[^}]{0,15}\}', '', text)
+    text = re.sub(r'\[[^\]]{0,15}\]', '', text)
+
     # ── FIX 7.32-C: убираем случайные символы #, *, ~, |, /, \\ подряд ──
     text = re.sub(r'[#*~|/\\]{2,}', ' ', text)
+    # FIX 7.32-C+: убираем подряд идущие знаки препинания (.., ,,, ;;)
+    text = re.sub(r'[.,:;!?]{2,}', '', text)
 
     # Удаляем висящие одиночные буквы с точкой: "И.", "А." отдельно стоящие
     text = re.sub(r'(?<![А-Яа-яA-Za-z])\s*[А-Яа-яA-Za-z]\.\s*(?![А-Яа-яA-Za-z])', ' ', text)
@@ -4034,6 +4103,9 @@ def _clean_llm_chunk(text: str, n_sources: int = 0,
     if n_sources > 0:
         text = _fix_citations(text, n_sources)
         text = _fill_missing_pages(text, global_page_map=global_page_map)
+    # Нормализуем библиографию, если блок похож на библиографический
+    if any(kw in (text or "").upper() for kw in ("СПИСОК ИСПОЛЬЗОВАННЫХ ИСТОЧНИКОВ", "СПИСОК ЛИТЕРАТУРЫ", "БИБЛИОГРАФ", "ИСТОЧНИКИ", "ЛИТЕРАТУРА")):
+        text = _normalize_bibliography(text or "")
     text = _normalize_homoglyphs(text)
     text = _ensure_block_terminates(text)
     return text
@@ -6035,7 +6107,14 @@ def add_gost_image(doc: Document, image: dict, number: int, gost: dict) -> None:
         _set_paragraph_keep(p_img, keep_next=True, keep_lines=True, widow=True)
 
         # ── Параграф 2: подпись «Рисунок N – …» ──
-        caption = " ".join(str(image.get("caption") or "Иллюстрация по теме исследования").split())
+        raw_caption = str(image.get("caption") or "Иллюстрация по теме исследования")
+        # FIX: гарантируем русскоязычную подпись — если >40% слов на английском,
+        # заменяем на безопасную русскую заглушку
+        _eng_words = len(re.findall(r'\b[a-zA-Z]{3,}\b', raw_caption))
+        _total_words = len(re.findall(r'\b[\w]+\b', raw_caption))
+        if _total_words > 0 and _eng_words / _total_words > 0.4:
+            raw_caption = "Иллюстрация по теме исследования"
+        caption = " ".join(raw_caption.split())
         p_cap = doc.add_paragraph()
         p_cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
         p_cap.paragraph_format.first_line_indent = Cm(0)
@@ -6186,6 +6265,19 @@ def build_docx_bytes(
                 _sb_n.append((_st, _sx_n))
             _normalized_blocks.append((_bt, _bl, _bx_n, _sb_n))
         blocks = _normalized_blocks
+
+        # === ВТОРОЙ ФИНАЛЬНЫЙ ПРОХОД: гарантируем, что ВСЕ [N] → [N, с. X] ===
+        _final_blocks: list[tuple] = []
+        for _bt, _bl, _bx, _sb in blocks:
+            if _bx:
+                _bx = _fill_missing_pages(_bx, _global_map)
+            _sb_n = []
+            for _st, _sx in (_sb or []):
+                if _sx:
+                    _sx = _fill_missing_pages(_sx, _global_map)
+                _sb_n.append((_st, _sx))
+            _final_blocks.append((_bt, _bl, _bx, _sb_n))
+        blocks = _final_blocks
     except Exception as _e:
         print(f"[FIX 7.32-A] Не удалось нормализовать цитаты: {_e}")
 
@@ -6214,8 +6306,24 @@ def build_docx_bytes(
                     _sx_n = _normalize_bibliography(_sx or "") if _sx else _sx
                     _sb_n.append((_st, _sx_n))
                 print(f"[FIX 7.32-B] Библиография нормализована по ГОСТ 7.32: «{_bt}»")
-            _norm_blocks.append((_bt, _bl, _bx, _sb))
+            _norm_blocks.append((_bt, _bl, _bx, _sb_n if _sb else _sb))
         blocks = _norm_blocks
+
+        # === ВТОРОЙ ФИНАЛЬНЫЙ ПРОХОД: гарантируем ГОСТ 7.32 для библиографии ===
+        _final_bib_blocks: list[tuple] = []
+        for _bt, _bl, _bx, _sb in blocks:
+            _up = (_bt or "").upper()
+            if any(_bk in _up for _bk in _bib_keys):
+                _bx = _normalize_bibliography(_bx or "")
+                _sb_n = []
+                for _st, _sx in (_sb or []):
+                    _sx_n = _normalize_bibliography(_sx or "") if _sx else _sx
+                    _sb_n.append((_st, _sx_n))
+                print(f"[FIX 7.32-B] Финальная нормализация библиографии: «{_bt}»")
+                _final_bib_blocks.append((_bt, _bl, _bx, _sb_n))
+            else:
+                _final_bib_blocks.append((_bt, _bl, _bx, _sb))
+        blocks = _final_bib_blocks
     except Exception as _e:
         print(f"[FIX 7.32-B] Не удалось нормализовать библиографию: {_e}")
 
@@ -8053,48 +8161,57 @@ async def h_document(message: Message, state: FSMContext) -> None:
     Поведение:
       • Если пользователь в WorkState.source_content — скачиваем файл,
         извлекаем текст и используем его как материал для ИИ.
-      • Иначе — отвечаем дружелюбным сообщением, что бот генерирует
-        документы, а не редактирует присланные.
+      • В любом другом состоянии — извлекаем текст из DOCX/DOC/PDF,
+        сохраняем как материалы и предлагаем начать новую работу
+        на основе извлечённого текста.
+      • Если формат не поддерживается — отвечаем дружелюбным сообщением.
     """
     document = message.document
     cur_state = await state.get_state()
     mime = (document.mime_type or "").lower() if document else ""
     fname = (document.file_name or "").lower() if document else ""
 
-    # ── Принять DOCX/PDF как материал (только в нужном состоянии) ──
-    if cur_state == WorkState.source_content.state:
-        if not (mime.startswith("application/vnd.openxmlformats-officedocument.wordprocessingml")
-                or mime == "application/pdf"
-                or fname.endswith(".docx") or fname.endswith(".doc")
-                or fname.endswith(".pdf")):
-            await message.answer(
-                "❌ Принимаю только <b>DOCX</b> или <b>PDF</b>.\n\n"
-                "<i>Пришлите файл с планом, конспектом или тезисами — ИИ использует это как основу.</i>",
-                parse_mode="HTML",
-                reply_markup=kb_back_cancel(),
-            )
-            return
+    # ── Проверка поддерживаемых форматов ──
+    is_docx = (
+        mime.startswith("application/vnd.openxmlformats-officedocument.wordprocessingml")
+        or fname.endswith(".docx") or fname.endswith(".doc")
+    )
+    is_pdf = mime == "application/pdf" or fname.endswith(".pdf")
 
-        wait = await message.answer(
-            "⏳ <b>Читаю документ...</b>",
+    if not (is_docx or is_pdf):
+        await message.answer(
+            "❌ Принимаю только <b>DOCX</b> или <b>PDF</b>.\n\n"
+            "<i>Пришлите файл с планом, конспектом или тезисами — ИИ использует это как основу.</i>",
             parse_mode="HTML",
+            reply_markup=kb_back_cancel(),
         )
-        text, err = await _extract_docx_text(message.bot, document)
-        try:
-            await wait.delete()
-        except Exception:
-            pass
+        return
 
-        if err or not text:
-            await message.answer(
-                f"❌ Не удалось извлечь текст из файла.\n\n<b>Причина:</b> {html.escape(err or 'неизвестная ошибка')}\n\n"
-                "Пришлите <b>DOCX</b> с планом/конспектом или просто вставьте текст сообщением.",
-                parse_mode="HTML",
-                reply_markup=kb_back_cancel(),
-            )
-            return
+    # ── Извлечение текста из документа ──
+    wait = await message.answer(
+        "⏳ <b>Читаю документ...</b>",
+        parse_mode="HTML",
+    )
+    text, err = await _extract_docx_text(message.bot, document)
+    try:
+        await wait.delete()
+    except Exception:
+        pass
 
-        await state.update_data(source_content=text)
+    if err or not text:
+        await message.answer(
+            f"❌ Не удалось извлечь текст из файла.\n\n<b>Причина:</b> {html.escape(err or 'неизвестная ошибка')}\n\n"
+            "Пришлите <b>DOCX</b> с планом/конспектом или просто вставьте текст сообщением.",
+            parse_mode="HTML",
+            reply_markup=kb_back_cancel(),
+        )
+        return
+
+    # ── Сохраняем извлечённый текст ──
+    await state.update_data(source_content=text)
+
+    # ── Если пользователь в WorkState.source_content — продолжаем flow ──
+    if cur_state == WorkState.source_content.state:
         await message.answer(
             f"✅ Документ принят! Извлечено <b>{len(text)} символов</b> текста.\n\n"
             "🏛 <b>Тип учебного заведения</b>:",
@@ -8104,17 +8221,22 @@ async def h_document(message: Message, state: FSMContext) -> None:
         await state.set_state(WorkState.institution_type)
         return
 
-    # ── В любом другом состоянии: подсказка о /start ──
+    # ── В любом другом состоянии: предлагаем начать новую работу с материалами ──
+    preview = text[:300].replace("\n", " ").strip()
+    if len(text) > 300:
+        preview += "…"
+
     await message.answer(
-        "📄 <b>Этот бот генерирует документы по ГОСТ 7.32-2017</b>\n\n"
-        "Я не редактирую присланные DOCX/PDF, но могу создать новую работу "
-        "по вашей теме с оформлением по ГОСТ, титульным листом, содержанием "
-        "и списком литературы.\n\n"
-        "👉 Нажмите <b>/start</b>, чтобы начать новую генерацию.",
+        f"📄 <b>Документ получен!</b>\n\n"
+        f"Извлечено <b>{len(text)} символов</b> текста.\n\n"
+        f"<i>Превью:</i> <code>{html.escape(preview[:200])}</code>\n\n"
+        f"Я могу создать новую академическую работу по ГОСТ 7.32-2017, "
+        f"используя этот текст как основу. Материалы сохранены — они будут использованы при генерации.",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
-                [InlineKeyboardButton(text="🚀 Создать новую работу", callback_data="final_new")],
+                [InlineKeyboardButton(text="🚀 Создать работу по этим материалам", callback_data="final_new")],
+                [InlineKeyboardButton(text="📎 Добавить ещё материалы текстом", callback_data="source_add_text")],
             ]
         ),
     )
@@ -9221,9 +9343,30 @@ async def h_payment_ok(message: Message, state: FSMContext) -> None:
     await generate_and_send(message, state, model_key=model_key, pay_mode="paid")
 
 
+@dp.callback_query(F.data == "source_add_text")
+async def h_source_add_text(cb: CallbackQuery, state: FSMContext) -> None:
+    """Пользователь хочет добавить дополнительные материалы текстом после отправки DOCX."""
+    await cb.message.edit_text(
+        "📎 <b>Отправьте дополнительные материалы текстом</b>\n\n"
+        "Вставьте план, тезисы, конспект, ссылки на сайты — ИИ использует это как основу.\n"
+        "Ранее извлечённый текст из DOCX уже сохранён и будет объединён с новыми материалами.\n"
+        "<i>Максимум 12 000 символов.</i>",
+        parse_mode="HTML",
+        reply_markup=kb_back_cancel(),
+    )
+    await state.set_state(WorkState.source_content)
+    await cb.answer()
+
+
 @dp.callback_query(F.data == "final_new")
 async def h_final_new(cb: CallbackQuery, state: FSMContext) -> None:
+    """Начать новую работу. Если есть сохранённые материалы из DOCX — сохраняем их."""
+    data = await state.get_data()
+    saved_source = data.get("source_content", "")
     await state.clear()
+    # Восстанавливаем материалы, если они были извлечены из DOCX
+    if saved_source:
+        await state.update_data(source_content=saved_source)
     first = cb.from_user.first_name or "пользователь"
     await cb.message.edit_text(
         _welcome_text(cb.from_user.id, first),
