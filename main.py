@@ -5273,7 +5273,8 @@ async def suggest_image_search_queries(
     limit: int = 5,
 ) -> list[str]:
     """DeepSeek формирует поисковые запросы для фото/иллюстраций."""
-    base = [" ".join(x for x in [topic, subject] if x).strip(), topic]
+    aliases = _topic_aliases(topic)
+    base = [topic] + aliases + [" ".join(x for x in [topic, subject] if x).strip()]
     system = (
         "Ты помогаешь искать реальные изображения для учебной работы. "
         "Верни СТРОГО JSON без markdown: {\"queries\": [\"...\"]}. "
@@ -5307,7 +5308,9 @@ async def suggest_image_search_queries(
     # Жёсткий фоллбэк для частых русских имён/тем, чтобы не упираться в русскую выдачу Commons.
     low = (topic or "").lower()
     if "байден" in low:
-        base.extend(["Joe Biden", "President Joe Biden", "Joe Biden official portrait"])
+        base.extend(["Joe Biden", "President Joe Biden", "Joe Biden official portrait", "Joe Biden press photo"])
+    if "трамп" in low:
+        base.extend(["Donald Trump", "President Donald Trump", "Donald Trump official portrait", "Donald Trump press photo"])
 
     out: list[str] = []
     for q in base:
@@ -5465,6 +5468,45 @@ _GOOD_PHOTO_WORDS = (
     "фото", "фотография", "портрет", "официаль", "пресс", "конференц",
 )
 
+
+
+def _image_relevance_tokens(topic: str, queries: Optional[list[str]] = None) -> list[str]:
+    """Токены, которые должны встречаться в метаданных фото, чтобы не брать мусор.
+
+    Особенно важно для персон: запрос «Trump» в Openverse может вернуть чужие
+    политические/уличные фото. Требуем фамилию/имя в caption/source.
+    """
+    raw_parts = [topic or ""] + list(queries or []) + _topic_aliases(topic)
+    blob = " ".join(raw_parts).lower()
+    manual = {
+        "трамп": ["trump", "donald", "дональд", "трамп"],
+        "байден": ["biden", "joe", "джо", "байден"],
+        "путин": ["putin", "vladimir", "путин", "владимир"],
+    }
+    out: list[str] = []
+    for key, vals in manual.items():
+        if key in blob or any(v in blob for v in vals):
+            out.extend(vals)
+    # Для латинских имён/фамилий добавляем слова длиной >=4.
+    for w in re.findall(r"[a-zа-яё]{4,}", blob, flags=re.I):
+        wl = w.lower()
+        if wl not in _BAD_IMAGE_WORDS and wl not in {"official", "portrait", "photo", "press", "documentary", "фото", "портрет"}:
+            out.append(wl)
+    res = []
+    for t in out:
+        t = t.lower().strip()
+        if t and t not in res:
+            res.append(t)
+    # Если токенов слишком много, главные персональные оставляем первыми.
+    return res[:8]
+
+
+def _image_matches_topic(image: dict, required_tokens: list[str]) -> bool:
+    if not required_tokens:
+        return True
+    blob = " ".join(str(image.get(k) or "") for k in ("caption", "source")).lower()
+    blob = re.sub(r"[_%20\-]+", " ", blob)
+    return any(t in blob for t in required_tokens)
 
 def _is_safe_real_photo_meta(*values: str) -> bool:
     """Отсекает мемы/карикатуры/рисунки/AI-изображения по метаданным."""
@@ -5669,10 +5711,15 @@ async def prepare_work_images(
     queries = await suggest_image_search_queries(model_key, topic, subject, limit=6)
     images: list[dict] = []
     seen_sources: set[str] = set()
+    required_tokens = _image_relevance_tokens(topic, queries)
+    print(f"[IMAGES] relevance tokens: {required_tokens}")
 
     async def add_from(found: list[dict]) -> None:
         nonlocal images
         for img in found or []:
+            if not _image_matches_topic(img, required_tokens):
+                print(f"[IMAGES] reject irrelevant: {str(img.get('caption') or '')[:80]}")
+                continue
             src = img.get("source") or ""
             if src and src in seen_sources:
                 continue
@@ -5733,7 +5780,7 @@ def add_gost_image(doc: Document, image: dict, number: int, gost: dict) -> None:
         p_img.paragraph_format.first_line_indent = Cm(0)
         run = p_img.add_run()
         width_cm = float(gost.get("image_width_cm", 10.0))
-        run.add_picture(io.BytesIO(img_bytes), width=Cm(max(6.0, min(12.0, width_cm))))
+        run.add_picture(io.BytesIO(img_bytes), width=Cm(max(4.0, min(12.0, width_cm))))
 
         caption = " ".join(str(image.get("caption") or "Иллюстрация по теме исследования").split())
         p_cap = doc.add_paragraph()
@@ -6711,9 +6758,9 @@ async def precise_page_adjustment(
             if _before - _after < max(50, chars_to_remove // 10):
                 # Если перебор вызван картинками, сначала уменьшаем их ширину и
                 # продолжаем точную подгонку, а не отдаём +1/+2 страницы.
-                if data.get("images") and float(gost.get("image_width_cm", 10.0)) > 6.0:
+                if data.get("images") and float(gost.get("image_width_cm", 10.0)) > 4.0:
                     old_w = float(gost.get("image_width_cm", 10.0))
-                    gost["image_width_cm"] = max(6.0, old_w - 1.0)
+                    gost["image_width_cm"] = max(4.0, old_w - 1.0)
                     print(f"[ADJUST] 🖼 Уменьшаю ширину изображений: {old_w} см → {gost['image_width_cm']} см")
                 else:
                     print(f"[ADJUST] ⛔ Обрезка упёрлась в порог целостности "
@@ -8484,7 +8531,7 @@ async def h_image_mode(cb: CallbackQuery, state: FSMContext) -> None:
         f"📐 <b>По ГОСТ/авто</b>: { _image_count_for_pages(pages) } шт. "
         "(примерно 1 изображение на 5 страниц, но не больше лимита).\n\n"
         "Или выберите своё количество. Бот будет искать <b>только настоящие фото</b> "
-        "через бесплатные источники: Openverse, Wikipedia, Wikimedia Commons, DuckDuckGo.",
+        "через бесплатные источники: Openverse, Wikipedia и Wikimedia Commons.",
         reply_markup=with_back(kb_image_count(pages)),
         parse_mode="HTML",
     )
@@ -8962,8 +9009,8 @@ async def generate_and_send(
                 for strict_round in range(3):
                     if final_pages == pages:
                         break
-                    if final_pages > pages and data.get("images") and float(gost.get("image_width_cm", 10.0)) > 6.0:
-                        gost["image_width_cm"] = max(6.0, float(gost.get("image_width_cm", 10.0)) - 1.0)
+                    if final_pages > pages and data.get("images") and float(gost.get("image_width_cm", 10.0)) > 4.0:
+                        gost["image_width_cm"] = max(4.0, float(gost.get("image_width_cm", 10.0)) - 1.0)
                         print(f"[PAGES] 🖼 strict: ширина изображений {gost['image_width_cm']} см")
                     blocks, _ = await precise_page_adjustment(
                         tmp_in=tmp_in,
