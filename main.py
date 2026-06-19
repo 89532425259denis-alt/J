@@ -5306,6 +5306,58 @@ async def search_wikipedia_page_images(query: str, limit: int = 2) -> list[dict]
     return out
 
 
+async def search_openverse_images(query: str, limit: int = 3) -> list[dict]:
+    """Бесплатный официальный Openverse API: реальные фото/изображения Creative Commons без ключа."""
+    if not ENABLE_IMAGE_SEARCH or limit <= 0:
+        return []
+    query = " ".join((query or "").split()).strip()
+    if not query:
+        return []
+
+    api = "https://api.openverse.engineering/v1/images/"
+    params = {
+        "q": query,
+        "page_size": str(max(1, min(limit * 5, 20))),
+        "category": "photograph",
+        "license_type": "commercial,modification",
+    }
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as session:
+            async with session.get(api, params=params, headers={"User-Agent": "GOST-Assistant/1.0"}) as resp:
+                if resp.status != 200:
+                    print(f"[IMAGES] Openverse status {resp.status} for {query!r}")
+                    return []
+                payload = await resp.json(content_type=None)
+    except Exception as e:
+        print(f"[IMAGES] Openverse error for {query!r}: {e}")
+        return []
+
+    out: list[dict] = []
+    seen: set[str] = set()
+    for item in payload.get("results", []) or []:
+        # Реальные изображения: сначала thumbnail (быстрее/стабильнее), затем оригинал.
+        candidates = [item.get("thumbnail"), item.get("url")]
+        for url in candidates:
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            img_bytes = await _download_image_bytes(url)
+            if not img_bytes:
+                continue
+            title = " ".join(str(item.get("title") or query).split())[:120]
+            creator = " ".join(str(item.get("creator") or "").split())
+            if creator and creator.lower() not in title.lower():
+                title = f"{title} ({creator[:60]})"[:120]
+            source = item.get("foreign_landing_url") or item.get("url") or url
+            out.append({"bytes": img_bytes, "caption": title or query, "source": source})
+            break
+        if len(out) >= limit:
+            break
+
+    print(f"[IMAGES] Openverse query={query!r}: найдено {len(out)}/{limit}")
+    return out
+
+
 def _image_bytes_for_docx(img_bytes: bytes, *, max_width: int = 1200, max_height: int = 900) -> bytes:
     """Нормализует изображение в PNG, чтобы python-docx точно смог вставить его."""
     if not img_bytes or PILImage is None:
@@ -5322,76 +5374,6 @@ def _image_bytes_for_docx(img_bytes: bytes, *, max_width: int = 1200, max_height
         print(f"[IMAGES] normalize error: {e}")
         return img_bytes
 
-
-def create_local_topic_image(topic: str, subject: str = "") -> Optional[dict]:
-    """Последний резерв: создаёт локальную PNG-иллюстрацию, чтобы DOCX не остался без картинок."""
-    if PILImage is None or ImageDraw is None:
-        return None
-    try:
-        w, h = 1200, 800
-        im = PILImage.new("RGB", (w, h), (245, 247, 250))
-        draw = ImageDraw.Draw(im)
-        # Простая академичная обложка/схема без внешнего интернета.
-        draw.rectangle((0, 0, w, 120), fill=(28, 75, 128))
-        draw.rectangle((70, 180, w - 70, h - 90), outline=(28, 75, 128), width=4)
-        draw.ellipse((90, 220, 310, 440), fill=(220, 232, 246), outline=(28, 75, 128), width=4)
-        draw.rectangle((360, 240, 1080, 295), fill=(220, 232, 246))
-        draw.rectangle((360, 330, 960, 385), fill=(220, 232, 246))
-        draw.rectangle((360, 420, 1030, 475), fill=(220, 232, 246))
-        draw.line((190, 440, 190, 610, 780, 610), fill=(28, 75, 128), width=6)
-        for x, y in ((420, 560), (610, 500), (800, 535), (990, 465)):
-            draw.ellipse((x - 22, y - 22, x + 22, y + 22), fill=(28, 75, 128))
-        try:
-            font_big = ImageFont.truetype("DejaVuSans-Bold.ttf", 44)
-            font_mid = ImageFont.truetype("DejaVuSans.ttf", 30)
-        except Exception:
-            font_big = None
-            font_mid = None
-        draw.text((70, 35), "Иллюстрация к учебной работе", fill="white", font=font_big)
-        topic_text = " ".join((topic or "Тема исследования").split())[:90]
-        subject_text = " ".join((subject or "").split())[:70]
-        draw.text((100, 650), topic_text, fill=(20, 45, 75), font=font_mid)
-        if subject_text:
-            draw.text((100, 700), f"Дисциплина: {subject_text}", fill=(70, 90, 110), font=font_mid)
-        out = io.BytesIO()
-        im.save(out, format="PNG")
-        return {
-            "bytes": out.getvalue(),
-            "caption": f"Иллюстративная схема по теме «{topic_text}»",
-            "source": "Сформировано автоматически средствами бота",
-        }
-    except Exception as e:
-        print(f"[IMAGES] local fallback error: {e}")
-        return None
-
-
-async def search_pollinations_images(query: str, limit: int = 1) -> list[dict]:
-    """Бесплатная генерация изображения без ключа через Pollinations как резерв."""
-    if not ENABLE_IMAGE_SEARCH or limit <= 0:
-        return []
-    query = " ".join((query or "").split()).strip()
-    if not query:
-        return []
-
-    out: list[dict] = []
-    prompts = [
-        f"realistic academic illustration, {query}, high quality, no text, no watermark",
-        f"documentary photo style illustration of {query}, high quality, no text",
-    ]
-    for prompt in prompts[:limit]:
-        url = "https://image.pollinations.ai/prompt/" + quote_plus(prompt) + "?width=1200&height=800&nologo=true&private=true&safe=true"
-        img_bytes = await _download_image_bytes(url, timeout=45)
-        if not img_bytes:
-            continue
-        out.append({
-            "bytes": img_bytes,
-            "caption": f"Иллюстрация по теме «{query}»",
-            "source": f"Pollinations AI, prompt: {prompt[:160]}",
-        })
-        if len(out) >= limit:
-            break
-    print(f"[IMAGES] Pollinations query={query!r}: найдено {len(out)}/{limit}")
-    return out
 
 
 async def search_duckduckgo_images(query: str, limit: int = 2) -> list[dict]:
@@ -5449,9 +5431,16 @@ async def search_duckduckgo_images(query: str, limit: int = 2) -> list[dict]:
     return out
 
 
-async def prepare_work_images(topic: str, subject: str, pages: int, model_key: str = FREE_MODEL_KEY) -> list[dict]:
-    """Готовит иллюстрации для DOCX: DeepSeek делает запросы, дальше пробуются бесплатные API."""
-    count = _image_count_for_pages(pages)
+async def prepare_work_images(
+    topic: str,
+    subject: str,
+    pages: int,
+    model_key: str = FREE_MODEL_KEY,
+    image_count: Optional[int] = None,
+) -> list[dict]:
+    """Готовит реальные фото для DOCX: DeepSeek делает запросы, дальше пробуются бесплатные API."""
+    count = int(image_count or _image_count_for_pages(pages))
+    count = max(1, min(MAX_WORK_IMAGES, count))
     queries = await suggest_image_search_queries(model_key, topic, subject, limit=6)
     images: list[dict] = []
     seen_sources: set[str] = set()
@@ -5469,10 +5458,10 @@ async def prepare_work_images(topic: str, subject: str, pages: int, model_key: s
                 break
 
     providers = (
+        ("openverse", search_openverse_images),
         ("wikipedia", search_wikipedia_page_images),
         ("wikimedia", search_wikimedia_images),
         ("duckduckgo", search_duckduckgo_images),
-        ("pollinations", search_pollinations_images),
     )
 
     for q in queries:
@@ -5488,16 +5477,7 @@ async def prepare_work_images(topic: str, subject: str, pages: int, model_key: s
         if len(images) >= count:
             break
 
-    # Абсолютный резерв: если все внешние API/поиски не дали результата или хостинг
-    # блокирует часть запросов, создаём локальную PNG-схему. Так пользователь,
-    # оплативший режим с изображениями, гарантированно получает DOCX с картинкой.
-    if not images:
-        fallback = create_local_topic_image(topic, subject)
-        if fallback:
-            images.append(fallback)
-            print("[IMAGES] использован локальный fallback PNG")
-
-    # Нормализуем все картинки в PNG для python-docx: это исправляет случаи,
+    # Нормализуем все реальные картинки в PNG для python-docx: это исправляет случаи,
     # когда API отдаёт WebP/прогрессивный JPEG/битый thumbnail, из-за чего Word
     # не показывал изображение.
     for img in images:
@@ -6697,6 +6677,28 @@ def kb_image_mode() -> InlineKeyboardMarkup:
     )
 
 
+def kb_image_count(pages: int) -> InlineKeyboardMarkup:
+    auto_count = _image_count_for_pages(pages)
+    max_count = max(1, MAX_WORK_IMAGES)
+    rows = [
+        [InlineKeyboardButton(text=f"📐 По ГОСТ/авто — {auto_count} шт.", callback_data="imgcount_auto")],
+        [
+            InlineKeyboardButton(text="1", callback_data="imgcount_1"),
+            InlineKeyboardButton(text="2", callback_data="imgcount_2"),
+            InlineKeyboardButton(text="3", callback_data="imgcount_3"),
+        ],
+    ]
+    if max_count >= 5:
+        rows.append([
+            InlineKeyboardButton(text="4", callback_data="imgcount_4"),
+            InlineKeyboardButton(text="5", callback_data="imgcount_5"),
+            InlineKeyboardButton(text="✏️ Своё", callback_data="imgcount_custom"),
+        ])
+    else:
+        rows.append([InlineKeyboardButton(text="✏️ Своё", callback_data="imgcount_custom")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def kb_humanize() -> InlineKeyboardMarkup:
     # Оставлено только для совместимости со старыми сообщениями Telegram.
     # Опечатки и искусственные неточности отключены в обработчике.
@@ -7203,6 +7205,7 @@ class WorkState(StatesGroup):
     pages              = State()
     page_number_position = State()
     image_mode         = State()
+    image_count        = State()
     model              = State()
     payment            = State()
     humanize           = State()
@@ -7472,6 +7475,14 @@ async def h_back_flow(cb: CallbackQuery, state: FSMContext) -> None:
             "🔢 <b>Нумерация страниц — где расположить?</b>",
             with_back(kb_page_number()),
             WorkState.page_number_position,
+        )
+    elif cur == WorkState.image_count.state:
+        await edit(
+            "🖼 <b>Добавить изображения в работу?</b>\n\n"
+            "• <b>Без изображений</b> — обычная работа.\n"
+            "• <b>С изображениями</b> — только реальные фото из бесплатных источников.",
+            with_back(kb_image_mode()),
+            WorkState.image_mode,
         )
     elif cur == WorkState.humanize.state:
         await edit(
@@ -8224,8 +8235,93 @@ async def _continue_after_image_choice(cb: CallbackQuery, state: FSMContext) -> 
 @dp.callback_query(F.data.in_(["images_yes", "images_no"]))
 async def h_image_mode(cb: CallbackQuery, state: FSMContext) -> None:
     include_images = cb.data == "images_yes"
-    await state.update_data(include_images=include_images)
+    if not include_images:
+        await state.update_data(include_images=False, image_count=0)
+        await _continue_after_image_choice(cb, state)
+        return
+
+    data = await state.get_data()
+    pages = int(data.get("pages", 10))
+    await state.update_data(include_images=True)
+    await cb.message.edit_text(
+        "🖼 <b>Сколько реальных фото вставить?</b>\n\n"
+        f"📐 <b>По ГОСТ/авто</b>: { _image_count_for_pages(pages) } шт. "
+        "(примерно 1 изображение на 5 страниц, но не больше лимита).\n\n"
+        "Или выберите своё количество. Бот будет искать <b>только настоящие фото</b> "
+        "через бесплатные источники: Openverse, Wikipedia, Wikimedia Commons, DuckDuckGo.",
+        reply_markup=with_back(kb_image_count(pages)),
+        parse_mode="HTML",
+    )
+    await state.set_state(WorkState.image_count)
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("imgcount_"))
+async def h_image_count_cb(cb: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    pages = int(data.get("pages", 10))
+    value = cb.data.replace("imgcount_", "", 1)
+
+    if value == "custom":
+        await cb.message.edit_text(
+            f"✏️ <b>Введите количество фото</b> числом от 1 до {MAX_WORK_IMAGES}.",
+            reply_markup=kb_back_cancel(),
+            parse_mode="HTML",
+        )
+        await state.set_state(WorkState.image_count)
+        await cb.answer()
+        return
+
+    if value == "auto":
+        count = _image_count_for_pages(pages)
+    else:
+        count = int(value)
+    count = max(1, min(MAX_WORK_IMAGES, count))
+    await state.update_data(include_images=True, image_count=count)
     await _continue_after_image_choice(cb, state)
+
+
+@dp.message(WorkState.image_count)
+async def h_image_count_text(message: Message, state: FSMContext) -> None:
+    try:
+        count = int((message.text or "").strip())
+    except Exception:
+        await message.answer(f"❌ Введите число от 1 до {MAX_WORK_IMAGES}.", reply_markup=kb_back_cancel())
+        return
+    if count < 1 or count > MAX_WORK_IMAGES:
+        await message.answer(f"❌ Допустимое количество фото: 1–{MAX_WORK_IMAGES}.", reply_markup=kb_back_cancel())
+        return
+    await state.update_data(include_images=True, image_count=count)
+
+    # После текстового ввода продолжаем тот же сценарий, только у message нет edit_text.
+    data = await state.get_data()
+    pages = int(data.get("pages", 10))
+    mode = data.get("mode", "free")
+    if mode == "free" and not is_vip(message.from_user.id):
+        await state.update_data(mode="paid")
+        mode = "paid"
+
+    if mode == "free":
+        ok, reason = check_user_limit(message.from_user.id, "free")
+        if not ok:
+            await message.answer(reason, parse_mode="HTML")
+            await state.clear()
+            return
+        await message.answer("🚀 <b>Запускаю генерацию...</b>", parse_mode="HTML")
+        await generate_and_send(message, state, model_key=FREE_MODEL_KEY, pay_mode="free")
+        return
+
+    ok, reason = check_user_limit(message.from_user.id, "paid")
+    if not ok and not is_vip(message.from_user.id):
+        await message.answer(reason, parse_mode="HTML")
+        await state.clear()
+        return
+    await message.answer(
+        f"✅ Фото: <b>{count}</b> шт.\n\n🤖 <b>Выберите ИИ-модель</b>",
+        reply_markup=with_back(kb_models()),
+        parse_mode="HTML",
+    )
+    await state.set_state(WorkState.model)
 
 
 @dp.callback_query(F.data.in_(["humanize_yes", "humanize_no"]))
@@ -8298,7 +8394,7 @@ async def h_model(cb: CallbackQuery, state: FSMContext) -> None:
         f"┌─────────────────────────\n"
         f"│ 🤖 Модель:  {model['name']}\n"
         f"│ 📄 Страниц: {pages}\n"
-        f"│ 🖼 Изображения: {'да' if include_images else 'нет'}\n"
+        f"│ 🖼 Изображения: {(str(int(data.get('image_count') or 0)) + ' шт.') if include_images else 'нет'}\n"
         f"│ 💰 Цена:    {price_per_page}⭐ × {pages} = <b>{total}⭐</b>\n"
         f"└─────────────────────────\n\n"
         f"Нажмите кнопку для оплаты через Telegram Stars:",
@@ -8330,6 +8426,7 @@ async def h_pay(cb: CallbackQuery, state: FSMContext) -> None:
             "model_key": model_key,
             "pages": data.get("pages", 10),
             "include_images": bool(data.get("include_images")),
+            "image_count": int(data.get("image_count") or 0),
         },
         ensure_ascii=False,
     )
@@ -8359,7 +8456,10 @@ async def h_payment_ok(message: Message, state: FSMContext) -> None:
     try:
         payload   = json.loads(message.successful_payment.invoice_payload)
         model_key = payload.get("model_key", FREE_MODEL_KEY)
-        await state.update_data(include_images=bool(payload.get("include_images")))
+        await state.update_data(
+            include_images=bool(payload.get("include_images")),
+            image_count=int(payload.get("image_count") or 0),
+        )
     except Exception:
         model_key = FREE_MODEL_KEY
 
@@ -8539,7 +8639,13 @@ async def generate_and_send(
 
             if data.get("include_images"):
                 await prog.update(label="🖼 Ищу изображения по теме и готовлю подписи по ГОСТ...", force=True)
-                data["images"] = await prepare_work_images(topic, subject, pages, model_key=model_key)
+                data["images"] = await prepare_work_images(
+                    topic,
+                    subject,
+                    pages,
+                    model_key=model_key,
+                    image_count=int(data.get("image_count") or 0) or None,
+                )
                 if not data.get("images"):
                     print("[IMAGES] Подходящие изображения не найдены — документ будет без иллюстраций")
 
