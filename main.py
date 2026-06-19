@@ -334,6 +334,9 @@ CHARS_PER_PAGE = int(cfg("CHARS_PER_PAGE", "1850"))
 # каталогов (OpenAlex/Crossref) и читать URL, которые пользователь прислал в
 # материалах. Если сервер без доступа к сети — функции тихо отключатся.
 ENABLE_WEB_SOURCES = cfg("ENABLE_WEB_SOURCES", "1").lower() not in ("0", "false", "no", "off")
+# Отдельный флаг для поиска изображений: даже если веб-источники для литературы отключены,
+# картинки можно оставить включёнными.
+ENABLE_IMAGE_SEARCH = cfg("ENABLE_IMAGE_SEARCH", "1").lower() not in ("0", "false", "no", "off")
 WEB_SOURCE_TIMEOUT = int(cfg("WEB_SOURCE_TIMEOUT", "12"))
 MAX_WEB_SOURCES    = int(cfg("MAX_WEB_SOURCES", "12"))
 MIN_REAL_SOURCES   = int(cfg("MIN_REAL_SOURCES", "10"))
@@ -5175,7 +5178,7 @@ async def suggest_image_search_queries(
 
 async def search_wikimedia_images(query: str, limit: int = 3) -> list[dict]:
     """Ищет свободные JPG/PNG на Wikimedia Commons и возвращает bytes + подпись."""
-    if not ENABLE_WEB_SOURCES or limit <= 0:
+    if not ENABLE_IMAGE_SEARCH or limit <= 0:
         return []
 
     query = " ".join((query or "").split()).strip()
@@ -5239,19 +5242,128 @@ async def search_wikimedia_images(query: str, limit: int = 3) -> list[dict]:
     return out
 
 
+async def search_wikipedia_page_images(query: str, limit: int = 2) -> list[dict]:
+    """Бесплатный no-key API Wikipedia: берёт главные изображения найденных страниц."""
+    if not ENABLE_IMAGE_SEARCH or limit <= 0:
+        return []
+    query = " ".join((query or "").split()).strip()
+    if not query:
+        return []
+
+    out: list[dict] = []
+    seen: set[str] = set()
+    # Пробуем английскую и русскую Википедию: для персон/международных тем en часто лучше.
+    for lang in ("en", "ru"):
+        api = f"https://{lang}.wikipedia.org/w/api.php"
+        params = {
+            "action": "query",
+            "generator": "search",
+            "gsrsearch": query,
+            "gsrlimit": str(max(1, min(limit * 4, 12))),
+            "prop": "pageimages|info",
+            "pithumbsize": "1200",
+            "inprop": "url",
+            "format": "json",
+        }
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
+                async with session.get(api, params=params, headers={"User-Agent": "GOST-Assistant/1.0"}) as resp:
+                    if resp.status != 200:
+                        print(f"[IMAGES] Wikipedia {lang} status {resp.status} for {query!r}")
+                        continue
+                    payload = await resp.json(content_type=None)
+        except Exception as e:
+            print(f"[IMAGES] Wikipedia {lang} error for {query!r}: {e}")
+            continue
+
+        pages = (payload.get("query", {}) or {}).get("pages", {}) or {}
+        for item in pages.values():
+            thumb = item.get("thumbnail") or {}
+            url = thumb.get("source") or ""
+            if not url or url in seen:
+                continue
+            if not re.search(r"\.(jpe?g|png)(\?|$)", url, flags=re.I):
+                continue
+            seen.add(url)
+            img_bytes = await _download_image_bytes(url)
+            if not img_bytes:
+                continue
+            caption = " ".join(str(item.get("title") or query).split())
+            source = item.get("fullurl") or f"https://{lang}.wikipedia.org/"
+            out.append({"bytes": img_bytes, "caption": caption[:120], "source": source})
+            if len(out) >= limit:
+                print(f"[IMAGES] Wikipedia query={query!r}: найдено {len(out)}/{limit}")
+                return out
+
+    print(f"[IMAGES] Wikipedia query={query!r}: найдено {len(out)}/{limit}")
+    return out
+
+
+async def search_duckduckgo_images(query: str, limit: int = 2) -> list[dict]:
+    """Бесплатный no-key поиск картинок DuckDuckGo (неофициальный)."""
+    if not ENABLE_IMAGE_SEARCH or limit <= 0:
+        return []
+    query = " ".join((query or "").split()).strip()
+    if not query:
+        return []
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
+        "Accept": "text/html,application/json,*/*",
+    }
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20), headers=headers) as session:
+            async with session.get("https://duckduckgo.com/", params={"q": query, "iax": "images", "ia": "images"}) as resp:
+                html_text = await resp.text()
+            m = re.search(r"vqd=['\"]?([\w-]+)['\"]?", html_text)
+            if not m:
+                print(f"[IMAGES] DuckDuckGo: vqd не найден для {query!r}")
+                return []
+            vqd = m.group(1)
+            params = {"l": "us-en", "o": "json", "q": query, "vqd": vqd, "f": ",,,", "p": "1"}
+            async with session.get("https://duckduckgo.com/i.js", params=params) as resp:
+                if resp.status != 200:
+                    print(f"[IMAGES] DuckDuckGo status {resp.status} for {query!r}")
+                    return []
+                payload = await resp.json(content_type=None)
+    except Exception as e:
+        print(f"[IMAGES] DuckDuckGo error for {query!r}: {e}")
+        return []
+
+    out: list[dict] = []
+    seen: set[str] = set()
+    for item in payload.get("results", []) or []:
+        # Сначала пробуем thumbnail — он чаще JPEG/PNG и быстрее скачивается.
+        candidates = [item.get("thumbnail"), item.get("image")]
+        for url in candidates:
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            img_bytes = await _download_image_bytes(url)
+            if not img_bytes:
+                continue
+            title = re.sub(r"<[^>]+>", "", str(item.get("title") or query))
+            title = " ".join(title.split())[:120]
+            source = item.get("url") or item.get("image") or url
+            out.append({"bytes": img_bytes, "caption": title or query, "source": source})
+            break
+        if len(out) >= limit:
+            break
+
+    print(f"[IMAGES] DuckDuckGo query={query!r}: найдено {len(out)}/{limit}")
+    return out
+
+
 async def prepare_work_images(topic: str, subject: str, pages: int, model_key: str = FREE_MODEL_KEY) -> list[dict]:
-    """Готовит иллюстрации для DOCX: DeepSeek делает запросы, Commons отдаёт фото."""
+    """Готовит иллюстрации для DOCX: DeepSeek делает запросы, дальше пробуются бесплатные API."""
     count = _image_count_for_pages(pages)
     queries = await suggest_image_search_queries(model_key, topic, subject, limit=6)
     images: list[dict] = []
     seen_sources: set[str] = set()
 
-    for q in queries:
-        need = count - len(images)
-        if need <= 0:
-            break
-        found = await search_wikimedia_images(q, limit=need)
-        for img in found:
+    async def add_from(found: list[dict]) -> None:
+        nonlocal images
+        for img in found or []:
             src = img.get("source") or ""
             if src and src in seen_sources:
                 continue
@@ -5260,6 +5372,25 @@ async def prepare_work_images(topic: str, subject: str, pages: int, model_key: s
             images.append(img)
             if len(images) >= count:
                 break
+
+    providers = (
+        ("wikipedia", search_wikipedia_page_images),
+        ("wikimedia", search_wikimedia_images),
+        ("duckduckgo", search_duckduckgo_images),
+    )
+
+    for q in queries:
+        for provider_name, provider in providers:
+            need = count - len(images)
+            if need <= 0:
+                break
+            try:
+                found = await provider(q, limit=need)
+                await add_from(found)
+            except Exception as e:
+                print(f"[IMAGES] provider {provider_name} failed for {q!r}: {e}")
+        if len(images) >= count:
+            break
 
     print(f"[IMAGES] итог: {len(images)}/{count}, queries={queries}")
     return images
