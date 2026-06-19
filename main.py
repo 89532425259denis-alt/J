@@ -5277,7 +5277,8 @@ async def suggest_image_search_queries(
     system = (
         "Ты помогаешь искать реальные изображения для учебной работы. "
         "Верни СТРОГО JSON без markdown: {\"queries\": [\"...\"]}. "
-        "Нужны короткие запросы для Wikimedia Commons/поиска изображений. "
+        "Нужны короткие запросы для поиска РЕАЛЬНЫХ ФОТО: official portrait, press photo, documentary photo. "
+        "Запрещены запросы со словами meme, funny, cartoon, caricature, joke, parody. "
         "Если тема содержит имя человека, обязательно дай вариант на английском."
     )
     user = (
@@ -5363,6 +5364,8 @@ async def search_wikimedia_images(query: str, limit: int = 3) -> list[dict]:
         # python-docx гарантированно работает с JPEG/PNG; svg/webp/tiff пропускаем.
         if mime not in ("image/jpeg", "image/png") and not re.search(r"\.(jpe?g|png)(\?|$)", url, flags=re.I):
             continue
+        if not _is_safe_real_photo_meta(title, url, mime):
+            continue
         seen.add(url)
         img_bytes = await _download_image_bytes(url)
         if not img_bytes:
@@ -5374,7 +5377,10 @@ async def search_wikimedia_images(query: str, limit: int = 3) -> list[dict]:
         if not caption:
             caption = re.sub(r"\.(jpe?g|png)$", "", title, flags=re.I)
         caption = re.sub(r"[_\-]+", " ", caption).strip() or query
-        out.append({"bytes": img_bytes, "caption": caption[:120], "source": info.get("descriptionurl") or info.get("url") or url})
+        source = info.get("descriptionurl") or info.get("url") or url
+        if not _is_safe_real_photo_meta(caption, source, url, mime):
+            continue
+        out.append({"bytes": img_bytes, "caption": caption[:120], "source": source})
         if len(out) >= limit:
             break
 
@@ -5424,12 +5430,18 @@ async def search_wikipedia_page_images(query: str, limit: int = 2) -> list[dict]
                 continue
             if not re.search(r"\.(jpe?g|png)(\?|$)", url, flags=re.I):
                 continue
+            caption0 = " ".join(str(item.get("title") or query).split())
+            source0 = item.get("fullurl") or f"https://{lang}.wikipedia.org/"
+            if not _is_safe_real_photo_meta(caption0, source0, url):
+                continue
             seen.add(url)
             img_bytes = await _download_image_bytes(url)
             if not img_bytes:
                 continue
             caption = " ".join(str(item.get("title") or query).split())
             source = item.get("fullurl") or f"https://{lang}.wikipedia.org/"
+            if not _is_safe_real_photo_meta(caption, source, url):
+                continue
             out.append({"bytes": img_bytes, "caption": caption[:120], "source": source})
             if len(out) >= limit:
                 print(f"[IMAGES] Wikipedia query={query!r}: найдено {len(out)}/{limit}")
@@ -5438,6 +5450,33 @@ async def search_wikipedia_page_images(query: str, limit: int = 2) -> list[dict]
     print(f"[IMAGES] Wikipedia query={query!r}: найдено {len(out)}/{limit}")
     return out
 
+
+
+_BAD_IMAGE_WORDS = (
+    "meme", "memes", "funny", "joke", "humor", "humour", "lol", "comedy",
+    "cartoon", "caricature", "parody", "satire", "comic", "sticker", "emoji",
+    "gif", "reaction", "demotivator", "демотиватор", "мем", "прикол", "смешн",
+    "карикатур", "парод", "сатира", "комикс", "стикер", "логотип", "logo",
+    "clipart", "vector", "drawing", "sketch", "illustration", "poster", "ai generated",
+    "generated", "midjourney", "stable diffusion", "dall-e", "dalle",
+)
+_GOOD_PHOTO_WORDS = (
+    "photo", "photograph", "portrait", "official", "press", "meeting", "conference",
+    "фото", "фотография", "портрет", "официаль", "пресс", "конференц",
+)
+
+
+def _is_safe_real_photo_meta(*values: str) -> bool:
+    """Отсекает мемы/карикатуры/рисунки/AI-изображения по метаданным."""
+    blob = " ".join(str(v or "") for v in values).lower()
+    blob = re.sub(r"[_%20\-]+", " ", blob)
+    if any(w in blob for w in _BAD_IMAGE_WORDS):
+        return False
+    # Если явно указано, что это фото/портрет/official — отлично.
+    if any(w in blob for w in _GOOD_PHOTO_WORDS):
+        return True
+    # Нейтральные метаданные допускаем для Wikipedia/Openverse: там часто title = имя страницы.
+    return True
 
 async def search_openverse_images(query: str, limit: int = 3) -> list[dict]:
     """Бесплатный официальный Openverse API: реальные фото/изображения Creative Commons без ключа."""
@@ -5468,6 +5507,11 @@ async def search_openverse_images(query: str, limit: int = 3) -> list[dict]:
     out: list[dict] = []
     seen: set[str] = set()
     for item in payload.get("results", []) or []:
+        title0 = " ".join(str(item.get("title") or query).split())
+        creator0 = " ".join(str(item.get("creator") or "").split())
+        source0 = item.get("foreign_landing_url") or item.get("url") or ""
+        if not _is_safe_real_photo_meta(title0, creator0, source0):
+            continue
         # Реальные изображения: сначала thumbnail (быстрее/стабильнее), затем оригинал.
         candidates = [item.get("thumbnail"), item.get("url")]
         for url in candidates:
@@ -5479,9 +5523,11 @@ async def search_openverse_images(query: str, limit: int = 3) -> list[dict]:
                 continue
             title = " ".join(str(item.get("title") or query).split())[:120]
             creator = " ".join(str(item.get("creator") or "").split())
+            source = item.get("foreign_landing_url") or item.get("url") or url
+            if not _is_safe_real_photo_meta(title, creator, source, url):
+                continue
             if creator and creator.lower() not in title.lower():
                 title = f"{title} ({creator[:60]})"[:120]
-            source = item.get("foreign_landing_url") or item.get("url") or url
             out.append({"bytes": img_bytes, "caption": title or query, "source": source})
             break
         if len(out) >= limit:
@@ -5640,7 +5686,8 @@ async def prepare_work_images(
         ("openverse", search_openverse_images),
         ("wikipedia", search_wikipedia_page_images),
         ("wikimedia", search_wikimedia_images),
-        ("duckduckgo", search_duckduckgo_images),
+        # DuckDuckGo намеренно не используем по умолчанию: выдача часто содержит мемы,
+        # карикатуры и смешные картинки. Оставляем функцию в коде только как запас.
     )
 
     for q in queries:
@@ -5685,7 +5732,8 @@ def add_gost_image(doc: Document, image: dict, number: int, gost: dict) -> None:
         p_img.alignment = WD_ALIGN_PARAGRAPH.CENTER
         p_img.paragraph_format.first_line_indent = Cm(0)
         run = p_img.add_run()
-        run.add_picture(io.BytesIO(img_bytes), width=Cm(12.0))
+        width_cm = float(gost.get("image_width_cm", 10.0))
+        run.add_picture(io.BytesIO(img_bytes), width=Cm(max(6.0, min(12.0, width_cm))))
 
         caption = " ".join(str(image.get("caption") or "Иллюстрация по теме исследования").split())
         p_cap = doc.add_paragraph()
@@ -6643,9 +6691,8 @@ async def precise_page_adjustment(
         elif diff > 0:
             # Всегда обрезаем если перебор (даже +1), чтобы не было +1 над целью
             pass  # continue to trim
-        elif it >= 10 and abs(diff) <= 1:
-            print(f"[ADJUST] ✅ Приемлемая цель достигнута на поздней итерации: {real_pages} стр.")
-            break
+        # Никаких «почти совпало»: пользователь заказал точное число страниц.
+        # Продолжаем подгонку, пока diff не станет 0 или пока не исчерпаны итерации.
         
         # Рассчитываем сколько символов нужно добавить/убрать
         chars_per_real_page = calculate_chars_per_page(gost)
@@ -6662,10 +6709,17 @@ async def precise_page_adjustment(
             # Если обрезка упёрлась в floor и реально ничего не удалила —
             # дальнейшие итерации бессмысленны (мы защищаем целостность глав).
             if _before - _after < max(50, chars_to_remove // 10):
-                print(f"[ADJUST] ⛔ Обрезка упёрлась в порог целостности "
-                      f"({_before - _after} зн. из {chars_to_remove}). "
-                      f"Останавливаюсь: {real_pages} стр. вместо {target_pages}.")
-                break
+                # Если перебор вызван картинками, сначала уменьшаем их ширину и
+                # продолжаем точную подгонку, а не отдаём +1/+2 страницы.
+                if data.get("images") and float(gost.get("image_width_cm", 10.0)) > 6.0:
+                    old_w = float(gost.get("image_width_cm", 10.0))
+                    gost["image_width_cm"] = max(6.0, old_w - 1.0)
+                    print(f"[ADJUST] 🖼 Уменьшаю ширину изображений: {old_w} см → {gost['image_width_cm']} см")
+                else:
+                    print(f"[ADJUST] ⛔ Обрезка упёрлась в порог целостности "
+                          f"({_before - _after} зн. из {chars_to_remove}). "
+                          f"Точная цель пока недостижима: {real_pages} стр. вместо {target_pages}.")
+                    break
         else:
             # Слишком мало страниц — добавляем
             chars_to_add = int(abs(diff) * chars_per_real_page)
@@ -8829,7 +8883,10 @@ async def generate_and_send(
                     image_count=int(data.get("image_count") or 0) or None,
                 )
                 if not data.get("images"):
-                    print("[IMAGES] Подходящие изображения не найдены — документ будет без иллюстраций")
+                    print("[IMAGES] Подходящие реальные фото не найдены — документ будет без иллюстраций")
+                else:
+                    # Компактный размер фото помогает сохранить точное число страниц.
+                    gost["image_width_cm"] = 10.0
 
             docx_raw = build_docx_bytes(data, blocks, gost)
             with open(tmp_in, "wb") as f:
@@ -8859,7 +8916,7 @@ async def generate_and_send(
             # ── Постобработка: LO после обновления TOC может «раздуть»
             #    документ на 1–2 страницы. Поэтому крутим коррекцию в цикле
             #    до 3 раз: измерили → подогнали blocks → пересобрали → LO → снова замер. ──
-            POST_LO_MAX_ROUNDS = 3
+            POST_LO_MAX_ROUNDS = 6
             final_pages = pages
             for round_idx in range(POST_LO_MAX_ROUNDS):
                 post_lo_pages = await measure_pages_async(final_path, work_dir)
@@ -8898,6 +8955,44 @@ async def generate_and_send(
             else:
                 # Цикл закончился без break — печатаем итог
                 print(f"[PAGES] ⚠️ После {POST_LO_MAX_ROUNDS} раундов финальная цифра {final_pages}, цель {pages}")
+
+            # Финальный строгий контроль: не отправляем «почти нужный» объём без попытки исправить.
+            if final_pages != pages:
+                print(f"[PAGES] 🚨 Финальная строгая коррекция: факт {final_pages}, цель {pages}")
+                for strict_round in range(3):
+                    if final_pages == pages:
+                        break
+                    if final_pages > pages and data.get("images") and float(gost.get("image_width_cm", 10.0)) > 6.0:
+                        gost["image_width_cm"] = max(6.0, float(gost.get("image_width_cm", 10.0)) - 1.0)
+                        print(f"[PAGES] 🖼 strict: ширина изображений {gost['image_width_cm']} см")
+                    blocks, _ = await precise_page_adjustment(
+                        tmp_in=tmp_in,
+                        blocks=blocks,
+                        target_pages=pages,
+                        topic=topic,
+                        model_key=model_key,
+                        writing_style=writing_style,
+                        data=data,
+                        gost=gost,
+                        prog=prog,
+                        work_dir=work_dir,
+                    )
+                    blocks = _apply_heading_format_to_blocks(blocks)
+                    docx_raw = build_docx_bytes(data, blocks, gost)
+                    with open(tmp_in, "wb") as f:
+                        f.write(docx_raw)
+                    updated = libreoffice_update_docx(tmp_in, tmp_out)
+                    final_path = tmp_out if updated else tmp_in
+                    measured = await measure_pages_async(final_path, work_dir)
+                    if measured is not None:
+                        final_pages = measured
+                    print(f"[PAGES] strict round {strict_round+1}: {final_pages}/{pages}")
+
+            if final_pages != pages:
+                raise RuntimeError(
+                    f"Не удалось добиться точного объёма: получилось {final_pages} стр., нужно {pages}. "
+                    "Попробуйте уменьшить количество изображений или выбрать на 1 страницу больше."
+                )
 
             print(f"[PAGES] 📤 Итог в caption: {final_pages} страниц")
 
