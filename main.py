@@ -3650,14 +3650,104 @@ def _is_garbage(text: str) -> bool:
     return False
 
 
+def _validate_fio(text: str, *, kind: str = "ФИО") -> tuple[bool, str]:
+    """Усиленная валидация ФИО (FIX 7.32-F: замена слабой проверки в h_author/h_teacher).
+
+    Правила:
+      - 2 или 3 слова (русская и международная практика).
+      - Каждое слово ≥ 2 букв.
+      - Каждое русское слово должно содержать хотя бы одну гласную.
+      - Разрешены только кириллица, дефис и пробел (без латиницы, цифр, спецсимволов).
+      - Первый символ каждого слова — заглавная буква, остальные — строчные.
+      - Возвращает (ok, normalized_text_or_error_message).
+    """
+    if not text:
+        return False, f"❌ {kind} не указано."
+
+    original = text
+    # Нормализация пробелов и ё→е (для сравнения гласных)
+    text_norm = re.sub(r"\s+", " ", text).strip()
+
+    # Слишком короткое
+    if len(text_norm) < 5:
+        return False, f"❌ {kind} слишком короткое (минимум 5 символов)."
+
+    words = text_norm.split()
+    if len(words) < 2:
+        return False, (
+            f"❌ Введите <b>полные {kind}</b> — минимум фамилия и имя.\n\n"
+            "<i>Пример: Иванов Иван Иванович</i>"
+        )
+    if len(words) > 3:
+        return False, (
+            f"❌ Введите <b>полные {kind}</b> — 2 или 3 слова.\n\n"
+            "<i>Пример: Иванов Иван Иванович</i>"
+        )
+
+    # Каждое слово ≥ 2 букв
+    if any(len(w) < 2 for w in words):
+        return False, (
+            f"❌ Слишком короткие слова в {kind}. Каждое слово — минимум 2 буквы.\n\n"
+            "<i>Пример: Иванов Иван Иванович</i>"
+        )
+
+    # Каждое слово должно состоять только из кириллицы и дефиса
+    for w in words:
+        if not re.fullmatch(r"[А-Яа-яЁё\-]+", w):
+            return False, (
+                f"❌ В {kind} найдены посторонние символы (латиница, цифры или спецсимволы).\n\n"
+                "<i>Используйте только кириллицу, например: Иванов Иван Иванович</i>"
+            )
+
+    # Каждое русское слово должно содержать хотя бы одну гласную
+    # (защита от «прш крн» и подобного мусора)
+    if _is_garbage(text_norm):
+        return False, (
+            f"❌ {kind} похоже на случайный набор символов.\n\n"
+            "<i>Пример: Иванов Иван Иванович</i>"
+        )
+
+    # Каждое слово должно начинаться с заглавной буквы
+    normalized_words: list[str] = []
+    for w in words:
+        # Разрешаем дефис (двойные фамилии: «Римский-Корсаков»)
+        parts = w.split("-")
+        parts_norm = []
+        for p in parts:
+            if not p:
+                continue
+            parts_norm.append(p[0].upper() + p[1:].lower() if len(p) > 1 else p.upper())
+        normalized_words.append("-".join(parts_norm))
+
+    normalized = " ".join(normalized_words)
+    return True, normalized
+
+
 def _clean_title_page_garbage(text: str) -> str:
     """Очищает текст титульного листа от случайных букв и мусора.
 
     Убирает: висящие одиночные буквы, случайные комбинации типа "Ршп дир",
-    обрезанные слова, латинские вкрапления в русский текст.
+    обрезанные слова, латинские вкрапления в русский текст,
+    URL и имена файлов, повторяющиеся символы и прочий «мусор».
+
+    Усилено (FIX 7.32-C): дополнительно удаляет «голые» URL, имена файлов
+    .docx/.pdf, смешанные латино-кириллические «слова-мусор», email-адреса
+    и защищает от ситуации, когда после очистки остаётся «почти мусор».
     """
     if not text:
         return text
+
+    # ── FIX 7.32-C: вырезаем «голые» URL и имена файлов (.docx/.pdf/.jpg...) ──
+    text = re.sub(r'https?://\S+', '', text)
+    text = re.sub(r'\b\S+\.(?:docx?|pdf|jpg|jpeg|png|xls|xlsx|rtf|txt)\b', '', text, flags=re.I)
+    text = re.sub(r'\bwww\.\S+', '', text, flags=re.I)
+
+    # ── FIX 7.32-C: удаляем email-адреса (явный мусор в титульнике) ──
+    text = re.sub(r'\b[\w.\-]+@[\w.\-]+\.[A-Za-z]{2,}\b', '', text)
+
+    # ── FIX 7.32-C: убираем случайные символы #, *, ~, |, /, \\ подряд ──
+    text = re.sub(r'[#*~|/\\]{2,}', ' ', text)
+
     # Удаляем висящие одиночные буквы с точкой: "И.", "А." отдельно стоящие
     text = re.sub(r'(?<![А-Яа-яA-Za-z])\s*[А-Яа-яA-Za-z]\.\s*(?![А-Яа-яA-Za-z])', ' ', text)
     # Удаляем случайные 2-3 буквенные комбинации без гласных (типа "ршп", "тлк")
@@ -3668,7 +3758,17 @@ def _clean_title_page_garbage(text: str) -> str:
     text = re.sub(r'(.)\1{3,}', r'\1\1\1', text)
     # Чистим латинские вкрапления в русских словах (гомоглифы)
     text = _normalize_homoglyphs(text)
-    # Схлопыв��ем лишние пробелы
+
+    # ── FIX 7.32-C: удаляем «смешанные» латино-кириллические «слова-мусор» ──
+    #                (типа "РшпA", "XВУЗ", "ФGБОУ") — оставляем только
+    #                чистые кириллические/латинские слова.
+    text = re.sub(
+        r'\b(?=[А-Яа-яЁё]*[A-Za-z])(?=[A-Za-z]*[А-Яа-яЁё])[A-Za-zА-Яа-яЁё]{2,8}\b',
+        '',
+        text,
+    )
+
+    # Схлопываем лишние пробелы
     text = re.sub(r'\s+', ' ', text).strip()
 
     # Удаляем строки, состоящие только из заглавных букв без гласных
@@ -3681,6 +3781,14 @@ def _clean_title_page_garbage(text: str) -> str:
     # название организации в титульном листе.
     text = re.sub(r'(?<![А-Яа-яA-Za-z])[А-Яа-яA-Za-z]\.(?![А-Яа-яA-Za-z])', ' ', text)
     text = re.sub(r'\s{2,}', ' ', text).strip()
+
+    # ── FIX 7.32-C: если после очистки остался «почти мусор»
+    #                (<30% кириллицы от суммы букв+цифр) — обнуляем. ──
+    if text and len(text) >= 3:
+        letters_ru = len(re.findall(r'[А-Яа-яЁё]', text))
+        digits = len(re.findall(r'\d', text))
+        if letters_ru + digits > 0 and letters_ru / max(1, letters_ru + digits) < 0.3:
+            return ""
 
     return text
 
@@ -5694,20 +5802,113 @@ async def search_duckduckgo_images(query: str, limit: int = 2) -> list[dict]:
 
 
 def _caption_ru_fallback(caption: str, topic: str = "") -> str:
-    """Быстрый словарный fallback для подписей к рисункам."""
+    """Быстрый словарный fallback для подписей к рисункам.
+
+    FIX 7.32-D: расширен словарь (Трамп, Байден, Эйнштейн, МГУ, NASA …),
+    добавлены правила для типовых русских заголовков,
+    более аккуратная очистка служебных английских слов.
+    """
     cap = " ".join((caption or "").replace("_", " ").replace("-", " ").split())
     low = cap.lower()
     topic_low = (topic or "").lower()
-    if "joe biden" in low or "biden" in low or "байден" in topic_low:
-        if "portrait" in low or "official" in low:
-            return "Официальный портрет Джо Байдена"
-        return "Фотография Джо Байдена"
-    # Убираем служебные английские слова, если нормального перевода нет.
-    cap = re.sub(r"\b(file|image|photo|portrait|official|jpg|jpeg|png|svg|commons|wikimedia)\b", "", cap, flags=re.I)
+
+    # ── Персоналии (частые случаи в реальных подписях) ──
+    PERSONS = {
+        "biden":  "Джо Байден",
+        "joe biden": "Джо Байден",
+        "байден":  "Джо Байден",
+        "trump":   "Дональд Трамп",
+        "donald trump": "Дональд Трамп",
+        "трамп":   "Дональд Трамп",
+        "putin":   "Владимир Путин",
+        "vladimir putin": "Владимир Путин",
+        "путин":   "Владимир Путин",
+        "einstein": "Альберт Эйнштейн",
+        "albert einstein": "Альберт Эйнштейн",
+        "эйнштейн": "Альберт Эйнштейн",
+        "tesla":   "Никола Тесла",
+        "edison":  "Томас Эдисон",
+        "newton":  "Исаак Ньютон",
+        "darwin":  "Чарльз Дарвин",
+    }
+    for k, v in PERSONS.items():
+        if k in low:
+            tail_phrase = ""
+            if any(w in low for w in ("portrait", "official", "photo")):
+                tail_phrase = " (портрет)"
+            elif any(w in low for w in ("speaking", "press", "conference")):
+                tail_phrase = " (выступление)"
+            return f"Фотография {v}{tail_phrase}"
+
+    # ── Организации и бренды (без перевода на русский — оставляем латиницей) ──
+    ORGS = ("NASA", "ESA", "ISS", "UNESCO", "WHO", "ООН", "МГУ", "Сколково")
+    org_hit = next((o for o in ORGS if o.lower() in low or o in cap), None)
+
+    # ── Тип фото (portrait, landscape, building и т. п.) ──
+    PHOTO_TYPES = {
+        "portrait": "портрет",
+        "landscape": "пейзаж",
+        "building": "здание",
+        "cityscape": "городской пейзаж",
+        "sunset": "закат",
+        "sunrise": "восход",
+        "night": "ночной вид",
+        "aerial": "вид сверху",
+        "satellite": "спутниковый снимок",
+        "map": "карта",
+        "diagram": "схема",
+        "chart": "диаграмма",
+        "graph": "график",
+        "sketch": "рисунок",
+        "drawing": "чертёж",
+        "photo": "фотография",
+        "image": "изображение",
+        "picture": "изображение",
+        "logo": "логотип",
+        "flag": "флаг",
+        "people": "люди",
+        "crowd": "толпа",
+        "student": "студент",
+        "students": "студенты",
+        "teacher": "преподаватель",
+        "lab": "лаборатория",
+        "office": "офис",
+        "computer": "компьютер",
+    }
+    detected_type = next((v for k, v in PHOTO_TYPES.items() if k in low), None)
+
+    # ── Убираем служебные английские слова ──
+    cap = re.sub(
+        r"\b(file|image|photo|portrait|official|jpg|jpeg|png|svg|commons|"
+        r"wikimedia|thumbnail|preview|of|the|a|an|and|by|from|in|on|at|"
+        r"high|resolution|full|small|large|small|medium|size|original)\b",
+        "",
+        cap,
+        flags=re.I,
+    )
     cap = re.sub(r"\s+", " ", cap).strip(" .,-_")
+
+    # ── Если есть кириллица — вернуть как есть (но с обрезанными служебными) ──
     if re.search(r"[А-Яа-яЁё]", cap):
+        if detected_type and detected_type not in cap.lower():
+            return f"{cap[:90]} ({detected_type})"[:120]
         return cap[:120]
-    return (f"Иллюстрация по теме «{topic}»" if topic else "Иллюстрация по теме исследования")
+
+    # ── Если только латиница — собираем русскую подпись по частям ──
+    parts: list[str] = []
+    if detected_type:
+        parts.append(f"Фотография: {detected_type}")
+    if org_hit:
+        parts.append(org_hit)
+    if topic:
+        parts.append(f"по теме «{topic[:50]}»")
+    if not parts:
+        parts.append("Иллюстрация по теме исследования")
+
+    # Избегаем дубликатов слов и схлопываем пробелы
+    out = ", ".join(p for p in parts if p)
+    out = re.sub(r"\s+", " ", out).strip(" .,")
+    return out[:120]
 
 
 async def translate_caption_to_russian(model_key: str, caption: str, topic: str = "") -> str:
@@ -5805,7 +6006,14 @@ async def prepare_work_images(
 
 
 def add_gost_image(doc: Document, image: dict, number: int, gost: dict) -> None:
-    """Вставляет изображение и подпись по ГОСТ: рисунок по центру, подпись снизу."""
+    """Вставляет изображение и подпись по ГОСТ: рисунок по центру, подпись снизу.
+
+    FIX 7.32-G: добавляет widow/orphan + keep_next + keep_lines на все три
+    параграфа (картинка → подпись → источник). Это гарантирует, что:
+      • фото и подпись НЕ окажутся на разных страницах;
+      • источник не «отвалится» в конец следующей страницы;
+      • строка подписи не будет «висячей» вверху/внизу страницы.
+    """
     img_bytes = image.get("bytes")
     if not img_bytes:
         return
@@ -5815,13 +6023,18 @@ def add_gost_image(doc: Document, image: dict, number: int, gost: dict) -> None:
     fs = int(gost.get("font_size", 14))
 
     try:
+        # ── Параграф 1: само изображение ──
         p_img = doc.add_paragraph()
         p_img.alignment = WD_ALIGN_PARAGRAPH.CENTER
         p_img.paragraph_format.first_line_indent = Cm(0)
         run = p_img.add_run()
         width_cm = float(gost.get("image_width_cm", 10.0))
         run.add_picture(io.BytesIO(img_bytes), width=Cm(max(4.0, min(12.0, width_cm))))
+        # Картинка должна остаться с подписью (или со следующим текстом главы,
+        # если подпись не предусмотрена — например, для приложения).
+        _set_paragraph_keep(p_img, keep_next=True, keep_lines=True, widow=True)
 
+        # ── Параграф 2: подпись «Рисунок N – …» ──
         caption = " ".join(str(image.get("caption") or "Иллюстрация по теме исследования").split())
         p_cap = doc.add_paragraph()
         p_cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -5830,7 +6043,10 @@ def add_gost_image(doc: Document, image: dict, number: int, gost: dict) -> None:
         p_cap.paragraph_format.space_after = Pt(6)
         r = p_cap.add_run(f"Рисунок {number} – {caption}")
         _set_run_font(r, fn, fs, False)
+        # Подпись должна остаться с источником (если он есть) и не разрываться.
+        _set_paragraph_keep(p_cap, keep_next=True, keep_lines=True, widow=True)
 
+        # ── Параграф 3: источник (опционально) ──
         source = image.get("source")
         if source:
             p_src = doc.add_paragraph()
@@ -5839,8 +6055,59 @@ def add_gost_image(doc: Document, image: dict, number: int, gost: dict) -> None:
             p_src.paragraph_format.space_after = Pt(6)
             r2 = p_src.add_run(f"Источник: {source}")
             _set_run_font(r2, fn, max(10, fs - 2), False)
+            # Источник — последний параграф «тройки» (картинка+подпись+источник).
+            # keep_lines + widow обязательно; keep_next не обязателен (нет следующего
+            # абзаца в группе), но и не вредит.
+            _set_paragraph_keep(p_src, keep_next=False, keep_lines=True, widow=True)
     except Exception as e:
         print(f"[IMAGES] insert error: {e}")
+def _set_paragraph_keep(p, *, keep_next: bool = False, keep_lines: bool = True, widow: bool = True) -> None:
+    """FIX 7.32-G: ставит «keep_next» и «keep_lines» на параграф.
+
+    `keep_next=True`  — Word/LibreOffice постараются НЕ разрывать страницу
+                        между этим параграфом и следующим.
+    `keep_lines=True` — внутри абзаца не должно быть «висячей» строки
+                        (widow/orphan control).
+    `widow=True`      — то же, что `keep_lines` (для совместимости).
+
+    Используется, чтобы фото + подпись + источник оставались на одной
+    странице, а последний абзац текста главы «прилипал» к следующему за ним
+    изображению. Реализовано через прямые XML-элементы pPr,
+    потому что python-docx не предоставляет этих свойств напрямую.
+    """
+    try:
+        pPr = p._p.get_or_add_pPr()
+        # 1) widow/orphan control
+        if widow or keep_lines:
+            existing_w = pPr.find(qn("w:widowControl"))
+            if existing_w is None:
+                w_el = OxmlElement("w:widowControl")
+                w_el.set(qn("w:val"), "1")
+                pPr.append(w_el)
+            else:
+                existing_w.set(qn("w:val"), "1")
+        # 2) keepNext — параграф не должен отрываться от следующего
+        if keep_next:
+            existing_k = pPr.find(qn("w:keepNext"))
+            if existing_k is None:
+                k_el = OxmlElement("w:keepNext")
+                k_el.set(qn("w:val"), "1")
+                pPr.append(k_el)
+            else:
+                existing_k.set(qn("w:val"), "1")
+        # 3) keepLines — строки абзаца не разрываются между страницами
+        if keep_lines:
+            existing_kl = pPr.find(qn("w:keepLines"))
+            if existing_kl is None:
+                kl_el = OxmlElement("w:keepLines")
+                kl_el.set(qn("w:val"), "1")
+                pPr.append(kl_el)
+            else:
+                existing_kl.set(qn("w:val"), "1")
+    except Exception as e:
+        print(f"[KEEP] Ошибка установки keep_next/keep_lines: {e}")
+
+
 
 
 def build_docx_bytes(
@@ -5895,6 +6162,63 @@ def build_docx_bytes(
             unique_blocks.append(b)
     blocks = unique_blocks
 
+    # ═══════════════════════════════════════════════════════════════
+    # FIX 7.32-A: глобальный page_map по ВСЕМУ тексту работы
+    #             + _fill_missing_pages для каждого блока и подблока.
+    # Все цитаты [N] приводятся к виду [N, с. X] согласно ГОСТ 7.32-2017.
+    # ═══════════════════════════════════════════════════════════════
+    try:
+        _global_text_parts: list[str] = []
+        for _bt, _bl, _bx, _sb in blocks:
+            if _bx:
+                _global_text_parts.append(_bx)
+            for _st, _sx in (_sb or []):
+                if _sx:
+                    _global_text_parts.append(_sx)
+        _global_map = _build_page_map("\n\n".join(_global_text_parts))
+
+        _normalized_blocks: list[tuple] = []
+        for _bt, _bl, _bx, _sb in blocks:
+            _bx_n = _fill_missing_pages(_bx or "", _global_map) if _bx else _bx
+            _sb_n = []
+            for _st, _sx in (_sb or []):
+                _sx_n = _fill_missing_pages(_sx or "", _global_map) if _sx else _sx
+                _sb_n.append((_st, _sx_n))
+            _normalized_blocks.append((_bt, _bl, _bx_n, _sb_n))
+        blocks = _normalized_blocks
+    except Exception as _e:
+        print(f"[FIX 7.32-A] Не удалось нормализовать цитаты: {_e}")
+
+    # ═══════════════════════════════════════════════════════════════
+    # FIX 7.32-B: библиография → ГОСТ 7.32 для ФИНАЛЬНОГО документа.
+    #             Прогоняем _normalize_bibliography по блоку
+    #             «СПИСОК ИСПОЛЬЗОВАННЫХ ИСТОЧНИКОВ» / «СПИСОК ЛИТЕРАТУРЫ».
+    # Это финальная страховка — add_paragraphs_from_text тоже вызовет
+    # её для is_bib=True, но двойная нормализация гарантирует формат.
+    # ═══════════════════════════════════════════════════════════════
+    try:
+        _bib_keys = (
+            "СПИСОК ИСПОЛЬЗОВАННЫХ ИСТОЧНИКОВ",
+            "СПИСОК ЛИТЕРАТУРЫ",
+            "СПИСОК ИСТОЧНИКОВ",
+            "БИБЛИОГРАФИЧЕСКИЙ СПИСОК",
+            "БИБЛИОГРАФИЯ",
+        )
+        _norm_blocks: list[tuple] = []
+        for _bt, _bl, _bx, _sb in blocks:
+            _up = (_bt or "").upper()
+            if any(_bk in _up for _bk in _bib_keys):
+                _bx = _normalize_bibliography(_bx or "")
+                _sb_n = []
+                for _st, _sx in (_sb or []):
+                    _sx_n = _normalize_bibliography(_sx or "") if _sx else _sx
+                    _sb_n.append((_st, _sx_n))
+                print(f"[FIX 7.32-B] Библиография нормализована по ГОСТ 7.32: «{_bt}»")
+            _norm_blocks.append((_bt, _bl, _bx, _sb))
+        blocks = _norm_blocks
+    except Exception as _e:
+        print(f"[FIX 7.32-B] Не удалось нормализовать библиографию: {_e}")
+
     work_images = data.get("images") or []
     image_number = 1
 
@@ -5907,6 +6231,27 @@ def build_docx_bytes(
             return
         if block_level != 1:
             return
+        # FIX 7.32-G: перед вставкой изображения — ставим keep_next=True
+        #              на ПОСЛЕДНИЙ абзац тела текущей главы, чтобы он
+        #              «прилип» к картинке. Это гарантирует, что фото
+        #              и текст главы будут на одной странице.
+        try:
+            _last_body_para = None
+            for _pp in doc.paragraphs[::-1]:
+                _pf = _pp.paragraph_format
+                _txt = "".join(_r.text for _r in _pp.runs).strip()
+                if (
+                    _txt
+                    and _pp.alignment == WD_ALIGN_PARAGRAPH.JUSTIFY
+                    and not _pf.page_break_before
+                    and _pf.first_line_indent is not None
+                ):
+                    _last_body_para = _pp
+                    break
+            if _last_body_para is not None:
+                _set_paragraph_keep(_last_body_para, keep_next=True, keep_lines=True, widow=True)
+        except Exception as _ke:
+            print(f"[FIX 7.32-G] keep_next не установлен: {_ke}")
         add_gost_image(doc, work_images[image_number - 1], image_number, gost)
         image_number += 1
 
@@ -7632,6 +7977,43 @@ def _mode_paid_text() -> str:
 #  ХЭНДЛЕРЫ — /start и общие команды
 # ═══════════════════════════════════════════════════════════════
 
+async def _extract_docx_text(bot: "Bot", document) -> tuple[str, str]:
+    """Скачивает DOCX из Telegram и извлекает текст.
+
+    Возвращает (text, error). text — извлечённый текст (без markdown),
+    error — пустая строка при успехе, иначе описание ошибки.
+    """
+    if not document:
+        return "", "документ не передан"
+    try:
+        file = await bot.get_file(document.file_id)
+        buf = io.BytesIO()
+        await bot.download_file(file.file_path, buf)
+        buf.seek(0)
+        doc = Document(buf)
+        paras: list[str] = []
+        for p in doc.paragraphs:
+            t = (p.text or "").strip()
+            if t:
+                paras.append(t)
+        # Таблицы тоже
+        for tbl in doc.tables:
+            for row in tbl.rows:
+                for cell in row.cells:
+                    t = (cell.text or "").strip()
+                    if t:
+                        paras.append(t)
+        if not paras:
+            return "", "документ пустой или не содержит читаемого текста"
+        text = "\n\n".join(paras)
+        # Ограничиваем размер для ИИ-контекста (12 000 символов)
+        if len(text) > 12000:
+            text = text[:12000].rsplit(" ", 1)[0] + "…"
+        return text, ""
+    except Exception as e:
+        return "", f"не удалось прочитать документ: {e}"
+
+
 @dp.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.clear()
@@ -7663,6 +8045,79 @@ async def cmd_help(message: Message, state: FSMContext) -> None:
         parse_mode="HTML",
     )
 
+
+@dp.message(F.document)
+async def h_document(message: Message, state: FSMContext) -> None:
+    """FIX 7.32-H: обработчик входящих DOCX/PDF/документов.
+
+    Поведение:
+      • Если пользователь в WorkState.source_content — скачиваем файл,
+        извлекаем текст и используем его как материал для ИИ.
+      • Иначе — отвечаем дружелюбным сообщением, что бот генерирует
+        документы, а не редактирует присланные.
+    """
+    document = message.document
+    cur_state = await state.get_state()
+    mime = (document.mime_type or "").lower() if document else ""
+    fname = (document.file_name or "").lower() if document else ""
+
+    # ── Принять DOCX/PDF как материал (только в нужном состоянии) ──
+    if cur_state == WorkState.source_content.state:
+        if not (mime.startswith("application/vnd.openxmlformats-officedocument.wordprocessingml")
+                or mime == "application/pdf"
+                or fname.endswith(".docx") or fname.endswith(".doc")
+                or fname.endswith(".pdf")):
+            await message.answer(
+                "❌ Принимаю только <b>DOCX</b> или <b>PDF</b>.\n\n"
+                "<i>Пришлите файл с планом, конспектом или тезисами — ИИ использует это как основу.</i>",
+                parse_mode="HTML",
+                reply_markup=kb_back_cancel(),
+            )
+            return
+
+        wait = await message.answer(
+            "⏳ <b>Читаю документ...</b>",
+            parse_mode="HTML",
+        )
+        text, err = await _extract_docx_text(message.bot, document)
+        try:
+            await wait.delete()
+        except Exception:
+            pass
+
+        if err or not text:
+            await message.answer(
+                f"❌ Не удалось извлечь текст из файла.\n\n<b>Причина:</b> {html.escape(err or 'неизвестная ошибка')}\n\n"
+                "Пришлите <b>DOCX</b> с планом/конспектом или просто вставьте текст сообщением.",
+                parse_mode="HTML",
+                reply_markup=kb_back_cancel(),
+            )
+            return
+
+        await state.update_data(source_content=text)
+        await message.answer(
+            f"✅ Документ принят! Извлечено <b>{len(text)} символов</b> текста.\n\n"
+            "🏛 <b>Тип учебного заведения</b>:",
+            reply_markup=with_back(kb_institution()),
+            parse_mode="HTML",
+        )
+        await state.set_state(WorkState.institution_type)
+        return
+
+    # ── В любом другом состоянии: подсказка о /start ──
+    await message.answer(
+        "📄 <b>Этот бот генерирует документы по ГОСТ 7.32-2017</b>\n\n"
+        "Я не редактирую присланные DOCX/PDF, но могу создать новую работу "
+        "по вашей теме с оформлением по ГОСТ, титульным листом, содержанием "
+        "и списком литературы.\n\n"
+        "👉 Нажмите <b>/start</b>, чтобы начать новую генерацию.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🚀 Создать новую работу", callback_data="final_new")],
+            ]
+        ),
+    )
 
 @dp.message(Command("limits"))
 async def cmd_limits(message: Message) -> None:
@@ -8142,39 +8597,19 @@ async def h_group(message: Message, state: FSMContext) -> None:
 
 @dp.message(WorkState.author)
 async def h_author(message: Message, state: FSMContext) -> None:
-    author = (message.text or "").strip()
-
-    # Валидация
-    words = author.split()
-    if len(words) < 2 or _is_garbage(author):
+    raw = (message.text or "").strip()
+    ok, value = _validate_fio(raw, kind="ФИО автора")
+    if not ok:
         await message.answer(
-            "❌ Введите полные ФИО (минимум имя и фамилия) без случайных символов\n\n"
-            "<i>Пример: Иванов Иван Иванович</i>",
+            value,
             parse_mode="HTML",
             reply_markup=kb_back_cancel(),
         )
         return
-
-    if any(len(w) == 1 for w in words):
-        await message.answer(
-            "❌ Не используйте однобуквенные сокращения\n\n"
-            "<i>Пример: Иванов Иван Иванович</i>",
-            parse_mode="HTML",
-            reply_markup=kb_back_cancel(),
-        )
-        return
-
-    if len(author) < 5:
-        await message.answer(
-            "❌ ФИО слишком короткое\n\n"
-            "<i>Пример: Иванов Иван Иванович</i>",
-            parse_mode="HTML",
-            reply_markup=kb_back_cancel(),
-        )
-        return
-
+    author = value
     await state.update_data(author=author)
     await message.answer(
+        f"✅ <b>ФИО автора:</b> {html.escape(author)}\n\n"
         "👨‍🏫 <b>Введите ФИО преподавателя</b>\n\n<i>Пример: Петров Пётр Петрович</i>",
         parse_mode="HTML",
         reply_markup=kb_back_cancel(),
@@ -8184,30 +8619,19 @@ async def h_author(message: Message, state: FSMContext) -> None:
 
 @dp.message(WorkState.teacher)
 async def h_teacher(message: Message, state: FSMContext) -> None:
-    teacher = (message.text or "").strip()
-
-    # Валидация
-    words = teacher.split()
-    if len(words) < 2 or _is_garbage(teacher):
+    raw = (message.text or "").strip()
+    ok, value = _validate_fio(raw, kind="ФИО преподавателя")
+    if not ok:
         await message.answer(
-            "❌ Введите полные ФИО преподавателя (минимум имя и фамилия) без случайных символов\n\n"
-            "<i>Пример: Петров Пётр Петрович</i>",
+            value,
             parse_mode="HTML",
             reply_markup=kb_back_cancel(),
         )
         return
-
-    if any(len(w) == 1 for w in words):
-        await message.answer(
-            "❌ Не используйте однобуквенные сокращения\n\n"
-            "<i>Пример: Петров Пётр Петрович</i>",
-            parse_mode="HTML",
-            reply_markup=kb_back_cancel(),
-        )
-        return
-
+    teacher = value
     await state.update_data(teacher=teacher)
     await message.answer(
+        f"✅ <b>ФИО преподавателя:</b> {html.escape(teacher)}\n\n"
         "📚 <b>Выберите дисциплину (предмет)</b>",
         reply_markup=with_back(kb_subject()),
         parse_mode="HTML",
