@@ -1453,7 +1453,8 @@ def _format_source_record(record: dict) -> str:
     elif url:
         ref += f" — URL: {url}."
     else:
-        ref += " — [URL не указан]."
+        # FIX CRIT-2: пропускаем источник без URL/DOI — не по ГОСТ
+        return ""
     # Не пропускаем битые строки из каталогов: «РАН Б.И.П.С.», «университет Б.Г.» и т.п.
     if _is_bad_literature_line(ref):
         return ""
@@ -1536,8 +1537,8 @@ def _ensure_bibliography_urls(bib_text: str) -> str:
     """Гарантирует, что в каждой позиции есть рабочая ссылка или пометка.
 
     Если есть DOI в виде `DOI: 10...`, он превращается в рабочий URL
-    `https://doi.org/10...`. Если ни DOI, ни URL нет — добавляется
-    `[URL не указан]`.
+    `https://doi.org/10...`. Если ни DOI, ни URL нет — источник
+    пропускается (не по ГОСТ).
     """
     if not bib_text:
         return ""
@@ -1555,10 +1556,11 @@ def _ensure_bibliography_urls(bib_text: str) -> str:
             flags=re.IGNORECASE,
         )
         has_url = bool(re.search(r"https?://\S+", line, flags=re.IGNORECASE))
-        has_no_url_mark = "[URL не указан]" in line
-        if not has_url and not has_no_url_mark:
-            line = line.rstrip(" .") + ". — [URL не указан]."
-        elif not line.endswith("."):
+        # FIX CRIT-2: не добавляем [URL не указан] — пропускаем строку без URL
+        if not has_url:
+            # Пропускаем источник без URL (не по ГОСТ)
+            continue
+        if not line.endswith("."):
             line += "."
         out.append(line)
     return "\n".join(out)
@@ -3449,14 +3451,14 @@ def _stub_text(key: str, topic: str) -> str:
         "intro":       f"Данная работа посвящена исследованию темы «{topic}». В современных условиях данная проблематика приобретает особую актуальность и практическую значимость для науки и общества.",
         "conclusion":  f"Проведённое исследование по теме «{topic}» позволило сформулировать следующие выводы: изученная проблематика имеет важное теоретическое и практическое значение.",
         "literature": (
-            f"1. Иванов А.А. Основы исследования темы «{topic}» / А.А. Иванов. — М.: Наука, 2023. — 256 с.\n"
-            f"2. Петров Б.Б. Методы изучения проблематики / Б.Б. Петров. — СПб.: Питер, 2022. — 312 с.\n"
-            f"3. Сидоров В.В. Теоретические аспекты темы «{topic}» / В.В. Сидоров. — М.: Юрайт, 2021. — 198 с.\n"
-            f"4. Кузнецова Г.Н. Современные подходы к изучению / Г.Н. Кузнецова. — М.: Кнорус, 2022. — 240 с.\n"
-            f"5. Морозов Д.А. Практические вопросы исследования / Д.А. Морозов. — СПб.: Лань, 2020. — 184 с.\n"
-            f"6. Васильев Е.П. Анализ проблематики темы «{topic}» / Е.П. Васильев. — М.: ИНФРА-М, 2021. — 272 с.\n"
-            f"7. Николаева О.И. Методология и методика исследования / О.И. Николаева. — М.: Академия, 2023. — 208 с.\n"
-            f"8. Соколов К.Р. Историография вопроса / К.Р. Соколов. — СПб.: РГПУ им. А.И. Герцена, 2022. — 296 с."
+            f"1. [ВСТАВЬТЕ РЕАЛЬНЫЙ ИСТОЧНИК] — ⚠️ Замените эту строку на реальный источник по теме «{topic}».\n"
+            f"2. [ВСТАВЬТЕ РЕАЛЬНЫЙ ИСТОЧНИК] — ⚠️ Замените эту строку на реальный источник по теме «{topic}».\n"
+            f"3. [ВСТАВЬТЕ РЕАЛЬНЫЙ ИСТОЧНИК] — ⚠️ Замените эту строку на реальный источник по теме «{topic}».\n"
+            f"4. [ВСТАВЬТЕ РЕАЛЬНЫЙ ИСТОЧНИК] — ⚠️ Замените эту строку на реальный источник по теме «{topic}».\n"
+            f"5. [ВСТАВЬТЕ РЕАЛЬНЫЙ ИСТОЧНИК] — ⚠️ Замените эту строку на реальный источник по теме «{topic}».\n"
+            f"6. [ВСТАВЬТЕ РЕАЛЬНЫЙ ИСТОЧНИК] — ⚠️ Замените эту строку на реальный источник по теме «{topic}».\n"
+            f"7. [ВСТАВЬТЕ РЕАЛЬНЫЙ ИСТОЧНИК] — ⚠️ Замените эту строку на реальный источник по теме «{topic}».\n"
+            f"8. [ВСТАВЬТЕ РЕАЛЬНЫЙ ИСТОЧНИК] — ⚠️ Замените эту строку на реальный источник по теме «{topic}»."
         ),
     }
     if key in stubs:
@@ -3723,18 +3725,21 @@ def _validate_fio(text: str, *, kind: str = "ФИО") -> tuple[bool, str]:
             "<i>Пример: Иванов Иван Иванович</i>"
         )
 
-    return True, text_norm            _max_repeat = max(w.lower().count(c) for c in set(w.lower()))
-            if _max_repeat / len(w) > 0.6:
-                return False, (
-                    f"❌ Слово «{w}» в {kind} похоже на ошибку ввода.\n\n"
-                    "<i>Пример: Иванов Иван Иванович</i>"
-                )
+        # FIX 7.32-F+: проверка повторяющихся символов (типа "Оаоа", "Алалал")
+        _max_repeat = max(w.lower().count(c) for c in set(w.lower()))
+        if _max_repeat / len(w) > 0.6:
+            return False, (
+                f"❌ Слово «{w}» в {kind} похоже на ошибку ввода.\n\n"
+                "<i>Пример: Иванов Иван Иванович</i>"
+            )
         # FIX 7.32-F+: защита от безгласных слов длиной >3 (типа «Пршп», «Дрнт»)
         if len(w) >= 4 and not re.search(r'[АЕЁИОУЫЭЮЯаеёиоуыэюя]', w):
             return False, (
                 f"❌ Слово «{w}» в {kind} не содержит гласных — это не похоже на реальное слово.\n\n"
                 "<i>Пример: Иванов Иван Иванович</i>"
             )
+
+    return True, text_norm
 
     # Каждое слово должно начинаться с заглавной буквы
     normalized_words: list[str] = []
@@ -7969,6 +7974,7 @@ class WorkState(StatesGroup):
     humanize           = State()
     topic_adjustment   = State()
     gost_free_text     = State()
+    fix_docx_confirm   = State()  # FIX CRIT-1: режим исправления готового DOCX
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -8133,6 +8139,168 @@ async def cmd_help(message: Message, state: FSMContext) -> None:
     )
 
 
+
+
+# ═══════════════════════════════════════════════════════════════
+#  FIX CRIT-1: ИСПРАВЛЕНИЕ ГОТОВОГО DOCX (ссылки + библиография)
+# ═══════════════════════════════════════════════════════════════
+
+async def process_docx_fix(
+    bot: "Bot",
+    chat_id: int,
+    document,
+    state: FSMContext,
+) -> None:
+    """Обрабатывает загруженный DOCX: исправляет ссылки, библиографию, очищает по ГОСТ 7.32."""
+    wait_msg = await bot.send_message(
+        chat_id,
+        "⏳ <b>Анализирую и исправляю документ...</b>\n\n"
+        "🔍 Ищу ошибки в ссылках и библиографии...",
+        parse_mode="HTML",
+    )
+
+    try:
+        # 1. Скачиваем файл
+        file = await bot.get_file(document.file_id)
+        buf = io.BytesIO()
+        await bot.download_file(file.file_path, buf)
+        buf.seek(0)
+
+        # 2. Читаем DOCX
+        from docx import Document
+        doc = Document(buf)
+
+        # 3. Извлекаем текст по параграфам + стили
+        paragraphs_data = []
+        full_text_parts = []
+        for p in doc.paragraphs:
+            t = (p.text or "").strip()
+            style = p.style.name if p.style else "Normal"
+            paragraphs_data.append({"text": p.text or "", "style": style})
+            if t:
+                full_text_parts.append(t)
+
+        # Таблицы тоже
+        table_texts = []
+        for tbl in doc.tables:
+            for row in tbl.rows:
+                for cell in row.cells:
+                    t = (cell.text or "").strip()
+                    if t:
+                        table_texts.append(t)
+
+        full_text = "\n\n".join(full_text_parts + table_texts)
+        if not full_text.strip():
+            await wait_msg.edit_text(
+                "❌ <b>Документ пуст или не содержит читаемого текста.</b>",
+                parse_mode="HTML",
+            )
+            return
+
+        await wait_msg.edit_text(
+            "⏳ <b>Исправляю ссылки и библиографию...</b>\n\n"
+            f"📄 Обнаружено {len(paragraphs_data)} параграфов.\n"
+            "📝 Применяю цепочку очисток по ГОСТ 7.32...",
+            parse_mode="HTML",
+        )
+
+        # 4. Применяем цепочку очисток
+        n_sources = _count_sources(full_text)
+        global_page_map = _build_page_map(full_text)
+
+        cleaned_paragraphs = []
+        is_bib_block = False
+        for pd in paragraphs_data:
+            text = pd["text"]
+            if not text.strip():
+                cleaned_paragraphs.append({"text": text, "style": pd["style"]})
+                continue
+
+            upper = text.upper()
+            if any(kw in upper for kw in ("СПИСОК ИСПОЛЬЗОВАННЫХ ИСТОЧНИКОВ", "СПИСОК ЛИТЕРАТУРЫ",
+                                            "БИБЛИОГРАФ", "ИСТОЧНИКИ", "ЛИТЕРАТУРА")):
+                is_bib_block = True
+                cleaned_paragraphs.append({"text": text, "style": pd["style"]})
+                continue
+
+            if is_bib_block and text.strip() and not text.strip()[0].isdigit():
+                if any(kw in upper for kw in ("ПРИЛОЖЕНИЕ", "ЗАКЛЮЧЕНИЕ", "ВВЕДЕНИЕ", "ГЛАВА")):
+                    is_bib_block = False
+
+            if is_bib_block:
+                cleaned = _normalize_bibliography(text)
+            else:
+                cleaned = text
+                cleaned = _repair(cleaned)
+                cleaned = _fix_citations(cleaned, n_sources=n_sources)
+                cleaned = _fill_missing_pages(cleaned, global_page_map=global_page_map)
+                cleaned = re.sub(r"\*\*(.*?)\*\*", r"\1", cleaned)
+                cleaned = re.sub(r"\s*#{1,6}\s+", "", cleaned)
+
+            cleaned_paragraphs.append({"text": cleaned, "style": pd["style"]})
+
+        # 5. Пересобираем DOCX
+        from docx.shared import Pt, Cm, RGBColor
+        from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING
+        from docx.oxml.ns import qn
+
+        new_doc = Document()
+        try:
+            style = new_doc.styles["Normal"]
+            font = style.font
+            font.name = "Times New Roman"
+            font.size = Pt(14)
+            style.element.rPr.rFonts.set(qn("w:eastAsia"), "Times New Roman")
+        except Exception:
+            pass
+
+        for cp in cleaned_paragraphs:
+            p = new_doc.add_paragraph()
+            if "Heading" in cp["style"] or "Заголовок" in cp["style"]:
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            run = p.add_run(cp["text"])
+            run.font.name = "Times New Roman"
+            run.font.size = Pt(14)
+            run.element.rPr.rFonts.set(qn("w:eastAsia"), "Times New Roman")
+            if "Heading" not in cp["style"] and "Заголовок" not in cp["style"]:
+                p.paragraph_format.first_line_indent = Cm(1.25)
+                p.paragraph_format.line_spacing = 1.5
+
+        # 6. Сохраняем
+        out_buf = io.BytesIO()
+        new_doc.save(out_buf)
+        out_buf.seek(0)
+        fixed_bytes = out_buf.read()
+
+        # 7. Отправляем
+        await wait_msg.delete()
+
+        fname = (document.file_name or "fixed_document").replace(".docx", "_fixed.docx")
+        await bot.send_document(
+            chat_id,
+            BufferedInputFile(fixed_bytes, filename=fname),
+            caption=(
+                "✅ <b>Документ исправлен!</b>\n\n"
+                "🔧 Что было сделано:\n"
+                "  • Ссылки [N] → [N, с. X] (добавлены номера страниц)\n"
+                "  • Библиография приведена к формату ГОСТ 7.32\n"
+                "  • Убраны артефакты markdown\n"
+                "  • Очищены битые ссылки\n\n"
+                "⚠️ Проверьте список литературы — замените маркеры [ВСТАВЬТЕ РЕАЛЬНЫЙ ИСТОЧНИК] на реальные источники."
+            ),
+            parse_mode="HTML",
+        )
+
+    except Exception as e:
+        print(f"[FIX DOCX] Ошибка: {e}")
+        await wait_msg.edit_text(
+            f"❌ <b>Не удалось исправить документ.</b>\n\n"
+            f"<b>Причина:</b> {html.escape(str(e)[:200])}\n\n"
+            f"Попробуйте отправить файл повторно или начните новую генерацию — /start",
+            parse_mode="HTML",
+        )
+
+
 @dp.message(F.document)
 async def h_document(message: Message, state: FSMContext) -> None:
     """FIX 7.32-H: обработчик входящих DOCX/PDF/документов.
@@ -8200,25 +8368,29 @@ async def h_document(message: Message, state: FSMContext) -> None:
         await state.set_state(WorkState.institution_type)
         return
 
-    # ── В любом другом состоянии: предлагаем начать новую работу с материалами ──
+    # ── В любом другом состоянии: предлагаем начать новую работу ИЛИ исправить файл ──
     preview = text[:300].replace("\n", " ").strip()
     if len(text) > 300:
         preview += "…"
+
+    # Сохраняем документ для возможного исправления
+    await state.update_data(fix_docx_document=document.model_dump())
 
     await message.answer(
         f"📄 <b>Документ получен!</b>\n\n"
         f"Извлечено <b>{len(text)} символов</b> текста.\n\n"
         f"<i>Превью:</i> <code>{html.escape(preview[:200])}</code>\n\n"
-        f"Я могу создать новую академическую работу по ГОСТ 7.32-2017, "
-        f"используя этот текст как основу. Материалы сохранены — они будут использованы при генерации.",
+        f"<b>Что сделать с файлом?</b>",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
-                [InlineKeyboardButton(text="🚀 Создать работу по этим материалам", callback_data="final_new")],
+                [InlineKeyboardButton(text="🔧 Исправить ссылки и библиографию", callback_data="fix_docx_yes")],
+                [InlineKeyboardButton(text="🚀 Создать новую работу по этим материалам", callback_data="final_new")],
                 [InlineKeyboardButton(text="📎 Добавить ещё материалы текстом", callback_data="source_add_text")],
             ]
         ),
     )
+    await state.set_state(WorkState.fix_docx_confirm)
 
 @dp.message(Command("limits"))
 async def cmd_limits(message: Message) -> None:
@@ -9320,6 +9492,78 @@ async def h_payment_ok(message: Message, state: FSMContext) -> None:
         parse_mode="HTML",
     )
     await generate_and_send(message, state, model_key=model_key, pay_mode="paid")
+
+
+
+
+@dp.callback_query(F.data == "fix_docx_yes")
+async def h_fix_docx_yes(cb: CallbackQuery, state: FSMContext) -> None:
+    """Пользователь выбрал 'Исправить ссылки и библиографию' — запускаем обработку."""
+    data = await state.get_data()
+    doc_dict = data.get("fix_docx_document")
+    if not doc_dict:
+        await cb.message.edit_text(
+            "❌ <b>Документ не найден.</b>\n\n"
+            "Пожалуйста, отправьте файл заново.",
+            parse_mode="HTML",
+        )
+        await cb.answer()
+        return
+
+    # Восстанавливаем объект Document из словаря
+    from aiogram.types import Document as TgDocument
+    try:
+        document = TgDocument(**doc_dict)
+    except Exception as e:
+        await cb.message.edit_text(
+            f"❌ <b>Ошибка восстановления документа:</b> {html.escape(str(e)[:100])}\n\n"
+            f"Пожалуйста, отправьте файл заново.",
+            parse_mode="HTML",
+        )
+        await cb.answer()
+        return
+
+    await cb.message.edit_text(
+        "⏳ <b>Начинаю исправление документа...</b>",
+        parse_mode="HTML",
+    )
+    await cb.answer()
+    await process_docx_fix(cb.bot, cb.message.chat.id, document, state)
+    await state.clear()
+
+@dp.callback_query(F.data == "fix_docx_yes")
+async def h_fix_docx_yes(cb: CallbackQuery, state: FSMContext) -> None:
+    """Пользователь выбрал 'Исправить ссылки и библиографию' — запускаем обработку."""
+    data = await state.get_data()
+    doc_dict = data.get("fix_docx_document")
+    if not doc_dict:
+        await cb.message.edit_text(
+            "❌ <b>Документ не найден.</b>\n\n"
+            "Пожалуйста, отправьте файл заново.",
+            parse_mode="HTML",
+        )
+        await cb.answer()
+        return
+
+    from aiogram.types import Document as TgDocument
+    try:
+        document = TgDocument(**doc_dict)
+    except Exception as e:
+        await cb.message.edit_text(
+            f"❌ <b>Ошибка восстановления документа:</b> {html.escape(str(e)[:100])}\n\n"
+            f"Пожалуйста, отправьте файл заново.",
+            parse_mode="HTML",
+        )
+        await cb.answer()
+        return
+
+    await cb.message.edit_text(
+        "⏳ <b>Начинаю исправление документа...</b>",
+        parse_mode="HTML",
+    )
+    await cb.answer()
+    await process_docx_fix(cb.bot, cb.message.chat.id, document, state)
+    await state.clear()
 
 
 @dp.callback_query(F.data == "source_add_text")
