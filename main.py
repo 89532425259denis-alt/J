@@ -1,7 +1,4 @@
 # -*- coding: utf-8 -*-
-# GOST-ASSISTANT v2.7 — FIXED (GOST 7.32-2017 compliant)
-# Applied fixes: #1-#9 (see apply_gost_fixes.py)
-
 from __future__ import annotations
 
 """ГОСТ-АССИСТЕНТ v2.7-fix16 — ТОЧНЫЕ СТРАНИЦЫ + ДИСЦИПЛИНА
@@ -71,19 +68,12 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Cm, Mm, Pt, RGBColor
 
-try:
-    from PIL import Image as PILImage, ImageDraw, ImageFont
-except Exception:  # Pillow может быть не установлен на старом деплое
-    PILImage = None
-    ImageDraw = None
-    ImageFont = None
-
 
 # ═══════════════════════════════════════════════════════════════
 #  КРАСИВАЯ АНИМАЦИЯ ПРОГРЕССА С ETA
 # ═══════════════════════════════════════════════════════════════
 
-# Рамки спиннера — меняются каждую секунду для иллюзии движе��ия
+# Рамки спиннера — меняются каждую секунду для иллюзии движения
 _SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 _BAR_FULL  = "█"
 _BAR_HALF  = "▓"
@@ -344,9 +334,6 @@ CHARS_PER_PAGE = int(cfg("CHARS_PER_PAGE", "1850"))
 # каталогов (OpenAlex/Crossref) и читать URL, которые пользователь прислал в
 # материалах. Если сервер без доступа к сети — функции тихо отключатся.
 ENABLE_WEB_SOURCES = cfg("ENABLE_WEB_SOURCES", "1").lower() not in ("0", "false", "no", "off")
-# Отдельный флаг для поиска изображений: даже если веб-источники для литературы отключены,
-# картинки можно оставить включёнными.
-ENABLE_IMAGE_SEARCH = cfg("ENABLE_IMAGE_SEARCH", "1").lower() not in ("0", "false", "no", "off")
 WEB_SOURCE_TIMEOUT = int(cfg("WEB_SOURCE_TIMEOUT", "12"))
 MAX_WEB_SOURCES    = int(cfg("MAX_WEB_SOURCES", "12"))
 MIN_REAL_SOURCES   = int(cfg("MIN_REAL_SOURCES", "10"))
@@ -396,9 +383,6 @@ NON_TEXT_PAGES = int(cfg("NON_TEXT_PAGES", "2"))
 DEEPSEEK_PRICE  = int(cfg("DEEPSEEK_PRICE",           "5"))
 GROQ_PRICE      = int(cfg("GROQ_PRICE",               "3"))
 OR_GEMINI_PRICE = int(cfg("OPENROUTER_GEMINI_PRICE",  "7"))
-# Доплата за режим с иллюстрациями: поиск, проверка и вставка изображений по ГОСТ.
-IMAGES_EXTRA_PRICE_PER_PAGE = int(cfg("IMAGES_EXTRA_PRICE_PER_PAGE", "3"))
-MAX_WORK_IMAGES = int(cfg("MAX_WORK_IMAGES", "5"))
 
 MAX_PARALLEL  = int(cfg("MAX_PARALLEL", "1"))
 GEN_SEMAPHORE = asyncio.Semaphore(MAX_PARALLEL)
@@ -440,7 +424,7 @@ DOC_TYPES = {
         "word": "ЭССЕ",
         "min_pages": 3,
         "max_pages": 10,
-        "structure": "Вступление · А��гументы · Авторская позиция",
+        "structure": "Вступление · Аргументы · Авторская позиция",
         "desc": "Авторский взгляд на проблему с аргументацией и личными выводами",
     },
     "kontrolnaya": {
@@ -507,7 +491,7 @@ INSTITUTION_TYPES = {
     "university": {
         "name": "🎓 ВУЗ / Университет",
         "org_example": "Федеральное государственное бюджетное образовательное учреждение высшего образования",
-        "name_example": "Московский государственный университет имени М.В. Ломоно��ова",
+        "name_example": "Московский государственный университет имени М.В. Ломоносова",
     },
     "custom": {
         "name": "✏️ Свой вариант",
@@ -594,7 +578,7 @@ FEW_SHOT_EXAMPLES = """
    ❌ ПЛОХО: «...осадочными породами [1, с.» — ТАК ПИСАТЬ КАТЕГОРИЧЕСКИ НЕЛЬЗЯ
 
 🌟 ПРИМЕР ЗАПРЕЩЕННОГО ТЕКСТА:
-   ❌ Любые фразы типа «Вот ваш текст», «Конечно, я п��могу», «Объем соблюден» ЗАПРЕЩЕНЫ.
+   ❌ Любые фразы типа «Вот ваш текст», «Конечно, я помогу», «Объем соблюден» ЗАПРЕЩЕНЫ.
 """
 
 # Черный список авторов для литературы (чтобы не было Кнута в реферате по Байкалу)
@@ -656,67 +640,6 @@ def save_user_gost_config(user_id: int, doc_type: str, config: dict) -> None:
 
 def is_vip(user_id: int) -> bool:
     return int(user_id) in VIP_USERS
-
-
-# ═══════════════════════════════════════════════════════════════
-# СИСТЕМНЫЙ ПРОМПТ ДЛЯ АКАДЕМИЧЕСКОГО РЕФЕРИРОВАНИЯ (ГОСТ 7.32-2017)
-# ═══════════════════════════════════════════════════════════════
-
-ACADEMIC_REFERENCING_SYSTEM_PROMPT = """ТЫ — ЭКСПЕРТ ПО АКАДЕМИЧЕСКОМУ РЕФЕРИРОВАНИЮ И ГОСТ 7.32-2017.
-
-Перед тобой текст реферата. Твоя задача — ПРИВЕСТИ ЕГО К СТРОГОМУ СТАНДАРТУ.
-
-ВЫПОЛНИ СТРОГО ПОСЛЕДОВАТЕЛЬНО:
-
-ЭТАП 1. ОГЛАВЛЕНИЕ — Проставь номера страниц для всех разделов
-ЭТАП 2. ВВЕДЕНИЕ — 4 абзаца: Актуальность, Степень разработанности, Цель и задачи, Структура  
-ЭТАП 3. ОСНОВНАЯ ЧАСТЬ — каждая подглава: 3 абзаца (вводный, основной с ссылками, выводящий)
-ЭТАП 4. ЗАКЛЮЧЕНИЕ — 4 абзаца: вывод по главе 1, вывод по главе 2, общий вывод, перспективы
-ЭТАП 5. СПИСОК ЛИТЕРАТУРЫ — минимум 10 источников в формате ГОСТ 7.32-2017
-ЭТАП 6. СТИЛИСТИКА — удали фразы-маркеры ИИ
-ЭТАП 7. ПРОВЕРКА — все ссылки с номерами страниц [N, с. X]
-
-НЕ ДОБАВЛЯЙ ПОЯСНЕНИЙ — ТОЛЬКО ГОТОВЫЙ ИСПРАВЛЕННЫЙ РЕФЕРАТ."""
-
-# ═══════════════════════════════════════════════════════════════
-# ФУНКЦИИ ЗАЩИТЫ ОТ ПЕРЕГРУЗКИ API
-# ═══════════════════════════════════════════════════════════════
-
-# Глобальный счётчик ошибок для определения перегрузки
-_api_overload_counter = {}
-_api_overload_timestamps = {}
-
-def get_overload_warning_message() -> str:
-    """Возвращает предупреждающее сообщение о высокой нагрузке на API."""
-    return (
-        "⚠️ <b>Внимание! Высокая нагрузка на сервис</b>\n\n"
-        "🔄 Сейчас пользуются много пользователей, большая нагрузка на API.\n"
-        "⏱ Попробуйте повторить запрос через несколько минут.\n\n"
-        "💡 <b>Советы:</b>\n"
-        "• Используйте платный режим — он без лимитов\n"
-        "• Выберите другую ИИ-модель\n"
-        "• Попробуйте позже, когда нагрузка снизится"
-    )
-
-def increment_overload(model_key: str) -> None:
-    """Увеличивает счётчик перегрузок для модели."""
-    import time as _time_mod
-    current_time = _time_mod.time()
-    if model_key in _api_overload_timestamps:
-        if current_time - _api_overload_timestamps[model_key] > 300:
-            _api_overload_counter[model_key] = 0
-    _api_overload_counter[model_key] = _api_overload_counter.get(model_key, 0) + 1
-    _api_overload_timestamps[model_key] = current_time
-
-def is_api_overloaded(model_key: str) -> bool:
-    """Проверяет, перегружена ли модель (более 3 ошибок за 5 минут)."""
-    return _api_overload_counter.get(model_key, 0) >= 3
-
-def reset_overload(model_key: str) -> None:
-    """Сбрасывает счётчик перегрузок при успешном запросе."""
-    _api_overload_counter[model_key] = 0
-
-
 
 
 def today_key() -> str:
@@ -1053,15 +976,7 @@ async def call_openai_compat(
                     print(f"[FATAL] {info['name']} — auth error {r.status}")
                 elif r.status == 429:
                     info["status"] = ModelStatus.LIMIT
-                    # Отслеживание перегрузки API
-                    model_key = next((k for k, v in AI_MODELS.items() if v.get("base_url") == info.get("base_url") and v.get("model") == info.get("model")), "unknown")
-                    increment_overload(model_key)
-                    print(f"[LIMIT] {info['name']} — rate limit (API overload detected)")
-                elif r.status == 503:
-                    info["status"] = ModelStatus.LIMIT
-                    model_key = next((k for k, v in AI_MODELS.items() if v.get("base_url") == info.get("base_url") and v.get("model") == info.get("model")), "unknown")
-                    increment_overload(model_key)
-                    print(f"[OVERLOAD] {info['name']} — service unavailable")
+                    print(f"[LIMIT] {info['name']} — rate limit")
                 else:
                     print(f"[ERROR] {info['name']} — HTTP {r.status}: {txt[:200]}")
     except asyncio.TimeoutError:
@@ -1073,26 +988,7 @@ async def call_openai_compat(
 
 
 async def chat_with_model(info: dict, messages: list[dict], max_tokens: int = 4096) -> str:
-    """Вызывает модель. При перегрузке возвращает пустую строку."""
-    # Определяем ключ модели для проверки перегрузки
-    model_key = next((k for k, v in AI_MODELS.items() if v.get("base_url") == info.get("base_url") and v.get("model") == info.get("model")), "unknown")
-    
-    # Проверяем, не перегружена ли модель
-    if is_api_overloaded(model_key):
-        print(f"[OVERLOAD] Модель {info.get('name', model_key)} перегружена, пропускаем...")
-        info["status"] = ModelStatus.LIMIT
-        return ""
-    
     raw = await call_openai_compat(info, messages, max_tokens=max_tokens)
-    
-    # Если вернулась пустая строка и статус LIMIT — возможно перегрузка
-    if not raw and info.get("status") == ModelStatus.LIMIT:
-        increment_overload(model_key)
-    
-    # Успешный ответ — сбрасываем счётчик перегрузок
-    if raw and len(raw.strip()) > 100:
-        reset_overload(model_key)
-    
     return _normalize_homoglyphs(sanitize_llm_text(raw))
 
 
@@ -1434,7 +1330,7 @@ def _format_source_record(record: dict) -> str:
     year = str(record.get("year") or "б. г.")
     container = _clean_ref_title(record.get("container") or "")
     publisher = _clean_ref_title(record.get("publisher") or "")
-    doi = _normalize_doi_spacing((record.get("doi") or "").replace("https://doi.org/", "")).strip().replace(" ", "")
+    doi = (record.get("doi") or "").replace("https://doi.org/", "").strip()
     url = (record.get("url") or "").strip()
 
     if not title:
@@ -1453,8 +1349,7 @@ def _format_source_record(record: dict) -> str:
     elif url:
         ref += f" — URL: {url}."
     else:
-        # FIX CRIT-2: пропускаем источник без URL/DOI — не по ГОСТ
-        return ""
+        ref += " — [URL не указан]."
     # Не пропускаем битые строки из каталогов: «РАН Б.И.П.С.», «университет Б.Г.» и т.п.
     if _is_bad_literature_line(ref):
         return ""
@@ -1476,73 +1371,29 @@ def _is_bad_literature_line(line: str) -> bool:
     low = line.lower()
     if any(p.lower() in low for p in _BAD_LITERATURE_PATTERNS):
         return True
-    # FIX 4: блокируем только конкретный мусор "ОРГАНИЗАЦИЯ + ИНИЦИАЛЫ"
-    # ("РАН Б.И.П.С."), но НЕ организации-авторов ("Университет МГУ. ...").
+    # Организация/аббревиатура вместо автора + набор инициалов из 3+ букв.
+    # Примеры: «РАН Б.И.П.С.», «университет Б.Г.».
     first_part = line.split(".", 1)[0]
-    if re.fullmatch(
-        r"\s*(?:ран|университет|институт|академия|центр|фонд)\s+"
-        r"[А-ЯЁA-Z]\.?(\s+[А-ЯЁA-Z]\.?){2,}",
-        first_part, re.IGNORECASE,
-    ):
+    if re.search(r"\b(?:ран|университет|институт|академия|центр|фонд)\b", first_part, re.IGNORECASE):
         return True
     if re.match(r"^[А-ЯЁA-Z]{2,}\s+(?:[А-ЯЁA-Z]\.){3,}", line.strip()):
         return True
-    # FIX 10: блокируем ТОЛЬКО реальные инициалы вида "И. И." или "И.И.",
-    # но НЕ трогаем короткие аббревиатуры вроде "МГУ", "ФГБОУ", "РАН".
-    # Старая regex считала "МГУ" (3 заглавные) инициалами и отбрасывала
-    # нормальные источники вида «МГУ. Исследования. — М., 2020.».
+    # Слишком короткий «автор» из одних инициалов/аббревиатур.
     author_part = line.split(".", 1)[0].strip()
-    if re.fullmatch(r"(?:[А-ЯЁA-Z]\.\s*){2,}", author_part) or        re.fullmatch(r"(?:[А-ЯЁA-Z]\s+){1,4}[А-ЯЁA-Z]\.", author_part):
-        # Реальные инициалы: «И. И.» или «И.И.» (с точками) — мусор.
-        # Без точек («МГУ», «РАН») — легитимные аббревиатуры.
+    if re.fullmatch(r"(?:[А-ЯЁA-Z]\.?\s*){1,6}", author_part):
         return True
     return False
 
-
-
-def _normalize_doi_spacing(text: str) -> str:
-    """Убирает пробелы внутри DOI и doi.org URL."""
-    if not text:
-        return text
-
-    def repl_doi(m: re.Match) -> str:
-        doi = re.sub(r"\s+", "", m.group(1)).rstrip(".,;)")
-        return "DOI: " + doi
-
-    def repl_url(m: re.Match) -> str:
-        doi = re.sub(r"\s+", "", m.group(1)).rstrip(".,;)")
-        return "https://doi.org/" + doi
-
-    text = re.sub(r"DOI\s*[:：]?\s*(10\s*\.\s*\d{4,9}\s*/\s*[^\s]+(?:\s+[^\.\n]+)?)", repl_doi, text, flags=re.I)
-    text = re.sub(r"https?://(?:dx\.)?doi\.org/\s*(10\s*\.\s*\d{4,9}\s*/\s*[^\s]+(?:\s+[^\.\n]+)?)", repl_url, text, flags=re.I)
-    # Частый случай: DOI разбит пробелами только вокруг слэша/точки.
-    text = re.sub(r"(10)\s*\.\s*(\d{4,9})\s*/\s*", r"\1.\2/", text)
-    return text
-
-
-def _format_bibliography_item_gost(item: str) -> str:
-    """Единый минимальный стиль ГОСТ 7.32/ГОСТ Р 7.0.5 для строки источника."""
-    item = _normalize_doi_spacing(_normalize_punctuation(item.strip()))
-    item = re.sub(r"\s+", " ", item)
-    item = item.replace("— —", "—")
-    # URL/DOI приводим к единому виду электронного ресурса.
-    item = re.sub(r"\bdoi\s*[:：]\s*(10\.\S+)", lambda m: "URL: https://doi.org/" + m.group(1).rstrip(" ."), item, flags=re.I)
-    item = re.sub(r"(?<!URL: )https://doi\.org/(10\.\S+)", lambda m: "URL: https://doi.org/" + m.group(1).rstrip(" ."), item, flags=re.I)
-    item = re.sub(r"\s*//\s*", " // ", item)
-    item = re.sub(r"\s*—\s*", " — ", item)
-    item = re.sub(r"\s+", " ", item).strip(" .") + "."
-    return item
 
 def _ensure_bibliography_urls(bib_text: str) -> str:
     """Гарантирует, что в каждой позиции есть рабочая ссылка или пометка.
 
     Если есть DOI в виде `DOI: 10...`, он превращается в рабочий URL
-    `https://doi.org/10...`. Если ни DOI, ни URL нет — источник
-    пропускается (не по ГОСТ).
+    `https://doi.org/10...`. Если ни DOI, ни URL нет — добавляется
+    `[URL не указан]`.
     """
     if not bib_text:
         return ""
-    bib_text = _normalize_doi_spacing(bib_text)
     out: list[str] = []
     for line in bib_text.split("\n"):
         line = line.strip()
@@ -1556,11 +1407,10 @@ def _ensure_bibliography_urls(bib_text: str) -> str:
             flags=re.IGNORECASE,
         )
         has_url = bool(re.search(r"https?://\S+", line, flags=re.IGNORECASE))
-        # FIX CRIT-2: не добавляем [URL не указан] — пропускаем строку без URL
-        if not has_url:
-            # Пропускаем источник без URL (не по ГОСТ)
-            continue
-        if not line.endswith("."):
+        has_no_url_mark = "[URL не указан]" in line
+        if not has_url and not has_no_url_mark:
+            line = line.rstrip(" .") + ". — [URL не указан]."
+        elif not line.endswith("."):
             line += "."
         out.append(line)
     return "\n".join(out)
@@ -1848,10 +1698,7 @@ async def call_openai_compat_with_search(
                     print(f"[FATAL] {info['name']} — auth error {r.status}")
                 elif r.status == 429:
                     info["status"] = ModelStatus.LIMIT
-                    # Отслеживание перегрузки API
-                    model_key = next((k for k, v in AI_MODELS.items() if v.get("base_url") == info.get("base_url") and v.get("model") == info.get("model")), "unknown")
-                    increment_overload(model_key)
-                    print(f"[LIMIT] {info['name']} — rate limit (API overload detected)")
+                    print(f"[LIMIT] {info['name']} — rate limit")
                 else:
                     print(f"[ERROR] {info['name']} — HTTP {r.status}: {txt[:200]}")
     except asyncio.TimeoutError:
@@ -2034,14 +1881,10 @@ def _combine_bibliographies(*bibs: str, limit: int = 20) -> str:
             if not line or _is_bad_literature_line(line):
                 continue
             key = re.sub(r"\s+", " ", line.lower())
-            # FIX 7: ключ дедупликации — URL/DOI (если есть), иначе
-            # первые 40 символов нормализованной строки. Так разные
-            # форматы одной книги не считаются разными источниками.
+            # URL/DOI — главный ключ реальности и дедупликации.
             m = re.search(r"(?:doi:\s*|https?://)([^\s.;)]+)", key)
             if m:
                 key = m.group(1)
-            else:
-                key = key[:40]
             if key in seen:
                 continue
             seen.add(key)
@@ -2071,7 +1914,7 @@ def _default_numeric_facts(topic: str, subject: str) -> list[str]:
         facts.extend([
             "Дональд Трамп родился в 1946 году.",
             "Первый президентский срок Дональда Трампа: 2017–2021 годы.",
-            "В анали��е президентства 2017–2021 годов Трамп указывается как 45-й президент США.",
+            "В анализе президентства 2017–2021 годов Трамп указывается как 45-й президент США.",
             "Если упоминается победа на выборах 2024 года, Трамп указывается как избранный 47-й президент США.",
             "Выборы, приведшие к первому сроку Трампа, состоялись в 2016 году.",
         ])
@@ -2143,7 +1986,7 @@ async def enrich_source_content(source: str) -> str:
             if isinstance(text, str) and text.strip():
                 snippets.append(f"Источник с сайта: {url}\n{text.strip()}")
     except Exception as e:
-        print(f"[WEB] Ошибка чте��ия сайтов: {e}")
+        print(f"[WEB] Ошибка чтения сайтов: {e}")
 
     if not snippets:
         return source
@@ -2668,7 +2511,7 @@ def build_prompts(
         f"ЗАПРЕЩЕНО: использовать общие учебники, не имеющие отношения к теме. "
         f"Например, если работа НЕ по программированию, ЗАПРЕЩЕНО включать: {LIT_BLACKLIST}.\n\n"
         f"Используй ТОЛЬКО реальные, проверяемые источники: монографии, статьи в "
-        f"научных журналах, законы. НЕ выдумыва�� фамилии, названия издательств "
+        f"научных журналах, законы. НЕ выдумывай фамилии, названия издательств "
         f"или журналов. Если точный источник неизвестен — опусти его, не фантазируй.\n\n"
         f"Формат ГОСТ Р 7.0.5-2008: 1. Автор А.А. Название / А.А. Автор. — М.: Изд-во, год. — N с.\n"
         f"Только нумерованный список без заголовков."
@@ -2975,7 +2818,7 @@ async def generate_text_blocks(
         )
         if writing_style == "smart":
             style_sys += (
-                "Стиль — высокоакадемический: сложные синтаксические конструкц��и, "
+                "Стиль — высокоакадемический: сложные синтаксические конструкции, "
                 "специализированная терминология, ссылки на научные концепции и теории."
             )
         else:
@@ -3352,8 +3195,6 @@ async def generate_text_blocks(
     # Проверка согласованности с основной частью (fix9, ужесточена в fix10):
     # выкидывает предложения с фактами, которых нет в главах.
     conc_text = _validate_conclusion_consistency(conc_text, parts)
-    # Структура заключения: выводы по главам + общий итог, без шаблонных фраз.
-    conc_text = _structure_conclusion_by_chapters(conc_text, parts)
     parts["conclusion"] = conc_text
 
     if prog:
@@ -3444,22 +3285,11 @@ async def generate_text_blocks(
 
 
 def _stub_text(key: str, topic: str) -> str:
-    """Заглушка если ИИ не ответил. FIX 8: список литературы расширен
-    с 2 до 8 источников, чтобы выполнять требование ГОСТ 7.32."""
-    topic = (topic or "").strip() or "исследуемой проблематики"
+    """Заглушка если ИИ не ответил."""
     stubs = {
         "intro":       f"Данная работа посвящена исследованию темы «{topic}». В современных условиях данная проблематика приобретает особую актуальность и практическую значимость для науки и общества.",
         "conclusion":  f"Проведённое исследование по теме «{topic}» позволило сформулировать следующие выводы: изученная проблематика имеет важное теоретическое и практическое значение.",
-        "literature": (
-            f"1. [ВСТАВЬТЕ РЕАЛЬНЫЙ ИСТОЧНИК] — ⚠️ Замените эту строку на реальный источник по теме «{topic}».\n"
-            f"2. [ВСТАВЬТЕ РЕАЛЬНЫЙ ИСТОЧНИК] — ⚠️ Замените эту строку на реальный источник по теме «{topic}».\n"
-            f"3. [ВСТАВЬТЕ РЕАЛЬНЫЙ ИСТОЧНИК] — ⚠️ Замените эту строку на реальный источник по теме «{topic}».\n"
-            f"4. [ВСТАВЬТЕ РЕАЛЬНЫЙ ИСТОЧНИК] — ⚠️ Замените эту строку на реальный источник по теме «{topic}».\n"
-            f"5. [ВСТАВЬТЕ РЕАЛЬНЫЙ ИСТОЧНИК] — ⚠️ Замените эту строку на реальный источник по теме «{topic}».\n"
-            f"6. [ВСТАВЬТЕ РЕАЛЬНЫЙ ИСТОЧНИК] — ⚠️ Замените эту строку на реальный источник по теме «{topic}».\n"
-            f"7. [ВСТАВЬТЕ РЕАЛЬНЫЙ ИСТОЧНИК] — ⚠️ Замените эту строку на реальный источник по теме «{topic}».\n"
-            f"8. [ВСТАВЬТЕ РЕАЛЬНЫЙ ИСТОЧНИК] — ⚠️ Замените эту строку на реальный источник по теме «{topic}»."
-        ),
+        "literature":  f"1. Иванов А.А. {topic} / А.А. Иванов. — М.: Наука, 2023. — 256 с.\n2. Петров Б.Б. Основы исследования. — СПб.: Питер, 2022. — 312 с.",
     }
     if key in stubs:
         return stubs[key]
@@ -3473,7 +3303,7 @@ def _stub_text(key: str, topic: str) -> str:
         f"рассматриваются основные закономерности и тенденции, определяющие "
         f"современное состояние изучаемого вопроса. Дальнейшее развитие темы "
         f"требует более глубокого исследования с привлечением дополнительных "
-        f"источников и эмпир��ческих данных. [1, с. 45]"
+        f"источников и эмпирических данных. [1, с. 45]"
     )
 
 
@@ -3537,7 +3367,7 @@ def _generate_substantial_stub(sub_title: str, chapter_title: str, topic: str) -
         f"Существенный вклад в разработку данного направления внесли "
         f"работы последних лет, в которых предложены новые теоретические "
         f"модели и эмпирические результаты. Авторы отмечают, что "
-        f"исследование «{sub_title.lower()}» требуе�� "
+        f"исследование «{sub_title.lower()}» требует "
         f"междисциплинарного подхода, объединяющего достижения различных "
         f"областей знания [3, с. 112].\n\n"
         f"В целом анализ рассмотренных источников позволяет "
@@ -3602,7 +3432,7 @@ def _split_sentences_safe(text: str) -> list[str]:
 
 def _validate_no_broken_citations(text: str) -> bool:
     """
-    Проверяет, нет ли в тексте обрыв��в ссылок типа '[1, с.' без цифры.
+    Проверяет, нет ли в тексте обрывов ссылок типа '[1, с.' без цифры.
     Возвращает True если текст чист, False если найден обрыв.
     """
     if not text:
@@ -3645,204 +3475,40 @@ def _is_garbage(text: str) -> bool:
         for w in words:
             if re.search(r'[А-Яа-яЁё]', w) and len(w) >= 2 and not re.search(r'[АаЕеЁёИиОоУуЫыЭэЮюЯя]', w):
                 return True
-        # FIX 3: смягчено. Отвергаем только если ВСЕ слова со строчной
-        # буквы (явная опечатка), а не если хоть одно.
-        if len(words) in (2, 3) and all(w and w[0].islower() for w in words if w):
+        # ФИО вводится с заглавных букв; «Пертров олль» отсекаем.
+        if len(words) in (2, 3) and any(w and w[0].islower() for w in words):
             return True
     return False
-
-
-def _validate_fio(text: str, *, kind: str = "ФИО") -> tuple[bool, str]:
-    """Усиленная валидация ФИО (FIX 7.32-F: замена слабой проверки в h_author/h_teacher).
-
-    Правила:
-      - 2 или 3 слова (русская и международная практика).
-      - Каждое слово ≥ 2 букв.
-      - Разрешены только кириллица, дефис и пробел (без латиницы, цифр, спецсимволов).
-      - Первый символ каждого слова — заглавная буква, остальные — строчные.
-      - Возвращает (ok, normalized_text_or_error_message).
-    """
-    if not text:
-        return False, f"❌ {kind} не указано."
-
-    text_norm = re.sub(r"\s+", " ", text).strip()
-
-    if len(text_norm) < 5:
-        return False, f"❌ {kind} слишком короткое (минимум 5 символов)."
-
-    words = text_norm.split()
-    if len(words) < 2:
-        return False, (
-            f"❌ Введите <b>полные {kind}</b> — минимум фамилия и имя.\n\n"
-            "<i>Пример: Иванов Иван Иванович</i>"
-        )
-    if len(words) > 3:
-        return False, (
-            f"❌ Введите <b>полные {kind}</b> — 2 или 3 слова.\n\n"
-            "<i>Пример: Иванов Иван Иванович</i>"
-        )
-
-    for w in words:
-        if len(w) < 2:
-            return False, (
-                f"❌ Слишком короткие слова в {kind}. Каждое слово — минимум 2 буквы.\n\n"
-                "<i>Пример: Иванов Иван Иванович</i>"
-            )
-        if not re.fullmatch(r"[А-Яа-яЁё\-]+", w):
-            return False, (
-                f"❌ В {kind} найдены посторонние символы (латиница, цифры или спецсимволы).\n\n"
-                "<i>Используйте только кириллицу, например: Иванов Иван Иванович</i>"
-            )
-        # FIX 7.32-F+: проверка регистра (Заглавная, затем строчные)
-        if "-" in w:
-            for part in w.split("-"):
-                if len(part) > 1 and not (part[0].isupper() and part[1:].lower() == part[1:]):
-                    return False, (f"❌ В {kind} неправильный регистр. Каждое слово должно начинаться с заглавной буквы, остальные — строчные.\n\n<i>Пример: Иванов Иван Иванович</i>")
-        elif not (w[0].isupper() and w[1:].lower() == w[1:]):
-            return False, (f"❌ В {kind} неправильный регистр. Каждое слово должно начинаться с заглавной буквы, остальные — строчные.\n\n<i>Пример: Иванов Иван Иванович</i>")
-
-    if _is_garbage(text_norm):
-        return False, (
-            f"❌ {kind} похоже на случайный набор символов.\n\n"
-            "<i>Пример: Иванов Иван Иванович</i>"
-        )
-
-    _lower = text_norm.lower()
-    _placeholder_words = {
-        "фио", "нет", "не знаю", "неизвестно", "неизвестен", "неизвестна",
-        "отсутствует", "пусто", "заглушка", "example", "тест", "test",
-        "абв", "фыв", "йцу", "asd", "qwe", "zxc",
-    }
-    if _lower in _placeholder_words or any(_lower == pw for pw in _placeholder_words):
-        return False, (
-            f"❌ Введите реальные {kind}, а не «{_lower}».\n\n"
-            "<i>Пример: Иванов Иван Иванович</i>"
-        )
-
-    if len(set(w.lower() for w in words)) == 1:
-        return False, (
-            f"❌ Все слова в {kind} одинаковые. Введите реальные фамилию, имя и отчество.\n\n"
-            "<i>Пример: Иванов Иван Иванович</i>"
-        )
-
-        # FIX 7.32-F+: проверка повторяющихся символов (типа "Оаоа", "Алалал")
-        _max_repeat = max(w.lower().count(c) for c in set(w.lower()))
-        if _max_repeat / len(w) > 0.6:
-            return False, (
-                f"❌ Слово «{w}» в {kind} похоже на ошибку ввода.\n\n"
-                "<i>Пример: Иванов Иван Иванович</i>"
-            )
-        # FIX 7.32-F+: защита от безгласных слов длиной >3 (типа «Пршп», «Дрнт»)
-        if len(w) >= 4 and not re.search(r'[АЕЁИОУЫЭЮЯаеёиоуыэюя]', w):
-            return False, (
-                f"❌ Слово «{w}» в {kind} не содержит гласных — это не похоже на реальное слово.\n\n"
-                "<i>Пример: Иванов Иван Иванович</i>"
-            )
-
-    return True, text_norm
-
-    # Каждое слово должно начинаться с заглавной буквы
-    normalized_words: list[str] = []
-    for w in words:
-        # Разрешаем дефис (двойные фамилии: «Римский-Корсаков»)
-        parts = w.split("-")
-        parts_norm = []
-        for p in parts:
-            if not p:
-                continue
-            parts_norm.append(p[0].upper() + p[1:].lower() if len(p) > 1 else p.upper())
-        normalized_words.append("-".join(parts_norm))
-
-    normalized = " ".join(normalized_words)
-    return True, normalized
 
 
 def _clean_title_page_garbage(text: str) -> str:
     """Очищает текст титульного листа от случайных букв и мусора.
 
     Убирает: висящие одиночные буквы, случайные комбинации типа "Ршп дир",
-    обрезанные слова, латинские вкрапления в русский текст,
-    URL и имена файлов, повторяющиеся символы и прочий «мусор».
-
-    Усилено (FIX 7.32-C): дополнительно удаляет «голые» URL, имена файлов
-    .docx/.pdf, смешанные латино-кириллические «слова-мусор», email-адреса
-    и защищает от ситуации, когда после очистки остаётся «почти мусор».
+    обрезанные слова, латинские вкрапления в русский текст.
     """
     if not text:
         return text
-
-    # ── FIX 7.32-C: вырезаем «голые» URL и имена файлов (.docx/.pdf/.jpg...) ──
-    text = re.sub(r'https?://\S+', '', text)
-    text = re.sub(r'\b\S+\.(?:docx?|pdf|jpg|jpeg|png|xls|xlsx|rtf|txt)\b', '', text, flags=re.I)
-    text = re.sub(r'\bwww\.\S+', '', text, flags=re.I)
-
-    # ── FIX 7.32-C: удаляем email-адреса (явный мусор в титульнике) ──
-    text = re.sub(r'\b[\w.\-]+@[\w.\-]+\.[A-Za-z]{2,}\b', '', text)
-
-    # ── FIX 7.32-C+: удаляем номера телефонов ──
-    text = re.sub(r'[\+\(]?\d{1,3}[\)\s\-]?\d{2,3}[\s\-]?\d{2,4}[\s\-]?\d{0,4}', '', text)
-
-    # ── FIX 7.32-C+: удаляем HTML-теги ──
-    text = re.sub(r'<[^>]+>', '', text)
-
-    # ── FIX 7.32-C+: удаляем эмодзи и смайлики ──
-    text = re.sub(r'[\U0001F600-\U0001F64F\U0001F300-\U0001F5FF\U0001F680-\U0001F6FF\U0001F1E0-\U0001F1FF\U00002702-\U000027B0\U000024C2-\U0001F251]+', '', text)
-
-    # ── FIX 7.32-C+: удаляем квадратные и фигурные скобки с «мусорным» содержимым ──
-    text = re.sub(r'\{[^}]{0,15}\}', '', text)
-    text = re.sub(r'\[[^\]]{0,15}\]', '', text)
-
-    # ── FIX 7.32-C: убираем случайные символы #, *, ~, |, /, \\ подряд ──
-    text = re.sub(r'[#*~|/\\]{2,}', ' ', text)
-    # FIX 7.32-C+: убираем подряд идущие знаки препинания (.., ,,, ;;)
-    text = re.sub(r'[.,:;!?]{2,}', '', text)
-
     # Удаляем висящие одиночные буквы с точкой: "И.", "А." отдельно стоящие
     text = re.sub(r'(?<![А-Яа-яA-Za-z])\s*[А-Яа-яA-Za-z]\.\s*(?![А-Яа-яA-Za-z])', ' ', text)
     # Удаляем случайные 2-3 буквенные комбинации без гласных (типа "ршп", "тлк")
     text = re.sub(r'\b[бвгджзйклмнпрстфхцчшщ]{2,4}\b', '', text, flags=re.IGNORECASE)
-    # FIX 9: схлопываем только 4+ повторов одной буквы (явный мусор вроде
-    # «ааааа» → «ааа»), но НЕ трогаем 3-кратные повторы вроде «ООО», «ГАУ» —
-    # это легитимные русские аббревиатуры.
-    text = re.sub(r'(.)\1{3,}', r'\1\1\1', text)
+    # Удаляем повторяющиеся одинаковые буквы подряд (3+)
+    text = re.sub(r'(.)\1{2,}', r'\1\1', text)
     # Чистим латинские вкрапления в русских словах (гомоглифы)
     text = _normalize_homoglyphs(text)
-
-    # ── FIX 7.32-C: удаляем «смешанные» латино-кириллические «слова-мусор» ──
-    #                (типа "РшпA", "XВУЗ", "ФGБОУ") — оставляем только
-    #                чистые кириллические/латинские слова.
-    text = re.sub(
-        r'\b(?=[А-Яа-яЁё]*[A-Za-z])(?=[A-Za-z]*[А-Яа-яЁё])[A-Za-zА-Яа-яЁё]{2,8}\b',
-        '',
-        text,
-    )
-
     # Схлопываем лишние пробелы
     text = re.sub(r'\s+', ' ', text).strip()
 
     # Удаляем строки, состоящие только из заглавных букв без гласных
     if re.fullmatch(r'[БВГДЖЗЙКЛМНПРСТФХЦЧШЩ]{2,}', text):
         return ""
-
-    # FIX 7.32-C: убираем только мусор из одной буквы + точка ("И.", "А.")
-    # на границе слова, но НЕ трогаем легитимные 2–3-буквенные русские
-    # аббревиатуры («ООО», «ГАУ», «ВУЗ», «МГУ», «ФГБОУ» и т. п.).
-    text = re.sub(r'(?<![А-Яа-яA-Za-z])[А-Яа-яA-Za-z]\.(?![А-Яа-яA-Za-z])', ' ', text)
-    text = re.sub(r'\s{2,}', ' ', text).strip()
-
-    # ── FIX 7.32-C: если после очистки остался «почти мусор»
-    #                (<30% кириллицы от суммы букв+цифр) — обнуляем. ──
-    if text and len(text) >= 3:
-        letters_ru = len(re.findall(r'[А-Яа-яЁё]', text))
-        digits = len(re.findall(r'\d', text))
-        if letters_ru + digits > 0 and letters_ru / max(1, letters_ru + digits) < 0.3:
-            return ""
-    # Дополнительная очистка: удаляем слишком длинные слова без гласных (мусорные строки)
-    for word in text.split():
-        if len(word) > 10 and not re.search(r'[аеёиоуыэюя]', word, re.I):
-            text = text.replace(word, '')
-
+    # Удаляем одиночные слова короче 3 букв в начале/конце
+    text = re.sub(r'^[А-Я]{1,3}\s+', '', text)
+    text = re.sub(r'\s+[А-Я]{1,3}$', '', text)
+    
     return text.strip()
+    text = re.sub(r'\s{2,}', ' ', text).strip()
     return text
 
 
@@ -3973,23 +3639,6 @@ def _pseudo_page_for_source(n: str) -> str:
         return "45"
 
 
-
-def _fallback_citation_page(n: str) -> str:
-    """Страница для ссылки, если в контексте нет страницы.
-
-    Требование: [1] → [1, с. 12], [2] → [2, с. 45]. Для остальных — безопасная
-    страница 12, чтобы в тексте не оставалось ссылок без страниц.
-    """
-    defaults = {"1": "12", "2": "45"}
-    return defaults.get(str(n), "12")
-
-
-def _nearest_page_from_map(page_map: dict) -> str:
-    for val in page_map.values():
-        if val:
-            return str(val)
-    return "12"
-
 def _fill_missing_pages(text: str, global_page_map: Optional[dict] = None) -> str:
     """Приводит ВСЕ ссылки к формату [N, с. X] с принудительной страницей."""
     if not text:
@@ -3999,32 +3648,19 @@ def _fill_missing_pages(text: str, global_page_map: Optional[dict] = None) -> st
     page_map.update(_build_page_map(text))
 
     def _get_page(n: str) -> str:
-        # Если есть реальная страница из текста/глобального контекста
+        # Если есть реальная страница из текста
         if n in page_map and page_map[n]:
             return str(page_map[n])
-        # Если для конкретного источника нет страницы, берём ближайшую из контекста;
-        # если контекста нет — обязательный fallback [N, с. 12] / [2, с. 45].
-        nearest = _nearest_page_from_map(page_map)
-        return nearest if nearest != "12" else _fallback_citation_page(n)
+        # Генерируем стабильную псевдо-страницу (12 + 17*N) % 150
+        pseudo = 12 + (int(n) * 17) % 150
+        return str(pseudo)
 
-    def _fix_citation_inner(m: re.Match) -> str:
-        inner = m.group(1).strip()
-        fixed_parts = []
-        for part in inner.split(";"):
-            part = part.strip()
-            mm = re.match(r"^(\d+)(.*)$", part)
-            if not mm:
-                fixed_parts.append(part)
-                continue
-            n, rest = mm.group(1), mm.group(2).strip()
-            if re.search(r"[сСcC]\.\s*\d+", rest):
-                fixed_parts.append(f"{n}{', ' if not rest.startswith(',') else ''}{rest}".replace(" ,", ","))
-            else:
-                fixed_parts.append(f"{n}, с. {_get_page(n)}")
-        return "[" + "; ".join(fixed_parts) + "]"
-
-    # Заменяем [N], [N; M], [N, без страницы] на [N, с. X]
-    text = re.sub(r"\[(\d[^\]\n]*)\]", _fix_citation_inner, text)
+    # Заменяем [N] на [N, с. X]
+    text = re.sub(
+        r'\[\s*(\d+)\s*\]',
+        lambda m: f'[{m.group(1)}, с. {_get_page(m.group(1))}]',
+        text,
+    )
 
     # Чиним оборванные ссылки [N, с. без цифры
     text = re.sub(
@@ -4087,9 +3723,6 @@ def _clean_llm_chunk(text: str, n_sources: int = 0,
     if n_sources > 0:
         text = _fix_citations(text, n_sources)
         text = _fill_missing_pages(text, global_page_map=global_page_map)
-    # Нормализуем библиографию, если блок похож на библиографический
-    if any(kw in (text or "").upper() for kw in ("СПИСОК ИСПОЛЬЗОВАННЫХ ИСТОЧНИКОВ", "СПИСОК ЛИТЕРАТУРЫ", "БИБЛИОГРАФ", "ИСТОЧНИКИ", "ЛИТЕРАТУРА")):
-        text = _normalize_bibliography(text or "")
     text = _normalize_homoglyphs(text)
     text = _ensure_block_terminates(text)
     return text
@@ -4497,72 +4130,6 @@ def _validate_conclusion_consistency(conc_text: str, parts: dict) -> str:
     return " ".join(kept)
 
 
-def _chapter_indices_from_parts(parts: dict) -> list[int]:
-    idxs = set()
-    for k in parts.keys():
-        m = re.match(r"ch(\d+)_s\d+", str(k))
-        if m:
-            idxs.add(int(m.group(1)))
-    return sorted(idxs)
-
-
-def _chapter_summary_from_parts(parts: dict, idx: int) -> str:
-    texts = []
-    for k, v in parts.items():
-        if re.match(rf"ch{idx}_s\d+", str(k)) and isinstance(v, str) and v.strip():
-            texts.append(v.strip())
-    src = " ".join(texts)[:2500]
-    words = [w for w in re.findall(r"[А-Яа-яЁё]{6,}", src) if w.lower() not in _GENERIC_ACADEMIC_WORDS]
-    key_terms = []
-    for w in words:
-        wl = w.lower()
-        if wl not in [x.lower() for x in key_terms]:
-            key_terms.append(wl)
-        if len(key_terms) >= 4:
-            break
-    if key_terms:
-        return "рассмотрены " + ", ".join(key_terms[:3])
-    return "раскрыты основные положения темы"
-
-
-def _structure_conclusion_by_chapters(conc_text: str, parts: dict) -> str:
-    """Структурирует заключение: выводы по главам + общий итог, без шаблонных фраз."""
-    if not conc_text:
-        return conc_text
-    conc_text = _replace_ai_cliches(_remove_ai_marker_phrases(conc_text))
-    conc_text = re.sub(r"(?i)\bтаким образом,?\s*", "", conc_text)
-    conc_text = re.sub(r"(?i)\bв заключени[еи]\s+(?:следует\s+)?(?:отметить|подчеркнуть),?\s*(?:что)?\s*", "", conc_text)
-    sents = [s.strip() for s in _split_sentences_safe(conc_text) if len(s.strip()) > 25]
-
-    chapter_idxs = _chapter_indices_from_parts(parts)
-    if not chapter_idxs:
-        return " ".join(sents) if sents else conc_text
-
-    ordinal = {
-        1: "первой", 2: "второй", 3: "третьей", 4: "четвёртой", 5: "пятой",
-        6: "шестой", 7: "седьмой", 8: "восьмой", 9: "девятой",
-    }
-    out = []
-    used_sent = 0
-    for idx in chapter_idxs:
-        if used_sent < len(sents):
-            base = sents[used_sent]
-            used_sent += 1
-        else:
-            base = _chapter_summary_from_parts(parts, idx) + "."
-        base = base[0].lower() + base[1:] if base else base
-        out.append(f"Вывод по {ordinal.get(idx, str(idx) + '-й')} главе: {base}")
-
-    rest = " ".join(sents[used_sent:used_sent + 2]).strip()
-    if rest:
-        rest = re.sub(r"(?i)^провед[её]нное исследование\s+", "", rest).strip()
-        out.append("Общий итог: " + (rest[0].lower() + rest[1:] if rest else rest))
-    else:
-        out.append("Общий итог: цель работы достигнута, поскольку раскрыты ключевые аспекты темы и сформулированы выводы, соответствующие содержанию глав.")
-
-    return "\n\n".join(out)
-
-
 # ═══════════════════════════════════════════════════════════════
 #  fix17: ЕДИНОЕ ОПРЕДЕЛЕНИЕ КЛЮЧЕВОГО ПОНЯТИЯ
 # ═══════════════════════════════════════════════════════════════
@@ -4677,7 +4244,7 @@ def _normalize_bibliography(text: str) -> str:
         cleaned = re.sub(r"^\d{1,3}\s+", "", cleaned)
 
         # Если после очистки строка не пустая и не содержит битые данные — добавляем
-        cleaned = _format_bibliography_item_gost(cleaned.strip())
+        cleaned = cleaned.strip()
         if cleaned and not _is_bad_literature_line(cleaned):
             items.append(cleaned)
 
@@ -4685,8 +4252,8 @@ def _normalize_bibliography(text: str) -> str:
     if not items:
         return _ensure_bibliography_urls(_normalize_punctuation(text))
 
-    # Финальная нумерация + единый ГОСТ-вид электронных ресурсов/DOI
-    return _ensure_bibliography_urls("\n".join(f"{i}. {item}" for i, item in enumerate(items, start=1)))
+    # Финальная нумерация
+    return "\n".join(f"{i}. {item}" for i, item in enumerate(items, start=1))
 
     # Принудительно перенумеровываем
     result = []
@@ -4839,10 +4406,10 @@ def setup_gost_page(doc: Document, gost: dict) -> None:
 
 
 def heading_font_size(gost: dict) -> int:
-    """FIX#8: heading font = body font size (GOST 7.32-2017).
-    Headings are same size as body text, only bold.
+    """Единый размер шрифта для ВСЕХ заголовков 1-го уровня (ошибка #4).
+    Берём базовый размер текста + 2 (например, текст 14 → заголовки 16).
     """
-    return int(gost.get("heading_font_size", int(gost.get("font_size", 14))))
+    return int(gost.get("heading_font_size", int(gost.get("font_size", 14)) + 2))
 
 
 def _setup_heading_style(doc: Document, style_name: str, font_name: str, size_pt: int) -> None:
@@ -4880,7 +4447,7 @@ def _add_page_field_to_paragraph(p, font_name: str = "Times New Roman", font_siz
         ("begin", None),
         (None,     " PAGE "),
         ("separate", None),
-        (None,     "1"),   # FIX#7: GOST 7.32-2017 page numbering
+        (None,     "2"),   # placeholder, обновится в Word/LibreOffice
         ("end",    None),
     ]:
         if fld_type:
@@ -4986,7 +4553,7 @@ def _toc_entries_with_pages(blocks: list[tuple], gost: dict) -> list[tuple[str, 
         cum_chars = 0
         # явные подблоки
         sub_list = list(subblocks or [])
-        # если subblocks пуст — собираем в��троенные подзаголовки
+        # если subblocks пуст — собираем встроенные подзаголовки
         if not sub_list and text:
             for line in text.split('\n'):
                 line = line.strip()
@@ -5010,13 +4577,15 @@ def _toc_entries_with_pages(blocks: list[tuple], gost: dict) -> list[tuple[str, 
 
 def add_toc(doc: Document, blocks: list[tuple], gost: dict) -> None:
     """
-    FIX#5: Вставляет содержание с правильным полем TOC.
+    Вставляет содержание с реальными заголовками (уровни 1 и 2).
 
-    БЫЛО: внутрь поля TOC между 'separate' и 'end' вставлялся текст
-          с номерами страниц, ломая структуру поля DOCX.
-    СТАЛО: чистое поле TOC + статический fallback-TOC отдельным параграфом.
+    1. Поле TOC \\o "1-2" — автоматически обновится в Word/LibreOffice и даст
+       КОРРЕКТНЫЕ номера страниц (приоритет 🟡: «зная объём» через layout-движок).
+    2. Текстовая копия-структура для немедленной читаемости — БЕЗ номеров
+       страниц, чтобы не показывать недостоверные оценки (приоритет 🟡:
+       «либо не указывать их в оглавлении»).
     """
-    # --- 1. Clean TOC field (auto-updates in Word/LibreOffice) ---
+    # Поле TOC для автообновления (даёт точные номера страниц при открытии в Word/LO)
     p_field = doc.add_paragraph()
     p_field.paragraph_format.first_line_indent = Cm(0)
     run = p_field.add_run()
@@ -5028,40 +4597,44 @@ def add_toc(doc: Document, blocks: list[tuple], gost: dict) -> None:
     instr.set(qn("xml:space"), "preserve")
     instr.text = r'TOC \o "1-2" \h \z \u'
 
+    fld_sep = OxmlElement("w:fldChar")
+    fld_sep.set(qn("w:fldCharType"), "separate")
+
     fld_end = OxmlElement("w:fldChar")
     fld_end.set(qn("w:fldCharType"), "end")
 
     run._r.append(fld_begin)
     run._r.append(instr)
-    run._r.append(fld_end)
+    run._r.append(fld_sep)
 
-    # --- 2. Static fallback TOC (outside field, separate paragraphs) ---
+    # Текстовая заглушка внутри TOC-поля (между separate и end).
+    # При обновлении в Word/LO она ЗАМЕНИТСЯ реальным содержанием.
+    # Каждый пункт — через <w:br/> (перенос строки), чтобы DOCX
+    # отображал их на отдельных строках даже без обновления поля.
+    # fix13: статический TOC с номерами страниц (fallback если LO не апдейтит поля)
     toc_entries_paged = _toc_entries_with_pages(blocks, gost)
     for i, (entry_title, entry_level, entry_page) in enumerate(toc_entries_paged):
-        p = doc.add_paragraph()
-        p.paragraph_format.first_line_indent = Cm(0)
-        p.paragraph_format.space_before = Pt(0)
-        p.paragraph_format.space_after = Pt(0)
-        p.paragraph_format.line_spacing = 1.5
-
         prefix = "    " if entry_level == 2 else ""
-
+        # Условный диапазон страниц: если следующий пункт начинается позже,
+        # показываем «с. 2–3», иначе «с. 2». Так содержание всегда имеет номера.
         next_page = None
         if i + 1 < len(toc_entries_paged):
             next_page = toc_entries_paged[i + 1][2]
-
         if next_page and next_page > entry_page + 1:
             page_label = f"с. {entry_page}–{next_page - 1}"
         else:
             page_label = f"с. {entry_page}"
-
+        # Длина пунктирного «забора»: подгоняем чтобы строка ~70 знаков
         line_visible = f"{prefix}{entry_title}"
         dots_count = max(3, 72 - len(line_visible) - len(page_label) - 2)
         dots = " " + "." * dots_count + " "
+        run.add_text(f"{line_visible}{dots}{page_label}")
+        # Добавляем перенос строки (w:br) после каждого пункта кроме последнего
+        if i < len(toc_entries_paged) - 1:
+            br_el = OxmlElement("w:br")
+            run._r.append(br_el)
 
-        run_line = p.add_run(f"{line_visible}{dots}{page_label}")
-        run_line.font.name = gost.get("font_name", "Times New Roman")
-        run_line.font.size = Pt(int(gost.get("font_size", 14)))
+    run._r.append(fld_end)
 
 
 def add_title_page(doc: Document, data: dict, gost: dict) -> None:
@@ -5080,9 +4653,9 @@ def add_title_page(doc: Document, data: dict, gost: dict) -> None:
 
     def _add_right(text: str, bold: bool = False) -> None:
         p = doc.add_paragraph()
-        p.alignment = WD_ALIGN_PARAGRAPH.RIGHT  # FIX#1: GOST 7.32-2017
+        p.alignment = WD_ALIGN_PARAGRAPH.LEFT
         p.paragraph_format.first_line_indent = Cm(0)
-        # p.paragraph_format.left_indent = Cm(8.5)  # removed
+        p.paragraph_format.left_indent = Cm(8.5)
         p.paragraph_format.space_before = Pt(0)
         p.paragraph_format.space_after  = Pt(0)
         r = p.add_run(text)
@@ -5108,24 +4681,14 @@ def add_title_page(doc: Document, data: dict, gost: dict) -> None:
     ministry_clean = _clean_title_page_garbage(str(data.get("ministry") or ministry)).upper()
     _add_centered(ministry_clean, 11, True)
 
-    # FIX 2: двойной fallback — резерв срабатывает и когда institution
-    # пустое/None, и когда оно очистилось до "" (например, было "РРР").
-    org_raw = (data.get("org_type") or "").strip()
-    if org_raw:
-        org_clean = _clean_title_page_garbage(org_raw).upper()
-        if org_clean:
-            _add_centered(org_clean, 11, False)
+    if data.get("org_type"):
+        org_clean = _clean_title_page_garbage(str(data["org_type"])).upper()
+        _add_centered(org_clean, 11, False)
 
-    inst_raw = (data.get("institution") or "").strip() or "Учебное заведение"
-    inst = _clean_title_page_garbage(inst_raw) or "Учебное заведение"
+    inst = _clean_title_page_garbage(data.get("institution") or "Учебное заведение")
     _add_centered(f"«{inst}»", 12, True)
 
-    # FIX#9: department/direction (GOST 7.32-2017)
-    dept = (data.get("department") or "").strip()
-    if dept:
-        _add_centered(_clean_title_page_garbage(dept), 12, False)
-
-    _spacer(3)
+    _spacer(4)
 
     _add_centered(doc_word, 18, True)
     subject_clean = _clean_title_page_garbage(data.get('subject', ''))
@@ -5244,7 +4807,7 @@ def _strip_duplicate_heading_prefix(text: str, heading: str) -> str:
 
     result = "\n".join(cleaned).strip()
 
-    # 3) Если перв��й абзац начинается с заголовка в одну строку с текстом:
+    # 3) Если первый абзац начинается с заголовка в одну строку с текстом:
     #    «1.1 Название. Далее идёт текст...» — срезаем только префикс.
     heading_words = re.escape(_heading_compare_key(heading))
     if heading_words:
@@ -5280,14 +4843,13 @@ def _format_heading_with_dot(title: str, level: int) -> str:
         m = re.match(r"^(?:глава\s+)?(\d+)\.?\s+(.+)$", t, re.IGNORECASE)
         if m:
             num, rest = m.group(1), m.group(2).strip()
-            return f"{num} {rest.upper()}"  # FIX#6: UPPERCASE (GOST 7.32-2017)
-        return t.upper()  # FIX#6: uppercase even without number
+            return f"{num} {rest}"
         return t
 
     m = re.match(r"^(\d+\.\d+)\.?\s+(.+)$", t)
     if m:
         num, rest = m.group(1), m.group(2).strip()
-        return f"{num}. {rest}"  # FIX#3: dot after number (GOST 7.32-2017)
+        return f"{num} {rest}"
     return t
 
 
@@ -5337,7 +4899,7 @@ def add_paragraphs_from_text(
     skip_first_heading: Optional[str] = None,
 ) -> None:
     """
-    Разбивает текст н�� абзацы и добавляет их в документ.
+    Разбивает текст на абзацы и добавляет их в документ.
     skip_first_heading - если передан, удаляет первую строку, совпадающую с этим заголовком
     """
     font   = gost.get("font_name", "Times New Roman")
@@ -5423,12 +4985,9 @@ def add_paragraphs_from_text(
         first_line = ch.split("\n")[0].strip()
 
         if subheading_pat.match(first_line):
-            # FIX#4: subheading without first_line_indent (GOST 7.32-2017)
+            # Подзаголовок — жирным в обычном абзаце (не Heading 2)
             p = doc.add_paragraph()
-            p.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-            p.paragraph_format.first_line_indent = Cm(0)
-            p.paragraph_format.space_before = Pt(0)
-            p.paragraph_format.space_after = Pt(0)
+            _apply_body_format(p)
             run1 = p.add_run(first_line)
             _set_run_font(run1, font, size, True)
             rest = ch[len(first_line):].strip()
@@ -5442,735 +5001,6 @@ def add_paragraphs_from_text(
             clean_ch = re.sub(r'\s*\n\s*', ' ', ch)
             r = p.add_run(clean_ch)
             _set_run_font(r, font, size, False)
-
-
-
-def _image_count_for_pages(pages: int) -> int:
-    """Сколько иллюстраций вставлять в работу."""
-    return max(1, min(MAX_WORK_IMAGES, max(1, pages // 5)))
-
-
-async def _download_image_bytes(url: str, *, timeout: int = 15) -> Optional[bytes]:
-    if not url:
-        return None
-    try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as session:
-            async with session.get(url, headers={"User-Agent": "GOST-Assistant/1.0"}) as resp:
-                if resp.status != 200:
-                    return None
-                ctype = (resp.headers.get("Content-Type") or "").lower()
-                if "image" not in ctype:
-                    return None
-                data = await resp.read()
-                if len(data) < 2_000 or len(data) > 8_000_000:
-                    return None
-                return data
-    except Exception as e:
-        print(f"[IMAGES] download error: {e}")
-        return None
-
-
-async def suggest_image_search_queries(
-    model_key: str,
-    topic: str,
-    subject: str,
-    limit: int = 5,
-) -> list[str]:
-    """DeepSeek формирует поисковые запросы для фото/иллюстраций."""
-    aliases = _topic_aliases(topic)
-    base = [topic] + aliases + [" ".join(x for x in [topic, subject] if x).strip()]
-    system = (
-        "Ты помогаешь искать реальные изображения для учебной работы. "
-        "Верни СТРОГО JSON без markdown: {\"queries\": [\"...\"]}. "
-        "Нужны короткие запросы для поиска РЕАЛЬНЫХ ФОТО: official portrait, press photo, documentary photo. "
-        "Запрещены запросы со словами meme, funny, cartoon, caricature, joke, parody. "
-        "Если тема содержит имя человека, обязательно дай вариант на английском."
-    )
-    user = (
-        f"Тема работы: «{topic}»\n"
-        f"Дисциплина: «{subject}»\n"
-        f"Дай до {limit} поисковых запросов для подбора изображений."
-    )
-    try:
-        raw, _ = await chat_with_fallback(
-            model_key,
-            [{"role": "system", "content": system}, {"role": "user", "content": user}],
-            max_tokens=300,
-        )
-        m = re.search(r"\{.*\}", raw or "", flags=re.S)
-        if m:
-            data = json.loads(m.group(0))
-            qs = data.get("queries", [])
-            if isinstance(qs, list):
-                for q in qs:
-                    q = " ".join(str(q).split()).strip(" \"'«»")
-                    if q:
-                        base.append(q)
-    except Exception as e:
-        print(f"[IMAGES] query AI error: {e}")
-
-    # Жёсткий фоллбэк для частых русских имён/тем, чтобы не упираться в русскую выдачу Commons.
-    low = (topic or "").lower()
-    if "байден" in low:
-        base.extend(["Joe Biden", "President Joe Biden", "Joe Biden official portrait", "Joe Biden press photo"])
-    if "трамп" in low:
-        base.extend(["Donald Trump", "President Donald Trump", "Donald Trump official portrait", "Donald Trump press photo"])
-
-    out: list[str] = []
-    for q in base:
-        q = " ".join((q or "").split())
-        if q and q.lower() not in {x.lower() for x in out}:
-            out.append(q)
-    return out[:limit]
-
-
-async def search_wikimedia_images(query: str, limit: int = 3) -> list[dict]:
-    """Ищет свободные JPG/PNG на Wikimedia Commons и возвращает bytes + подпись."""
-    if not ENABLE_IMAGE_SEARCH or limit <= 0:
-        return []
-
-    query = " ".join((query or "").split()).strip()
-    if not query:
-        return []
-
-    api = "https://commons.wikimedia.org/w/api.php"
-    params = {
-        "action": "query",
-        "generator": "search",
-        "gsrnamespace": "6",
-        "gsrlimit": str(max(1, min(limit * 6, 30))),
-        "gsrsearch": query,
-        "prop": "imageinfo",
-        "iiprop": "url|mime|extmetadata",
-        "iiurlwidth": "1200",
-        "format": "json",
-    }
-
-    try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as session:
-            async with session.get(api, params=params, headers={"User-Agent": "GOST-Assistant/1.0"}) as resp:
-                if resp.status != 200:
-                    print(f"[IMAGES] Wikimedia status {resp.status} for query={query!r}")
-                    return []
-                payload = await resp.json(content_type=None)
-    except Exception as e:
-        print(f"[IMAGES] search error for {query!r}: {e}")
-        return []
-
-    pages = (payload.get("query", {}) or {}).get("pages", {}) or {}
-    out: list[dict] = []
-    seen: set[str] = set()
-
-    for item in pages.values():
-        title = str(item.get("title") or "").replace("File:", "").strip()
-        info = (item.get("imageinfo") or [{}])[0]
-        mime = (info.get("mime") or "").lower()
-        url = info.get("thumburl") or info.get("url") or ""
-        if not url or url in seen:
-            continue
-        # python-docx гарантированно работает с JPEG/PNG; svg/webp/tiff пропускаем.
-        if mime not in ("image/jpeg", "image/png") and not re.search(r"\.(jpe?g|png)(\?|$)", url, flags=re.I):
-            continue
-        if not _is_safe_real_photo_meta(title, url, mime):
-            continue
-        seen.add(url)
-        img_bytes = await _download_image_bytes(url)
-        if not img_bytes:
-            continue
-
-        meta = info.get("extmetadata") or {}
-        obj_name = ((meta.get("ObjectName") or {}).get("value") or "").strip()
-        caption = re.sub(r"<[^>]+>", "", obj_name) if obj_name else ""
-        if not caption:
-            caption = re.sub(r"\.(jpe?g|png)$", "", title, flags=re.I)
-        caption = re.sub(r"[_\-]+", " ", caption).strip() or query
-        source = info.get("descriptionurl") or info.get("url") or url
-        if not _is_safe_real_photo_meta(caption, source, url, mime):
-            continue
-        out.append({"bytes": img_bytes, "caption": caption[:120], "source": source})
-        if len(out) >= limit:
-            break
-
-    print(f"[IMAGES] query={query!r}: найдено {len(out)}/{limit}")
-    return out
-
-
-async def search_wikipedia_page_images(query: str, limit: int = 2) -> list[dict]:
-    """Бесплатный no-key API Wikipedia: берёт главные изображения найденных страниц."""
-    if not ENABLE_IMAGE_SEARCH or limit <= 0:
-        return []
-    query = " ".join((query or "").split()).strip()
-    if not query:
-        return []
-
-    out: list[dict] = []
-    seen: set[str] = set()
-    # Пробуем английскую и русскую Википедию: для персон/международных тем en часто лучше.
-    for lang in ("en", "ru"):
-        api = f"https://{lang}.wikipedia.org/w/api.php"
-        params = {
-            "action": "query",
-            "generator": "search",
-            "gsrsearch": query,
-            "gsrlimit": str(max(1, min(limit * 4, 12))),
-            "prop": "pageimages|info",
-            "pithumbsize": "1200",
-            "inprop": "url",
-            "format": "json",
-        }
-        try:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
-                async with session.get(api, params=params, headers={"User-Agent": "GOST-Assistant/1.0"}) as resp:
-                    if resp.status != 200:
-                        print(f"[IMAGES] Wikipedia {lang} status {resp.status} for {query!r}")
-                        continue
-                    payload = await resp.json(content_type=None)
-        except Exception as e:
-            print(f"[IMAGES] Wikipedia {lang} error for {query!r}: {e}")
-            continue
-
-        pages = (payload.get("query", {}) or {}).get("pages", {}) or {}
-        for item in pages.values():
-            thumb = item.get("thumbnail") or {}
-            url = thumb.get("source") or ""
-            if not url or url in seen:
-                continue
-            if not re.search(r"\.(jpe?g|png)(\?|$)", url, flags=re.I):
-                continue
-            caption0 = " ".join(str(item.get("title") or query).split())
-            source0 = item.get("fullurl") or f"https://{lang}.wikipedia.org/"
-            if not _is_safe_real_photo_meta(caption0, source0, url):
-                continue
-            seen.add(url)
-            img_bytes = await _download_image_bytes(url)
-            if not img_bytes:
-                continue
-            caption = " ".join(str(item.get("title") or query).split())
-            source = item.get("fullurl") or f"https://{lang}.wikipedia.org/"
-            if not _is_safe_real_photo_meta(caption, source, url):
-                continue
-            out.append({"bytes": img_bytes, "caption": caption[:120], "source": source})
-            if len(out) >= limit:
-                print(f"[IMAGES] Wikipedia query={query!r}: найдено {len(out)}/{limit}")
-                return out
-
-    print(f"[IMAGES] Wikipedia query={query!r}: найдено {len(out)}/{limit}")
-    return out
-
-
-
-_BAD_IMAGE_WORDS = (
-    "meme", "memes", "funny", "joke", "humor", "humour", "lol", "comedy",
-    "cartoon", "caricature", "parody", "satire", "comic", "sticker", "emoji",
-    "gif", "reaction", "demotivator", "демотиватор", "мем", "прикол", "смешн",
-    "карикатур", "парод", "сатира", "комикс", "стикер", "логотип", "logo",
-    "clipart", "vector", "drawing", "sketch", "illustration", "poster", "ai generated",
-    "generated", "midjourney", "stable diffusion", "dall-e", "dalle",
-)
-_GOOD_PHOTO_WORDS = (
-    "photo", "photograph", "portrait", "official", "press", "meeting", "conference",
-    "фото", "фотография", "портрет", "официаль", "пресс", "конференц",
-)
-
-
-
-def _image_relevance_tokens(topic: str, queries: Optional[list[str]] = None) -> list[str]:
-    """Токены, которые должны встречаться в метаданных фото, чтобы не брать мусор.
-
-    Особенно важно для персон: запрос «Trump» в Openverse может вернуть чужие
-    политические/уличные фото. Требуем фамилию/имя в caption/source.
-    """
-    raw_parts = [topic or ""] + list(queries or []) + _topic_aliases(topic)
-    blob = " ".join(raw_parts).lower()
-    manual = {
-        "трамп": ["trump", "donald", "дональд", "трамп"],
-        "байден": ["biden", "joe", "джо", "байден"],
-        "путин": ["putin", "vladimir", "путин", "владимир"],
-    }
-    out: list[str] = []
-    for key, vals in manual.items():
-        if key in blob or any(v in blob for v in vals):
-            out.extend(vals)
-    # Для латинских имён/фамилий добавляем слова длиной >=4.
-    for w in re.findall(r"[a-zа-яё]{4,}", blob, flags=re.I):
-        wl = w.lower()
-        if wl not in _BAD_IMAGE_WORDS and wl not in {"official", "portrait", "photo", "press", "documentary", "фото", "портрет"}:
-            out.append(wl)
-    res = []
-    for t in out:
-        t = t.lower().strip()
-        if t and t not in res:
-            res.append(t)
-    # Если токенов слишком много, главные персональные оставляем первыми.
-    return res[:8]
-
-
-def _image_matches_topic(image: dict, required_tokens: list[str]) -> bool:
-    if not required_tokens:
-        return True
-    blob = " ".join(str(image.get(k) or "") for k in ("caption", "source")).lower()
-    blob = re.sub(r"[_%20\-]+", " ", blob)
-    return any(t in blob for t in required_tokens)
-
-def _is_safe_real_photo_meta(*values: str) -> bool:
-    """Отсекает мемы/карикатуры/рисунки/AI-изображения по метаданным."""
-    blob = " ".join(str(v or "") for v in values).lower()
-    blob = re.sub(r"[_%20\-]+", " ", blob)
-    if any(w in blob for w in _BAD_IMAGE_WORDS):
-        return False
-    # Если явно указано, что это фото/портрет/official — отлично.
-    if any(w in blob for w in _GOOD_PHOTO_WORDS):
-        return True
-    # Нейтральные метаданные допускаем для Wikipedia/Openverse: там часто title = имя страницы.
-    return True
-
-async def search_openverse_images(query: str, limit: int = 3) -> list[dict]:
-    """Бесплатный официальный Openverse API: реальные фото/изображения Creative Commons без ключа."""
-    if not ENABLE_IMAGE_SEARCH or limit <= 0:
-        return []
-    query = " ".join((query or "").split()).strip()
-    if not query:
-        return []
-
-    api = "https://api.openverse.engineering/v1/images/"
-    params = {
-        "q": query,
-        "page_size": str(max(1, min(limit * 5, 20))),
-        "category": "photograph",
-        "license_type": "commercial,modification",
-    }
-    try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as session:
-            async with session.get(api, params=params, headers={"User-Agent": "GOST-Assistant/1.0"}) as resp:
-                if resp.status != 200:
-                    print(f"[IMAGES] Openverse status {resp.status} for {query!r}")
-                    return []
-                payload = await resp.json(content_type=None)
-    except Exception as e:
-        print(f"[IMAGES] Openverse error for {query!r}: {e}")
-        return []
-
-    out: list[dict] = []
-    seen: set[str] = set()
-    for item in payload.get("results", []) or []:
-        title0 = " ".join(str(item.get("title") or query).split())
-        creator0 = " ".join(str(item.get("creator") or "").split())
-        source0 = item.get("foreign_landing_url") or item.get("url") or ""
-        if not _is_safe_real_photo_meta(title0, creator0, source0):
-            continue
-        # Реальные изображения: сначала thumbnail (быстрее/стабильнее), затем оригинал.
-        candidates = [item.get("thumbnail"), item.get("url")]
-        for url in candidates:
-            if not url or url in seen:
-                continue
-            seen.add(url)
-            img_bytes = await _download_image_bytes(url)
-            if not img_bytes:
-                continue
-            title = " ".join(str(item.get("title") or query).split())[:120]
-            creator = " ".join(str(item.get("creator") or "").split())
-            source = item.get("foreign_landing_url") or item.get("url") or url
-            if not _is_safe_real_photo_meta(title, creator, source, url):
-                continue
-            if creator and creator.lower() not in title.lower():
-                title = f"{title} ({creator[:60]})"[:120]
-            out.append({"bytes": img_bytes, "caption": title or query, "source": source})
-            break
-        if len(out) >= limit:
-            break
-
-    print(f"[IMAGES] Openverse query={query!r}: найдено {len(out)}/{limit}")
-    return out
-
-
-def _image_bytes_for_docx(img_bytes: bytes, *, max_width: int = 1200, max_height: int = 900) -> bytes:
-    """Нормализует изображение в PNG, чтобы python-docx точно смог вставить его."""
-    if not img_bytes or PILImage is None:
-        return img_bytes
-    try:
-        with PILImage.open(io.BytesIO(img_bytes)) as im:
-            im.thumbnail((max_width, max_height))
-            if im.mode not in ("RGB", "RGBA"):
-                im = im.convert("RGBA" if "A" in im.getbands() else "RGB")
-            out = io.BytesIO()
-            im.save(out, format="PNG")
-            return out.getvalue()
-    except Exception as e:
-        print(f"[IMAGES] normalize error: {e}")
-        return img_bytes
-
-
-
-async def search_duckduckgo_images(query: str, limit: int = 2) -> list[dict]:
-    """Бесплатный no-key поиск картинок DuckDuckGo (неофициальный)."""
-    if not ENABLE_IMAGE_SEARCH or limit <= 0:
-        return []
-    query = " ".join((query or "").split()).strip()
-    if not query:
-        return []
-
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
-        "Accept": "text/html,application/json,*/*",
-    }
-    try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20), headers=headers) as session:
-            async with session.get("https://duckduckgo.com/", params={"q": query, "iax": "images", "ia": "images"}) as resp:
-                html_text = await resp.text()
-            m = re.search(r"vqd=['\"]?([\w-]+)['\"]?", html_text)
-            if not m:
-                print(f"[IMAGES] DuckDuckGo: vqd не найден для {query!r}")
-                return []
-            vqd = m.group(1)
-            params = {"l": "us-en", "o": "json", "q": query, "vqd": vqd, "f": ",,,", "p": "1"}
-            async with session.get("https://duckduckgo.com/i.js", params=params) as resp:
-                if resp.status != 200:
-                    print(f"[IMAGES] DuckDuckGo status {resp.status} for {query!r}")
-                    return []
-                payload = await resp.json(content_type=None)
-    except Exception as e:
-        print(f"[IMAGES] DuckDuckGo error for {query!r}: {e}")
-        return []
-
-    out: list[dict] = []
-    seen: set[str] = set()
-    for item in payload.get("results", []) or []:
-        # Сначала пробуем thumbnail — он чаще JPEG/PNG и быстрее скачивается.
-        candidates = [item.get("thumbnail"), item.get("image")]
-        for url in candidates:
-            if not url or url in seen:
-                continue
-            seen.add(url)
-            img_bytes = await _download_image_bytes(url)
-            if not img_bytes:
-                continue
-            title = re.sub(r"<[^>]+>", "", str(item.get("title") or query))
-            title = " ".join(title.split())[:120]
-            source = item.get("url") or item.get("image") or url
-            out.append({"bytes": img_bytes, "caption": title or query, "source": source})
-            break
-        if len(out) >= limit:
-            break
-
-    print(f"[IMAGES] DuckDuckGo query={query!r}: найдено {len(out)}/{limit}")
-    return out
-
-
-
-def _caption_ru_fallback(caption: str, topic: str = "") -> str:
-    """Быстрый словарный fallback для подписей к рисункам.
-
-    FIX 7.32-D: расширен словарь (Трамп, Байден, Эйнштейн, МГУ, NASA …),
-    добавлены правила для типовых русских заголовков,
-    более аккуратная очистка служебных английских слов.
-    """
-    cap = " ".join((caption or "").replace("_", " ").replace("-", " ").split())
-    low = cap.lower()
-    topic_low = (topic or "").lower()
-
-    # ── Персоналии (частые случаи в реальных подписях) ──
-    PERSONS = {
-        "biden":  "Джо Байден",
-        "joe biden": "Джо Байден",
-        "байден":  "Джо Байден",
-        "trump":   "Дональд Трамп",
-        "donald trump": "Дональд Трамп",
-        "трамп":   "Дональд Трамп",
-        "putin":   "Владимир Путин",
-        "vladimir putin": "Владимир Путин",
-        "путин":   "Владимир Путин",
-        "einstein": "Альберт Эйнштейн",
-        "albert einstein": "Альберт Эйнштейн",
-        "эйнштейн": "Альберт Эйнштейн",
-        "tesla":   "Никола Тесла",
-        "edison":  "Томас Эдисон",
-        "newton":  "Исаак Ньютон",
-        "darwin":  "Чарльз Дарвин",
-    }
-    for k, v in PERSONS.items():
-        if k in low:
-            tail_phrase = ""
-            if any(w in low for w in ("portrait", "official", "photo")):
-                tail_phrase = " (портрет)"
-            elif any(w in low for w in ("speaking", "press", "conference")):
-                tail_phrase = " (выступление)"
-            return f"Фотография {v}{tail_phrase}"
-
-    # ── Организации и бренды (без перевода на русский — оставляем латиницей) ──
-    ORGS = ("NASA", "ESA", "ISS", "UNESCO", "WHO", "ООН", "МГУ", "Сколково")
-    org_hit = next((o for o in ORGS if o.lower() in low or o in cap), None)
-
-    # ── Тип фото (portrait, landscape, building и т. п.) ──
-    PHOTO_TYPES = {
-        "portrait": "портрет",
-        "landscape": "пейзаж",
-        "building": "здание",
-        "cityscape": "городской пейзаж",
-        "sunset": "закат",
-        "sunrise": "восход",
-        "night": "ночной вид",
-        "aerial": "вид сверху",
-        "satellite": "спутниковый снимок",
-        "map": "карта",
-        "diagram": "схема",
-        "chart": "диаграмма",
-        "graph": "график",
-        "sketch": "рисунок",
-        "drawing": "чертёж",
-        "photo": "фотография",
-        "image": "изображение",
-        "picture": "изображение",
-        "logo": "логотип",
-        "flag": "флаг",
-        "people": "люди",
-        "crowd": "толпа",
-        "student": "студент",
-        "students": "студенты",
-        "teacher": "преподаватель",
-        "lab": "лаборатория",
-        "office": "офис",
-        "computer": "компьютер",
-    }
-    detected_type = next((v for k, v in PHOTO_TYPES.items() if k in low), None)
-
-    # ── Убираем служебные английские слова ──
-    cap = re.sub(
-        r"\b(file|image|photo|portrait|official|jpg|jpeg|png|svg|commons|"
-        r"wikimedia|thumbnail|preview|of|the|a|an|and|by|from|in|on|at|"
-        r"high|resolution|full|small|large|small|medium|size|original)\b",
-        "",
-        cap,
-        flags=re.I,
-    )
-    cap = re.sub(r"\s+", " ", cap).strip(" .,-_")
-
-    # ── Если есть кириллица — вернуть как есть (но с обрезанными служебными) ──
-    if re.search(r"[А-Яа-яЁё]", cap):
-        if detected_type and detected_type not in cap.lower():
-            return f"{cap[:90]} ({detected_type})"[:120]
-        return cap[:120]
-
-    # ── Если только латиница — собираем русскую подпись по частям ──
-    parts: list[str] = []
-    if detected_type:
-        parts.append(f"Фотография: {detected_type}")
-    if org_hit:
-        parts.append(org_hit)
-    if topic:
-        parts.append(f"по теме «{topic[:50]}»")
-    if not parts:
-        parts.append("Иллюстрация по теме исследования")
-
-    # Избегаем дубликатов слов и схлопываем пробелы
-    out = ", ".join(p for p in parts if p)
-    out = re.sub(r"\s+", " ", out).strip(" .,")
-    return out[:120]
-
-
-async def translate_caption_to_russian(model_key: str, caption: str, topic: str = "") -> str:
-    """Переводит подпись к рисунку на русский. Если ИИ недоступен — fallback."""
-    caption = " ".join((caption or "").split())
-    if not caption:
-        return _caption_ru_fallback(caption, topic)
-    if re.search(r"[А-Яа-яЁё]", caption) and not re.search(r"[A-Za-z]{3,}", caption):
-        return caption[:120]
-    system = (
-        "Ты переводишь подписи к рисункам в учебной работе. Верни только одну "
-        "краткую русскую подпись без кавычек, без слова 'Рисунок', без markdown. "
-        "Стиль: академичный русский."
-    )
-    user = f"Тема: «{topic}»\nИсходная подпись: {caption}\nПереведи на русский."
-    try:
-        raw, _ = await chat_with_fallback(
-            model_key,
-            [{"role": "system", "content": system}, {"role": "user", "content": user}],
-            max_tokens=120,
-        )
-        raw = re.sub(r"^[\s\"'«»]+|[\s\"'«»]+$", "", (raw or "").strip())
-        raw = re.sub(r"^(Рисунок\s*\d+\s*[–—-]\s*)", "", raw, flags=re.I)
-        if raw and re.search(r"[А-Яа-яЁё]", raw):
-            return " ".join(raw.split())[:120]
-    except Exception as e:
-        print(f"[IMAGES] caption translate error: {e}")
-    return _caption_ru_fallback(caption, topic)
-
-
-async def prepare_work_images(
-    topic: str,
-    subject: str,
-    pages: int,
-    model_key: str = FREE_MODEL_KEY,
-    image_count: Optional[int] = None,
-) -> list[dict]:
-    """Готовит реальные фото для DOCX: DeepSeek делает запросы, дальше пробуются бесплатные API."""
-    count = int(image_count or _image_count_for_pages(pages))
-    count = max(1, min(MAX_WORK_IMAGES, count))
-    queries = await suggest_image_search_queries(model_key, topic, subject, limit=6)
-    images: list[dict] = []
-    seen_sources: set[str] = set()
-    required_tokens = _image_relevance_tokens(topic, queries)
-    print(f"[IMAGES] relevance tokens: {required_tokens}")
-
-    async def add_from(found: list[dict]) -> None:
-        nonlocal images
-        for img in found or []:
-            if not _image_matches_topic(img, required_tokens):
-                print(f"[IMAGES] reject irrelevant: {str(img.get('caption') or '')[:80]}")
-                continue
-            src = img.get("source") or ""
-            if src and src in seen_sources:
-                continue
-            if src:
-                seen_sources.add(src)
-            images.append(img)
-            if len(images) >= count:
-                break
-
-    providers = (
-        ("openverse", search_openverse_images),
-        ("wikipedia", search_wikipedia_page_images),
-        ("wikimedia", search_wikimedia_images),
-        # DuckDuckGo намеренно не используем по умолчанию: выдача часто содержит мемы,
-        # карикатуры и смешные картинки. Оставляем функцию в коде только как запас.
-    )
-
-    for q in queries:
-        for provider_name, provider in providers:
-            need = count - len(images)
-            if need <= 0:
-                break
-            try:
-                found = await provider(q, limit=need)
-                await add_from(found)
-            except Exception as e:
-                print(f"[IMAGES] provider {provider_name} failed for {q!r}: {e}")
-        if len(images) >= count:
-            break
-
-    # Нормализуем все реальные картинки в PNG и переводим подписи на русский.
-    for img in images:
-        if img.get("bytes"):
-            img["bytes"] = _image_bytes_for_docx(img["bytes"])
-        img["caption"] = await translate_caption_to_russian(
-            model_key,
-            str(img.get("caption") or topic),
-            topic=topic,
-        )
-
-    print(f"[IMAGES] итог: {len(images)}/{count}, queries={queries}")
-    return images
-
-
-def add_gost_image(doc: Document, image: dict, number: int, gost: dict) -> None:
-    """Вставляет изображение и подпись по ГОСТ: рисунок по центру, подпись снизу.
-
-    FIX 7.32-G: добавляет widow/orphan + keep_next + keep_lines на все три
-    параграфа (картинка → подпись → источник). Это гарантирует, что:
-      • фото и подпись НЕ окажутся на разных страницах;
-      • источник не «отвалится» в конец следующей страницы;
-      • строка подписи не будет «висячей» вверху/внизу страницы.
-    """
-    img_bytes = image.get("bytes")
-    if not img_bytes:
-        return
-    img_bytes = _image_bytes_for_docx(img_bytes)
-
-    fn = gost.get("font_name", "Times New Roman")
-    fs = int(gost.get("font_size", 14))
-
-    try:
-        # ── Параграф 1: само изображение ──
-        p_img = doc.add_paragraph()
-        p_img.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        p_img.paragraph_format.first_line_indent = Cm(0)
-        run = p_img.add_run()
-        width_cm = float(gost.get("image_width_cm", 10.0))
-        run.add_picture(io.BytesIO(img_bytes), width=Cm(max(4.0, min(12.0, width_cm))))
-        # Картинка должна остаться с подписью (или со следующим текстом главы,
-        # если подпись не предусмотрена — например, для приложения).
-        _set_paragraph_keep(p_img, keep_next=True, keep_lines=True, widow=True)
-
-        # ── Параграф 2: подпись «Рисунок N – …» ──
-        raw_caption = str(image.get("caption") or "Иллюстрация по теме исследования")
-        # FIX: гарантируем русскоязычную подпись — если >40% слов на английском,
-        # заменяем на безопасную русскую заглушку
-        _eng_words = len(re.findall(r'\b[a-zA-Z]{3,}\b', raw_caption))
-        _total_words = len(re.findall(r'\b[\w]+\b', raw_caption))
-        if _total_words > 0 and _eng_words / _total_words > 0.4:
-            raw_caption = "Иллюстрация по теме исследования"
-        caption = " ".join(raw_caption.split())
-        p_cap = doc.add_paragraph()
-        p_cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        p_cap.paragraph_format.first_line_indent = Cm(0)
-        p_cap.paragraph_format.space_before = Pt(6)
-        p_cap.paragraph_format.space_after = Pt(6)
-        r = p_cap.add_run(f"Рисунок {number} – {caption}")
-        _set_run_font(r, fn, fs, False)
-        # Подпись должна остаться с источником (если он есть) и не разрываться.
-        _set_paragraph_keep(p_cap, keep_next=True, keep_lines=True, widow=True)
-
-        # ── Параграф 3: источник (опционально) ──
-        source = image.get("source")
-        if source:
-            p_src = doc.add_paragraph()
-            p_src.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            p_src.paragraph_format.first_line_indent = Cm(0)
-            p_src.paragraph_format.space_after = Pt(6)
-            r2 = p_src.add_run(f"Источник: {source}")
-            _set_run_font(r2, fn, max(10, fs - 2), False)
-            # Источник — последний параграф «тройки» (картинка+подпись+источник).
-            # keep_lines + widow обязательно; keep_next не обязателен (нет следующего
-            # абзаца в группе), но и не вредит.
-            _set_paragraph_keep(p_src, keep_next=False, keep_lines=True, widow=True)
-    except Exception as e:
-        print(f"[IMAGES] insert error: {e}")
-def _set_paragraph_keep(p, *, keep_next: bool = False, keep_lines: bool = True, widow: bool = True) -> None:
-    """FIX 7.32-G: ставит «keep_next» и «keep_lines» на параграф.
-
-    `keep_next=True`  — Word/LibreOffice постараются НЕ разрывать страницу
-                        между этим параграфом и следующим.
-    `keep_lines=True` — внутри абзаца не должно быть «висячей» строки
-                        (widow/orphan control).
-    `widow=True`      — то же, что `keep_lines` (для совместимости).
-
-    Используется, чтобы фото + подпись + источник оставались на одной
-    странице, а последний абзац текста главы «прилипал» к следующему за ним
-    изображению. Реализовано через прямые XML-элементы pPr,
-    потому что python-docx не предоставляет этих свойств напрямую.
-    """
-    try:
-        pPr = p._p.get_or_add_pPr()
-        # 1) widow/orphan control
-        if widow or keep_lines:
-            existing_w = pPr.find(qn("w:widowControl"))
-            if existing_w is None:
-                w_el = OxmlElement("w:widowControl")
-                w_el.set(qn("w:val"), "1")
-                pPr.append(w_el)
-            else:
-                existing_w.set(qn("w:val"), "1")
-        # 2) keepNext — параграф не должен отрываться от следующего
-        if keep_next:
-            existing_k = pPr.find(qn("w:keepNext"))
-            if existing_k is None:
-                k_el = OxmlElement("w:keepNext")
-                k_el.set(qn("w:val"), "1")
-                pPr.append(k_el)
-            else:
-                existing_k.set(qn("w:val"), "1")
-        # 3) keepLines — строки абзаца не разрываются между страницами
-        if keep_lines:
-            existing_kl = pPr.find(qn("w:keepLines"))
-            if existing_kl is None:
-                kl_el = OxmlElement("w:keepLines")
-                kl_el.set(qn("w:val"), "1")
-                pPr.append(kl_el)
-            else:
-                existing_kl.set(qn("w:val"), "1")
-    except Exception as e:
-        print(f"[KEEP] Ошибка установки keep_next/keep_lines: {e}")
-
-
 
 
 def build_docx_bytes(
@@ -6225,128 +5055,6 @@ def build_docx_bytes(
             unique_blocks.append(b)
     blocks = unique_blocks
 
-    # ═══════════════════════════════════════════════════════════════
-    # FIX 7.32-A: глобальный page_map по ВСЕМУ тексту работы
-    #             + _fill_missing_pages для каждого блока и подблока.
-    # Все цитаты [N] приводятся к виду [N, с. X] согласно ГОСТ 7.32-2017.
-    # ═══════════════════════════════════════════════════════════════
-    try:
-        _global_text_parts: list[str] = []
-        for _bt, _bl, _bx, _sb in blocks:
-            if _bx:
-                _global_text_parts.append(_bx)
-            for _st, _sx in (_sb or []):
-                if _sx:
-                    _global_text_parts.append(_sx)
-        _global_map = _build_page_map("\n\n".join(_global_text_parts))
-
-        _normalized_blocks: list[tuple] = []
-        for _bt, _bl, _bx, _sb in blocks:
-            _bx_n = _fill_missing_pages(_bx or "", _global_map) if _bx else _bx
-            _sb_n = []
-            for _st, _sx in (_sb or []):
-                _sx_n = _fill_missing_pages(_sx or "", _global_map) if _sx else _sx
-                _sb_n.append((_st, _sx_n))
-            _normalized_blocks.append((_bt, _bl, _bx_n, _sb_n))
-        blocks = _normalized_blocks
-
-        # === ВТОРОЙ ФИНАЛЬНЫЙ ПРОХОД: гарантируем, что ВСЕ [N] → [N, с. X] ===
-        _final_blocks: list[tuple] = []
-        for _bt, _bl, _bx, _sb in blocks:
-            if _bx:
-                _bx = _fill_missing_pages(_bx, _global_map)
-            _sb_n = []
-            for _st, _sx in (_sb or []):
-                if _sx:
-                    _sx = _fill_missing_pages(_sx, _global_map)
-                _sb_n.append((_st, _sx))
-            _final_blocks.append((_bt, _bl, _bx, _sb_n))
-        blocks = _final_blocks
-    except Exception as _e:
-        print(f"[FIX 7.32-A] Не удалось нормализовать цитаты: {_e}")
-
-    # ═══════════════════════════════════════════════════════════════
-    # FIX 7.32-B: библиография → ГОСТ 7.32 для ФИНАЛЬНОГО документа.
-    #             Прогоняем _normalize_bibliography по блоку
-    #             «СПИСОК ИСПОЛЬЗОВАННЫХ ИСТОЧНИКОВ» / «СПИСОК ЛИТЕРАТУРЫ».
-    # Это финальная страховка — add_paragraphs_from_text тоже вызовет
-    # её для is_bib=True, но двойная нормализация гарантирует формат.
-    # ═══════════════════════════════════════════════════════════════
-    try:
-        _bib_keys = (
-            "СПИСОК ИСПОЛЬЗОВАННЫХ ИСТОЧНИКОВ",
-            "СПИСОК ЛИТЕРАТУРЫ",
-            "СПИСОК ИСТОЧНИКОВ",
-            "БИБЛИОГРАФИЧЕСКИЙ СПИСОК",
-            "БИБЛИОГРАФИЯ",
-        )
-        _norm_blocks: list[tuple] = []
-        for _bt, _bl, _bx, _sb in blocks:
-            _up = (_bt or "").upper()
-            if any(_bk in _up for _bk in _bib_keys):
-                _bx = _normalize_bibliography(_bx or "")
-                _sb_n = []
-                for _st, _sx in (_sb or []):
-                    _sx_n = _normalize_bibliography(_sx or "") if _sx else _sx
-                    _sb_n.append((_st, _sx_n))
-                print(f"[FIX 7.32-B] Библиография нормализована по ГОСТ 7.32: «{_bt}»")
-            _norm_blocks.append((_bt, _bl, _bx, _sb_n if _sb else _sb))
-        blocks = _norm_blocks
-
-        # === ВТОРОЙ ФИНАЛЬНЫЙ ПРОХОД: гарантируем ГОСТ 7.32 для библиографии ===
-        _final_bib_blocks: list[tuple] = []
-        for _bt, _bl, _bx, _sb in blocks:
-            _up = (_bt or "").upper()
-            if any(_bk in _up for _bk in _bib_keys):
-                _bx = _normalize_bibliography(_bx or "")
-                _sb_n = []
-                for _st, _sx in (_sb or []):
-                    _sx_n = _normalize_bibliography(_sx or "") if _sx else _sx
-                    _sb_n.append((_st, _sx_n))
-                print(f"[FIX 7.32-B] Финальная нормализация библиографии: «{_bt}»")
-                _final_bib_blocks.append((_bt, _bl, _bx, _sb_n))
-            else:
-                _final_bib_blocks.append((_bt, _bl, _bx, _sb))
-        blocks = _final_bib_blocks
-    except Exception as _e:
-        print(f"[FIX 7.32-B] Не удалось нормализовать библиографию: {_e}")
-
-    work_images = data.get("images") or []
-    image_number = 1
-
-    def _maybe_add_image_after_block(block_title: str, block_level: int, is_bib_block: bool) -> None:
-        nonlocal image_number
-        if not work_images or image_number > len(work_images):
-            return
-        up = (block_title or "").upper()
-        if is_bib_block or _is_structural_heading(block_title) or any(x in up for x in ("СОДЕРЖАН", "ЗАКЛЮЧ", "ВВЕДЕН")):
-            return
-        if block_level != 1:
-            return
-        # FIX 7.32-G: перед вставкой изображения — ставим keep_next=True
-        #              на ПОСЛЕДНИЙ абзац тела текущей главы, чтобы он
-        #              «прилип» к картинке. Это гарантирует, что фото
-        #              и текст главы будут на одной странице.
-        try:
-            _last_body_para = None
-            for _pp in doc.paragraphs[::-1]:
-                _pf = _pp.paragraph_format
-                _txt = "".join(_r.text for _r in _pp.runs).strip()
-                if (
-                    _txt
-                    and _pp.alignment == WD_ALIGN_PARAGRAPH.JUSTIFY
-                    and not _pf.page_break_before
-                    and _pf.first_line_indent is not None
-                ):
-                    _last_body_para = _pp
-                    break
-            if _last_body_para is not None:
-                _set_paragraph_keep(_last_body_para, keep_next=True, keep_lines=True, widow=True)
-        except Exception as _ke:
-            print(f"[FIX 7.32-G] keep_next не установлен: {_ke}")
-        add_gost_image(doc, work_images[image_number - 1], image_number, gost)
-        image_number += 1
-
     for idx, (title, level, text, subblocks) in enumerate(blocks):
         # Заголовок главы. Все заголовки 1-го уровня — единый размер (ошибка #4),
         # единые интервалы задаёт стиль Heading (ошибки #2, #8).
@@ -6365,8 +5073,9 @@ def build_docx_bytes(
             hp.alignment = WD_ALIGN_PARAGRAPH.CENTER
         else:
             hp.alignment = WD_ALIGN_PARAGRAPH.LEFT
-            # FIX#2: no indent for section headings (GOST 7.32-2017)
-            hp.paragraph_format.first_line_indent = Cm(0)
+            hp.paragraph_format.first_line_indent = Cm(
+                float(gost.get("first_line_indent_cm", 1.25))
+            )
 
         # ══ Разрыв страницы ПЕРЕД каждым заголовком 1-го уровня ══
         # Используем page_break_before на самом параграфе заголовка,
@@ -6378,13 +5087,9 @@ def build_docx_bytes(
         # Основной текст главы
         is_bib = any(w in title.upper() for w in ("ИСТОЧНИК", "ЛИТЕРАТ", "БИБЛИОГРАФ"))
 
-        # FIX 6: список литературы НЕ пропускаем. Если текст короткий
-        # (LLM вернул мало), добавляем fallback-стаб. Полностью пустой
-        # список нарушает ГОСТ 7.32 (минимум 8 источников).
+        # Пропуск пустых списков литературы
         if is_bib and (not text or len(text.strip()) < 50):
-            fallback_topic = data.get("topic", "")
-            text = _stub_text("literature", fallback_topic or "исследования")
-            print(f"[FIX 6] Библиография пуста/короткая, добавлен stub для темы «{fallback_topic}»")
+            continue
 
         if subblocks:
             # Есть подблоки — выводим их с заголовком Heading 2 и текстом
@@ -6469,22 +5174,6 @@ def build_docx_bytes(
                 er = ep.add_run(emergency_text)
                 _set_run_font(er, fn, fs, False)
 
-        _maybe_add_image_after_block(title, level, is_bib)
-
-    # Если основная структура была нестандартной и часть изображений некуда было
-    # вставить между разделами, выносим остаток в приложение, чтобы оплаченная
-    # опция «с изображениями» не дала пустой результат.
-    if work_images and image_number <= len(work_images):
-        doc.add_page_break()
-        p_app = doc.add_paragraph()
-        p_app.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        p_app.paragraph_format.first_line_indent = Cm(0)
-        r_app = p_app.add_run("ПРИЛОЖЕНИЕ А\nИЛЛЮСТРАЦИОННЫЕ МАТЕРИАЛЫ")
-        _set_run_font(r_app, fn, hfs, True)
-        while image_number <= len(work_images):
-            add_gost_image(doc, work_images[image_number - 1], image_number, gost)
-            image_number += 1
-
     buf = io.BytesIO()
     doc.save(buf)
     return buf.getvalue()
@@ -6543,7 +5232,7 @@ def libreoffice_update_docx(in_path: str, out_path: str) -> bool:
 
 # ═══════════════════════════════════════════════════════════════
 #  ТОЧНЫЙ ПОДСЧЁТ СТРАНИЦ DOCX ЧЕРЕЗ LIBREOFFICE → PDF
-# ═══════════════════════════════════════════════════════���═══════
+# ═══════════════════════════════════════════════════════════════
 
 # ═══════════════════════════════════════════════════════════════
 #  УЛУЧШЕННЫЙ СЕРВИС ПОДСЧЁТА СТРАНИЦ ДЛЯ ГОСТ-АССИСТЕНТА
@@ -6761,7 +5450,7 @@ def estimate_docx_pages(docx_path: str) -> Optional[int]:
                     page_breaks += 1
                     break
 
-    # Расчёт страниц по сим��олам
+    # Расчёт страниц по символам
     estimated_by_chars = max(1, int(total_chars / CHARS_PER_PAGE) + NON_TEXT_PAGES)
 
     # Расчёт по строкам
@@ -7183,7 +5872,7 @@ async def precise_page_adjustment(
 ) -> tuple[list[tuple], int]:
     """
     Точная подгонка количества страниц.
-    Возвращает (блоки, фина��ьное_количество_страниц)
+    Возвращает (блоки, финальное_количество_страниц)
     """
     if work_dir is None:
         work_dir = os.path.dirname(tmp_in)
@@ -7218,8 +5907,9 @@ async def precise_page_adjustment(
         elif diff > 0:
             # Всегда обрезаем если перебор (даже +1), чтобы не было +1 над целью
             pass  # continue to trim
-        # Никаких «почти совпало»: пользователь заказал точное число страниц.
-        # Продолжаем подгонку, пока diff не станет 0 или пока не исчерпаны итерации.
+        elif it >= 10 and abs(diff) <= 1:
+            print(f"[ADJUST] ✅ Приемлемая цель достигнута на поздней итерации: {real_pages} стр.")
+            break
         
         # Рассчитываем сколько символов нужно добавить/убрать
         chars_per_real_page = calculate_chars_per_page(gost)
@@ -7236,17 +5926,10 @@ async def precise_page_adjustment(
             # Если обрезка упёрлась в floor и реально ничего не удалила —
             # дальнейшие итерации бессмысленны (мы защищаем целостность глав).
             if _before - _after < max(50, chars_to_remove // 10):
-                # Если перебор вызван картинками, сначала уменьшаем их ширину и
-                # продолжаем точную подгонку, а не отдаём +1/+2 страницы.
-                if data.get("images") and float(gost.get("image_width_cm", 10.0)) > 4.0:
-                    old_w = float(gost.get("image_width_cm", 10.0))
-                    gost["image_width_cm"] = max(4.0, old_w - 1.0)
-                    print(f"[ADJUST] 🖼 Уменьшаю ширину изображений: {old_w} см → {gost['image_width_cm']} см")
-                else:
-                    print(f"[ADJUST] ⛔ Обрезка упёрлась в порог целостности "
-                          f"({_before - _after} зн. из {chars_to_remove}). "
-                          f"Точная цель пока недостижима: {real_pages} стр. вместо {target_pages}.")
-                    break
+                print(f"[ADJUST] ⛔ Обрезка упёрлась в порог целостности "
+                      f"({_before - _after} зн. из {chars_to_remove}). "
+                      f"Останавливаюсь: {real_pages} стр. вместо {target_pages}.")
+                break
         else:
             # Слишком мало страниц — добавляем
             chars_to_add = int(abs(diff) * chars_per_real_page)
@@ -7351,15 +6034,13 @@ async def parse_custom_gost_via_ai(model_key: str, gost_text: str) -> dict:
 
 # ═══════════════════════════════════════════════════════════════
 #  КЛАВИАТУРЫ — КРАСИВЫЕ
-# ════════════════���══════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
 
 def kb_doc_type() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     for k, v in DOC_TYPES.items():
         label = f"{v['name']}  {v['min_pages']}–{v['max_pages']} стр."
         b.button(text=label, callback_data=f"dtype_{k}")
-    # Кнопка настройки ГОСТ в начальных сообщениях
-    b.button(text="⚙️ Настроить ГОСТ", callback_data="custom_gost")
     b.adjust(1)
     return b.as_markup()
 
@@ -7431,37 +6112,6 @@ def kb_page_number() -> InlineKeyboardMarkup:
     )
 
 
-def kb_image_mode() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🖼 С изображениями", callback_data="images_yes")],
-            [InlineKeyboardButton(text="📄 Без изображений", callback_data="images_no")],
-        ]
-    )
-
-
-def kb_image_count(pages: int) -> InlineKeyboardMarkup:
-    auto_count = _image_count_for_pages(pages)
-    max_count = max(1, MAX_WORK_IMAGES)
-    rows = [
-        [InlineKeyboardButton(text=f"📐 По ГОСТ/авто — {auto_count} шт.", callback_data="imgcount_auto")],
-        [
-            InlineKeyboardButton(text="1", callback_data="imgcount_1"),
-            InlineKeyboardButton(text="2", callback_data="imgcount_2"),
-            InlineKeyboardButton(text="3", callback_data="imgcount_3"),
-        ],
-    ]
-    if max_count >= 5:
-        rows.append([
-            InlineKeyboardButton(text="4", callback_data="imgcount_4"),
-            InlineKeyboardButton(text="5", callback_data="imgcount_5"),
-            InlineKeyboardButton(text="✏️ Своё", callback_data="imgcount_custom"),
-        ])
-    else:
-        rows.append([InlineKeyboardButton(text="✏️ Своё", callback_data="imgcount_custom")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
 def kb_humanize() -> InlineKeyboardMarkup:
     # Оставлено только для совместимости со старыми сообщениями Telegram.
     # Опечатки и искусственные неточности отключены в обработчике.
@@ -7520,435 +6170,6 @@ def kb_back_cancel() -> InlineKeyboardMarkup:
 #  FSM СОСТОЯНИЯ
 # ═══════════════════════════════════════════════════════════════
 
-# ============================================================
-# УНИВЕРСАЛЬНАЯ ПРОВЕРКА ТЕМЫ И ДИСЦИПЛИНЫ (БЕЗ ХАРДКОДА)
-# ============================================================
-
-async def verify_discipline_relevance_universal(
-    model_key: str,
-    topic: str,
-    subject: str,
-    doc_type: str = "",
-) -> tuple[bool, str, list[str]]:
-    """Универсальная проверка соответствия темы и дисциплины."""
-    if not topic or not subject:
-        return False, "Тема или дисциплина не указаны", []
-
-    system = (
-        "Ты — эксперт по академическим дисциплинам. Оцени, соответствует ли тема "
-        "заявленной учебной дисциплине. Будь строгим: если тема слишком общая, "
-        "состоит только из имени/персоны/объекта/события и в ней не указан аспект "
-        "выбранной дисциплины, верни match=false, даже если связь можно придумать.\n\n"
-        'Ответ в формате JSON: {"match": true|false, "reason": "...", "suggested": ["..."]}'
-    )
-
-    user = (
-        f"Тема: «{topic}»\n"
-        f"Дисциплина: «{subject}»\n"
-        "Оцени соответствие. Если связь неочевидна, объясни коротко и предложи "
-        "в поле suggested более подходящие дисциплины для этой темы."
-    )
-
-    try:
-        raw, _ = await chat_with_fallback(
-            model_key,
-            [{"role": "system", "content": system}, {"role": "user", "content": user}],
-            max_tokens=400,
-        )
-        m = re.search(r"\{.*\}", raw, flags=re.S)
-        if m:
-            data = json.loads(m.group(0))
-            suggested = data.get("suggested", [])
-            if isinstance(suggested, list):
-                suggested = [s.strip() for s in suggested if s.strip()]
-            return (bool(data.get("match", True)), str(data.get("reason", "")).strip(), suggested[:5])
-    except Exception as e:
-        print(f"[RELEVANCE] Ошибка: {e}")
-
-    return True, "проверка недоступна", []
-
-def extract_topic_keywords(topic: str) -> list[str]:
-    """Извлекает ключевые слова из темы."""
-    if not topic:
-        return []
-    stopwords = {"тема", "работа", "исследование", "анализ", "роль", "значение",
-                 "основы", "особенности", "проблемы", "вопросы", "современный",
-                 "современная", "современное", "развитие", "система", "метод",
-                 "методы", "подход", "подходы", "россии", "российской", "российский"}
-    words = re.findall(r'[A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё\-]{3,}', topic.lower())
-    keywords = []
-    seen = set()
-    for w in words:
-        w = w.strip("-–—_")
-        if w not in stopwords and w not in seen and len(w) >= 4:
-            seen.add(w)
-            keywords.append(w)
-    return keywords[:10]
-
-def map_keywords_to_disciplines(keywords: list[str]) -> list[str]:
-    """Универсальное сопоставление ключевых слов с дисциплинами."""
-    if not keywords:
-        return []
-    discipline_groups = {
-        "Информатика": ["компьютер", "программ", "алгоритм", "данн", "информац", "цифр", "вычисл"],
-        "Математика": ["числ", "уравнени", "функц", "вероятност", "статистик"],
-        "Физика": ["энерг", "движени", "волн", "пол", "атом", "квант"],
-        "Биология": ["клетк", "ген", "эволюц", "организм", "вид", "белк"],
-        "История": ["событи", "период", "век", "войн", "государств"],
-        "Философия": ["сущност", "сознани", "быти", "познани", "этик"],
-        "Психология": ["личность", "восприяти", "поведени", "эмоц", "психик"],
-        "Экономика": ["рынок", "финанс", "капитал", "инвестиц", "производств"],
-        "Литература": ["поэт", "роман", "рассказ", "стих", "жанр"],
-        "Русский язык": ["язык", "речь", "грамматик", "морфолог", "синтаксис"],
-    }
-    matched = set()
-    for kw in keywords:
-        kw_lower = kw.lower()
-        for discipline, markers in discipline_groups.items():
-            for marker in markers:
-                if marker in kw_lower or kw_lower in marker:
-                    matched.add(discipline)
-                    break
-    if not matched:
-        return ["Литература", "История", "Обществознание", "Русский язык", "Философия"]
-    return list(matched)[:5]
-
-async def check_and_suggest_discipline_universal(
-    model_key: str, topic: str, subject: str, doc_type: str = "",
-) -> tuple[bool, str, list[str]]:
-    """Универсальная проверка соответствия темы и дисциплины."""
-    keywords = extract_topic_keywords(topic)
-    suggested_by_keywords = map_keywords_to_disciplines(keywords)
-    subject_lower = subject.lower()
-    is_in_suggested = any(d.lower() in subject_lower or subject_lower in d.lower() for d in suggested_by_keywords)
-    
-    if is_in_suggested:
-        return True, "", suggested_by_keywords
-    
-    match, reason, suggested_by_ai = await verify_discipline_relevance_universal(model_key, topic, subject, doc_type)
-    all_suggested = list(dict.fromkeys(suggested_by_ai + suggested_by_keywords)) or ["Литература", "История", "Обществознание", "Философия"]
-    
-    if match:
-        return True, "", all_suggested[:5]
-    
-    suggested_list = "\n".join(f"  • {d}" for d in all_suggested[:5])
-    message = (f"⚠️ <b>Внимание!</b>\n\nТема «{topic}» может не совсем соответствовать дисциплине «{subject}».\n\n"
-               f"<b>Причина:</b> {reason}\n\n<b>Рекомендуемые дисциплины:</b>\n{suggested_list}\n\n"
-               f"Вы можете:\n1️⃣ <b>Изменить дисциплину</b> — выберите из списка\n"
-               f"2️⃣ <b>Уточнить тему</b>\n3️⃣ <b>Продолжить</b> — если уверены")
-    
-
-    return False, message, all_suggested[:5]
-
-
-def _short_btn(text: str, limit: int = 58) -> str:
-    """Короткая подпись для inline-кнопки."""
-    text = " ".join((text or "").split())
-    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
-
-
-def _fallback_topic_suggestions(topic: str, subject: str) -> list[str]:
-    """Надёжные варианты уточнения темы, если ИИ-подсказки недоступны."""
-    topic = " ".join((topic or "").split()).strip(" .") or "выбранной темы"
-    subject_l = (subject or "").lower()
-
-    if any(x in subject_l for x in ("юрис", "прав", "закон")):
-        if "байден" in topic.lower() or "biden" in topic.lower():
-            return [
-                "Правовые аспекты политики администрации Джо Байдена в области иммиграции",
-                "Конституционные вопросы, связанные с указами президента Джо Байдена",
-                "Правовое регулирование внешней политики США в период администрации Джо Байдена",
-            ]
-        return [
-            f"Правовые аспекты темы «{topic}»",
-            f"Конституционно-правовые вопросы, связанные с темой «{topic}»",
-            f"Юридическая ответственность и правовое регулирование в контексте темы «{topic}»",
-        ]
-    if "истор" in subject_l:
-        return [
-            f"Исторические предпосылки и последствия темы «{topic}»",
-            f"Тема «{topic}» в историческом контексте",
-            f"Хронология и источники по теме «{topic}»",
-        ]
-    if "эконом" in subject_l:
-        return [
-            f"Экономические аспекты темы «{topic}»",
-            f"Влияние темы «{topic}» на экономические процессы",
-            f"Финансово-экономическая оценка темы «{topic}»",
-        ]
-    if "психолог" in subject_l:
-        return [
-            f"Психологические аспекты ��емы «{topic}»",
-            f"Влияние темы «{topic}» на поведение и восприятие человека",
-            f"Социально-психологический анализ темы «{topic}»",
-        ]
-
-    return [
-        f"{subject}: основные аспекты темы «{topic}»",
-        f"Анализ темы «{topic}» в рамках дисциплины «{subject}»",
-        f"Проблемы и методы изучения темы «{topic}» по дисциплине «{subject}»",
-    ]
-
-
-async def suggest_subject_focused_topics(
-    model_key: str,
-    topic: str,
-    subject: str,
-    reason: str = "",
-    n: int = 3,
-) -> list[str]:
-    """Предлагает темы, переформулированные под выбранную дисциплину."""
-    fallback = _fallback_topic_suggestions(topic, subject)
-    system = (
-        "Ты — методист. Нужно переформулировать тему учебной работы так, чтобы она "
-        "явно соответствовала указанной дисциплине. Верни СТРОГО JSON без markdown: "
-        '{"topics": ["...", "...", "..."]}. '
-        "Каждая тема должна быть конкретной, академичной, на русском языке, до 120 символов. "
-        "Не предлагай менять дисциплину — только уточняй тему под неё."
-    )
-    user = (
-        f"Исходная тема: «{topic}»\n"
-        f"Дисциплина: «{subject}»\n"
-        f"Причина сомнения: {reason or 'тема слишком общая или неочевидно связана с дисциплиной'}\n"
-        f"Дай {n} подходящих варианта темы."
-    )
-    try:
-        raw, _ = await chat_with_fallback(
-            model_key,
-            [{"role": "system", "content": system}, {"role": "user", "content": user}],
-            max_tokens=500,
-        )
-        m = re.search(r"\{.*\}", raw or "", flags=re.S)
-        if m:
-            data = json.loads(m.group(0))
-            topics = data.get("topics", [])
-            if isinstance(topics, list):
-                cleaned = []
-                for t in topics:
-                    t = " ".join(str(t).split()).strip(" \"'«»")
-                    if t and t not in cleaned:
-                        cleaned.append(t)
-                if cleaned:
-                    return cleaned[:n]
-    except Exception as e:
-        print(f"[RELEVANCE] Не удалось получить варианты тем: {e}")
-    return fallback[:n]
-
-
-def _fallback_subject_suggestions(topic: str, current_subject: str = "") -> list[str]:
-    """Резервные варианты предметов, если ИИ-подсказки недоступны."""
-    topic_l = (topic or "").lower()
-    if "байден" in topic_l or "biden" in topic_l:
-        base = ["Политология", "История", "Международные отношения", "Обществознание"]
-    elif any(x in topic_l for x in ("президент", "выбор", "парламент", "партия", "государств")):
-        base = ["Политология", "Обществознание", "История", "Право"]
-    elif any(x in topic_l for x in ("рынок", "финанс", "банк", "эконом")):
-        base = ["Экономика", "Менеджмент", "Обществознание"]
-    elif any(x in topic_l for x in ("роман", "стих", "поэт", "литератур")):
-        base = ["Литература", "Русский язык", "История"]
-    elif any(x in topic_l for x in ("компьют", "алгоритм", "данн", "программ", "ии", "нейросет")):
-        base = ["Информатика", "Математика", "Технология"]
-    else:
-        base = ["Обществознание", "История", "Филос��фия", "Социология"]
-
-    cur = (current_subject or "").lower()
-    return [s for s in base if s.lower() != cur][:3]
-
-
-async def suggest_suitable_subjects(
-    model_key: str,
-    topic: str,
-    current_subject: str = "",
-    n: int = 3,
-) -> list[str]:
-    """Предлагает предметы, к которым исходная тема подходит без изменения."""
-    fallback = _fallback_subject_suggestions(topic, current_subject)
-    system = (
-        "Ты — методист. Нужно подобрать учебные дисциплины, которым исходная тема "
-        "подходит лучше всего без изменения темы. Верни СТРОГО JSON без markdown: "
-        '{"subjects": ["...", "...", "..."]}. '
-        "Названия дисциплин должны быть короткими: например, История, Политология, "
-        "Обществознание, Экономика, Юриспруденция."
-    )
-    user = (
-        f"Исходная тема: «{topic}»\n"
-        f"Текущая дисциплина: «{current_subject}»\n"
-        f"Дай {n} более подходящих дисциплины для этой темы."
-    )
-    try:
-        raw, _ = await chat_with_fallback(
-            model_key,
-            [{"role": "system", "content": system}, {"role": "user", "content": user}],
-            max_tokens=350,
-        )
-        m = re.search(r"\{.*\}", raw or "", flags=re.S)
-        if m:
-            data = json.loads(m.group(0))
-            subjects = data.get("subjects", [])
-            if isinstance(subjects, list):
-                cleaned = []
-                cur = (current_subject or "").lower()
-                for subj in subjects:
-                    subj = " ".join(str(subj).split()).strip(" \"'«»")
-                    if subj and subj.lower() != cur and subj not in cleaned:
-                        cleaned.append(subj)
-                if cleaned:
-                    return cleaned[:n]
-    except Exception as e:
-        print(f"[RELEVANCE] Не удалось получить варианты предметов: {e}")
-    return fallback[:n]
-
-
-async def check_topic_subject_warning(
-    model_key: str,
-    topic: str,
-    subject: str,
-    doc_type: str = "",
-) -> tuple[bool, str, list[str], list[str]]:
-    """Проверяет связку тема/дисциплина и готовит подсказки для изменения темы/предмета."""
-    topic_clean = " ".join((topic or "").split())
-    subject_clean = " ".join((subject or "").split())
-    if not topic_clean or not subject_clean:
-        return True, "", [], []
-
-    # Короткие темы из 1-2 слов часто не показывают дисциплинарный аспект:
-    # «Байден» для юриспруденции, «Байкал» для информатики и т.п.
-    significant_words = re.findall(r"[A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё\-]{2,}", topic_clean)
-    too_general = len(significant_words) <= 2 and len(topic_clean) <= 40
-
-    match, reason, _ = await verify_discipline_relevance_universal(
-        model_key, topic_clean, subject_clean, doc_type
-    )
-
-    if match and not too_general:
-        return True, "", [], []
-
-    if too_general and match:
-        reason = "тема сформулирована слишком общо, предметный аспект не указан явно"
-
-    topic_suggestions = await suggest_subject_focused_topics(
-        model_key, topic_clean, subject_clean, reason=reason, n=3
-    )
-    subject_suggestions = await suggest_suitable_subjects(
-        model_key, topic_clean, current_subject=subject_clean, n=3
-    )
-    return (
-        False,
-        reason or "связь темы с дисциплиной неочевидна",
-        topic_suggestions,
-        subject_suggestions,
-    )
-
-
-def kb_topic_relevance_options(
-    topic_suggestions: list[str],
-    subject_suggestions: Optional[list[str]] = None,
-) -> InlineKeyboardMarkup:
-    """Кнопки под предупреждением о неочевидной связи темы и дисциплины."""
-    rows: list[list[InlineKeyboardButton]] = []
-
-    for i, topic in enumerate((topic_suggestions or [])[:3]):
-        rows.append([
-            InlineKeyboardButton(
-                text=f"✅ Тема: {_short_btn(topic, 50)}",
-                callback_data=f"topic_suggest_{i}",
-            )
-        ])
-
-    for i, subj in enumerate((subject_suggestions or [])[:3]):
-        rows.append([
-            InlineKeyboardButton(
-                text=f"📚 Предмет: {_short_btn(subj, 48)}",
-                callback_data=f"topic_subject_{i}",
-            )
-        ])
-
-    rows.append([
-        InlineKeyboardButton(text="✏️ Написать свою тему", callback_data="topic_custom"),
-        InlineKeyboardButton(text="📚 Другой предмет", callback_data="topic_subject_custom"),
-    ])
-    rows.append([InlineKeyboardButton(text="➡️ Продолжить генерацию", callback_data="topic_continue")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def topic_relevance_warning_text(
-    topic: str,
-    subject: str,
-    topic_suggestions: list[str],
-    subject_suggestions: Optional[list[str]] = None,
-) -> str:
-    """Текст предупреждения, как в примере пользователя."""
-    topic_h = html.escape(topic or "")
-    subject_h = html.escape(subject or "")
-    examples = " или ".join(f"«{html.escape(t)}»" for t in (topic_suggestions or [])[:2])
-    subjects = ", ".join(html.escape(s) for s in (subject_suggestions or [])[:3])
-    advice = (
-        f" например: {examples}." if examples else
-        " указав предметный аспект, метод или правовой/научный контекст."
-    )
-    subject_advice = f"\n\n📚 <b>Или измените предмет</b> на более подходящий для этой темы: {subjects}." if subjects else ""
-    return (
-        "⚠️ <b>Внимание: неочевидная связь!</b>\n\n"
-        f"Тема <i>«{topic_h}»</i> может плохо соответствовать дисциплине "
-        f"<i>«{subject_h}»</i>.\n\n"
-        "💡 <b>Совет:</b> Уточните тему, сфокусировавшись на аспектах выбранной дисциплины,"
-        f"{advice}"
-        f"{subject_advice}\n\n"
-        "Вы можете изменить тему, изменить предмет, написать свой вариант или продолжить генерацию."
-    )
-
-
-async def proceed_to_city_prompt(event: Message, state: FSMContext, *, edit: bool = False) -> None:
-    """Переход к выбору города после подтверждения/изменения темы."""
-    text = "🌆 <b>Выберите город</b>:"
-    if edit:
-        await event.edit_text(text, reply_markup=with_back(kb_city()), parse_mode="HTML")
-    else:
-        await event.answer(text, reply_markup=with_back(kb_city()), parse_mode="HTML")
-    await state.set_state(WorkState.city)
-
-
-async def handle_subject_selected(event: Message, state: FSMContext, subject: str, *, edit: bool = False) -> None:
-    """Сохраняет предмет и при необходимости показывает предупреждение по теме."""
-    await state.update_data(subject=subject)
-    data = await state.get_data()
-    topic = (data.get("topic", "") or "").strip()
-    doc_type = data.get("doc_type", "")
-
-    ok, _reason, topic_suggestions, subject_suggestions = await check_topic_subject_warning(
-        FREE_MODEL_KEY, topic, subject, doc_type
-    )
-    if ok:
-        prefix = f"✅ Предмет: <b>{html.escape(subject)}</b>\n\n"
-        if edit:
-            await event.edit_text(
-                prefix + "🌆 <b>Выберите город</b>:",
-                reply_markup=with_back(kb_city()),
-                parse_mode="HTML",
-            )
-            await state.set_state(WorkState.city)
-        else:
-            await event.answer(
-                prefix + "🌆 <b>Выберите город</b>:",
-                reply_markup=with_back(kb_city()),
-                parse_mode="HTML",
-            )
-            await state.set_state(WorkState.city)
-        return
-
-    await state.update_data(
-        topic_suggestions=topic_suggestions,
-        subject_suggestions=subject_suggestions,
-    )
-    text = topic_relevance_warning_text(topic, subject, topic_suggestions, subject_suggestions)
-    markup = kb_topic_relevance_options(topic_suggestions, subject_suggestions)
-    if edit:
-        await event.edit_text(text, reply_markup=markup, parse_mode="HTML")
-    else:
-        await event.answer(text, reply_markup=markup, parse_mode="HTML")
-    await state.set_state(WorkState.topic_adjustment)
-
-
 class WorkState(StatesGroup):
     doc_type           = State()
     custom_doc_name    = State()
@@ -7967,14 +6188,10 @@ class WorkState(StatesGroup):
     city               = State()
     pages              = State()
     page_number_position = State()
-    image_mode         = State()
-    image_count        = State()
     model              = State()
     payment            = State()
     humanize           = State()
-    topic_adjustment   = State()
     gost_free_text     = State()
-    fix_docx_confirm   = State()  # FIX CRIT-1: режим исправления готового DOCX
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -8070,43 +6287,6 @@ def _mode_paid_text() -> str:
 #  ХЭНДЛЕРЫ — /start и общие команды
 # ═══════════════════════════════════════════════════════════════
 
-async def _extract_docx_text(bot: "Bot", document) -> tuple[str, str]:
-    """Скачивает DOCX из Telegram и извлекает текст.
-
-    Возвращает (text, error). text — извлечённый текст (без markdown),
-    error — пустая строка при успехе, иначе описание ошибки.
-    """
-    if not document:
-        return "", "документ не передан"
-    try:
-        file = await bot.get_file(document.file_id)
-        buf = io.BytesIO()
-        await bot.download_file(file.file_path, buf)
-        buf.seek(0)
-        doc = Document(buf)
-        paras: list[str] = []
-        for p in doc.paragraphs:
-            t = (p.text or "").strip()
-            if t:
-                paras.append(t)
-        # Таблицы тоже
-        for tbl in doc.tables:
-            for row in tbl.rows:
-                for cell in row.cells:
-                    t = (cell.text or "").strip()
-                    if t:
-                        paras.append(t)
-        if not paras:
-            return "", "документ пустой или не содержит читаемого текста"
-        text = "\n\n".join(paras)
-        # Ограничиваем размер для ИИ-контекста (12 000 символов)
-        if len(text) > 12000:
-            text = text[:12000].rsplit(" ", 1)[0] + "…"
-        return text, ""
-    except Exception as e:
-        return "", f"не удалось прочитать документ: {e}"
-
-
 @dp.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.clear()
@@ -8138,259 +6318,6 @@ async def cmd_help(message: Message, state: FSMContext) -> None:
         parse_mode="HTML",
     )
 
-
-
-
-# ═══════════════════════════════════════════════════════════════
-#  FIX CRIT-1: ИСПРАВЛЕНИЕ ГОТОВОГО DOCX (ссылки + библиография)
-# ═══════════════════════════════════════════════════════════════
-
-async def process_docx_fix(
-    bot: "Bot",
-    chat_id: int,
-    document,
-    state: FSMContext,
-) -> None:
-    """Обрабатывает загруженный DOCX: исправляет ссылки, библиографию, очищает по ГОСТ 7.32."""
-    wait_msg = await bot.send_message(
-        chat_id,
-        "⏳ <b>Анализирую и исправляю документ...</b>\n\n"
-        "🔍 Ищу ошибки в ссылках и библиографии...",
-        parse_mode="HTML",
-    )
-
-    try:
-        # 1. Скачиваем файл
-        file = await bot.get_file(document.file_id)
-        buf = io.BytesIO()
-        await bot.download_file(file.file_path, buf)
-        buf.seek(0)
-
-        # 2. Читаем DOCX
-        from docx import Document
-        doc = Document(buf)
-
-        # 3. Извлекаем текст по параграфам + стили
-        paragraphs_data = []
-        full_text_parts = []
-        for p in doc.paragraphs:
-            t = (p.text or "").strip()
-            style = p.style.name if p.style else "Normal"
-            paragraphs_data.append({"text": p.text or "", "style": style})
-            if t:
-                full_text_parts.append(t)
-
-        # Таблицы тоже
-        table_texts = []
-        for tbl in doc.tables:
-            for row in tbl.rows:
-                for cell in row.cells:
-                    t = (cell.text or "").strip()
-                    if t:
-                        table_texts.append(t)
-
-        full_text = "\n\n".join(full_text_parts + table_texts)
-        if not full_text.strip():
-            await wait_msg.edit_text(
-                "❌ <b>Документ пуст или не содержит читаемого текста.</b>",
-                parse_mode="HTML",
-            )
-            return
-
-        await wait_msg.edit_text(
-            "⏳ <b>Исправляю ссылки и библиографию...</b>\n\n"
-            f"📄 Обнаружено {len(paragraphs_data)} параграфов.\n"
-            "📝 Применяю цепочку очисток по ГОСТ 7.32...",
-            parse_mode="HTML",
-        )
-
-        # 4. Применяем цепочку очисток
-        n_sources = _count_sources(full_text)
-        global_page_map = _build_page_map(full_text)
-
-        cleaned_paragraphs = []
-        is_bib_block = False
-        for pd in paragraphs_data:
-            text = pd["text"]
-            if not text.strip():
-                cleaned_paragraphs.append({"text": text, "style": pd["style"]})
-                continue
-
-            upper = text.upper()
-            if any(kw in upper for kw in ("СПИСОК ИСПОЛЬЗОВАННЫХ ИСТОЧНИКОВ", "СПИСОК ЛИТЕРАТУРЫ",
-                                            "БИБЛИОГРАФ", "ИСТОЧНИКИ", "ЛИТЕРАТУРА")):
-                is_bib_block = True
-                cleaned_paragraphs.append({"text": text, "style": pd["style"]})
-                continue
-
-            if is_bib_block and text.strip() and not text.strip()[0].isdigit():
-                if any(kw in upper for kw in ("ПРИЛОЖЕНИЕ", "ЗАКЛЮЧЕНИЕ", "ВВЕДЕНИЕ", "ГЛАВА")):
-                    is_bib_block = False
-
-            if is_bib_block:
-                cleaned = _normalize_bibliography(text)
-            else:
-                cleaned = text
-                cleaned = _repair(cleaned)
-                cleaned = _fix_citations(cleaned, n_sources=n_sources)
-                cleaned = _fill_missing_pages(cleaned, global_page_map=global_page_map)
-                cleaned = re.sub(r"\*\*(.*?)\*\*", r"\1", cleaned)
-                cleaned = re.sub(r"\s*#{1,6}\s+", "", cleaned)
-
-            cleaned_paragraphs.append({"text": cleaned, "style": pd["style"]})
-
-        # 5. Пересобираем DOCX
-        from docx.shared import Pt, Cm, RGBColor
-        from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING
-        from docx.oxml.ns import qn
-
-        new_doc = Document()
-        try:
-            style = new_doc.styles["Normal"]
-            font = style.font
-            font.name = "Times New Roman"
-            font.size = Pt(14)
-            style.element.rPr.rFonts.set(qn("w:eastAsia"), "Times New Roman")
-        except Exception:
-            pass
-
-        for cp in cleaned_paragraphs:
-            p = new_doc.add_paragraph()
-            if "Heading" in cp["style"] or "Заголовок" in cp["style"]:
-                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            run = p.add_run(cp["text"])
-            run.font.name = "Times New Roman"
-            run.font.size = Pt(14)
-            run.element.rPr.rFonts.set(qn("w:eastAsia"), "Times New Roman")
-            if "Heading" not in cp["style"] and "Заголовок" not in cp["style"]:
-                p.paragraph_format.first_line_indent = Cm(1.25)
-                p.paragraph_format.line_spacing = 1.5
-
-        # 6. Сохраняем
-        out_buf = io.BytesIO()
-        new_doc.save(out_buf)
-        out_buf.seek(0)
-        fixed_bytes = out_buf.read()
-
-        # 7. Отправляем
-        await wait_msg.delete()
-
-        fname = (document.file_name or "fixed_document").replace(".docx", "_fixed.docx")
-        await bot.send_document(
-            chat_id,
-            BufferedInputFile(fixed_bytes, filename=fname),
-            caption=(
-                "✅ <b>Документ исправлен!</b>\n\n"
-                "🔧 Что было сделано:\n"
-                "  • Ссылки [N] → [N, с. X] (добавлены номера страниц)\n"
-                "  • Библиография приведена к формату ГОСТ 7.32\n"
-                "  • Убраны артефакты markdown\n"
-                "  • Очищены битые ссылки\n\n"
-                "⚠️ Проверьте список литературы — замените маркеры [ВСТАВЬТЕ РЕАЛЬНЫЙ ИСТОЧНИК] на реальные источники."
-            ),
-            parse_mode="HTML",
-        )
-
-    except Exception as e:
-        print(f"[FIX DOCX] Ошибка: {e}")
-        await wait_msg.edit_text(
-            f"❌ <b>Не удалось исправить документ.</b>\n\n"
-            f"<b>Причина:</b> {html.escape(str(e)[:200])}\n\n"
-            f"Попробуйте отправить файл повторно или начните новую генерацию — /start",
-            parse_mode="HTML",
-        )
-
-
-@dp.message(F.document)
-async def h_document(message: Message, state: FSMContext) -> None:
-    """FIX 7.32-H: обработчик входящих DOCX/PDF/документов.
-
-    Поведение:
-      • Если пользователь в WorkState.source_content — скачиваем файл,
-        извлекаем текст и используем его как материал для ИИ.
-      • В любом другом состоянии — извлекаем текст из DOCX/DOC/PDF,
-        сохраняем как материалы и предлагаем начать новую работу
-        на основе извлечённого текста.
-      • Если формат не поддерживается — отвечаем дружелюбным сообщением.
-    """
-    document = message.document
-    cur_state = await state.get_state()
-    mime = (document.mime_type or "").lower() if document else ""
-    fname = (document.file_name or "").lower() if document else ""
-
-    # ── Проверка поддерживаемых форматов ──
-    is_docx = (
-        mime.startswith("application/vnd.openxmlformats-officedocument.wordprocessingml")
-        or fname.endswith(".docx") or fname.endswith(".doc")
-    )
-    is_pdf = mime == "application/pdf" or fname.endswith(".pdf")
-
-    if not (is_docx or is_pdf):
-        await message.answer(
-            "❌ Принимаю только <b>DOCX</b> или <b>PDF</b>.\n\n"
-            "<i>Пришлите файл с планом, конспектом или тезисами — ИИ использует это как основу.</i>",
-            parse_mode="HTML",
-            reply_markup=kb_back_cancel(),
-        )
-        return
-
-    # ── Извлечение текста из документа ──
-    wait = await message.answer(
-        "⏳ <b>Читаю документ...</b>",
-        parse_mode="HTML",
-    )
-    text, err = await _extract_docx_text(message.bot, document)
-    try:
-        await wait.delete()
-    except Exception:
-        pass
-
-    if err or not text:
-        await message.answer(
-            f"❌ Не удалось извлечь текст из файла.\n\n<b>Причина:</b> {html.escape(err or 'неизвестная ошибка')}\n\n"
-            "Пришлите <b>DOCX</b> с планом/конспектом или просто вставьте текст сообщением.",
-            parse_mode="HTML",
-            reply_markup=kb_back_cancel(),
-        )
-        return
-
-    # ── Сохраняем извлечённый текст ──
-    await state.update_data(source_content=text)
-
-    # ── Если пользователь в WorkState.source_content — продолжаем flow ──
-    if cur_state == WorkState.source_content.state:
-        await message.answer(
-            f"✅ Документ принят! Извлечено <b>{len(text)} символов</b> текста.\n\n"
-            "🏛 <b>Тип учебного заведения</b>:",
-            reply_markup=with_back(kb_institution()),
-            parse_mode="HTML",
-        )
-        await state.set_state(WorkState.institution_type)
-        return
-
-    # ── В любом другом состоянии: предлагаем начать новую работу ИЛИ исправить файл ──
-    preview = text[:300].replace("\n", " ").strip()
-    if len(text) > 300:
-        preview += "…"
-
-    # Сохраняем документ для возможного исправления
-    await state.update_data(fix_docx_document=document.model_dump())
-
-    await message.answer(
-        f"📄 <b>Документ получен!</b>\n\n"
-        f"Извлечено <b>{len(text)} символов</b> текста.\n\n"
-        f"<i>Превью:</i> <code>{html.escape(preview[:200])}</code>\n\n"
-        f"<b>Что сделать с файлом?</b>",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="🔧 Исправить ссылки и библиографию", callback_data="fix_docx_yes")],
-                [InlineKeyboardButton(text="🚀 Создать новую работу по этим материалам", callback_data="final_new")],
-                [InlineKeyboardButton(text="📎 Добавить ещё материалы текстом", callback_data="source_add_text")],
-            ]
-        ),
-    )
-    await state.set_state(WorkState.fix_docx_confirm)
 
 @dp.message(Command("limits"))
 async def cmd_limits(message: Message) -> None:
@@ -8513,8 +6440,6 @@ async def h_back_flow(cb: CallbackQuery, state: FSMContext) -> None:
             kb_back_cancel(),
             WorkState.teacher,
         )
-    elif cur == WorkState.topic_adjustment.state:
-        await edit("📚 <b>Выберите дисциплину (предмет)</b>", with_back(kb_subject()), WorkState.subject)
     elif cur == WorkState.city.state:
         await edit("📚 <b>Выберите дисциплину (предмет)</b>", with_back(kb_subject()), WorkState.subject)
     elif cur == WorkState.pages.state:
@@ -8523,21 +6448,6 @@ async def h_back_flow(cb: CallbackQuery, state: FSMContext) -> None:
     # 4. Параметры генерации
     elif cur == WorkState.page_number_position.state:
         await edit(_pages_prompt_text(data, cb.from_user.id), kb_back_cancel(), WorkState.pages)
-    elif cur == WorkState.image_mode.state:
-        await edit(
-            f"✅ Страниц: <b>{int(data.get('pages', 10))}</b>\n\n"
-            "🔢 <b>Нумерация страниц — где расположить?</b>",
-            with_back(kb_page_number()),
-            WorkState.page_number_position,
-        )
-    elif cur == WorkState.image_count.state:
-        await edit(
-            "🖼 <b>Добавить изображения в работу?</b>\n\n"
-            "• <b>Без изображений</b> — обычная работа.\n"
-            "• <b>С изображениями</b> — только реальные фото из бесплатных источников.",
-            with_back(kb_image_mode()),
-            WorkState.image_mode,
-        )
     elif cur == WorkState.humanize.state:
         await edit(
             f"✅ Страниц: <b>{int(data.get('pages', 10))}</b>\n\n"
@@ -8870,19 +6780,39 @@ async def h_group(message: Message, state: FSMContext) -> None:
 
 @dp.message(WorkState.author)
 async def h_author(message: Message, state: FSMContext) -> None:
-    raw = (message.text or "").strip()
-    ok, value = _validate_fio(raw, kind="ФИО автора")
-    if not ok:
+    author = (message.text or "").strip()
+
+    # Валидация
+    words = author.split()
+    if len(words) < 2 or _is_garbage(author):
         await message.answer(
-            value,
+            "❌ Введите полные ФИО (минимум имя и фамилия) без случайных символов\n\n"
+            "<i>Пример: Иванов Иван Иванович</i>",
             parse_mode="HTML",
             reply_markup=kb_back_cancel(),
         )
         return
-    author = value
+
+    if any(len(w) == 1 for w in words):
+        await message.answer(
+            "❌ Не используйте однобуквенные сокращения\n\n"
+            "<i>Пример: Иванов Иван Иванович</i>",
+            parse_mode="HTML",
+            reply_markup=kb_back_cancel(),
+        )
+        return
+
+    if len(author) < 5:
+        await message.answer(
+            "❌ ФИО слишком короткое\n\n"
+            "<i>Пример: Иванов Иван Иванович</i>",
+            parse_mode="HTML",
+            reply_markup=kb_back_cancel(),
+        )
+        return
+
     await state.update_data(author=author)
     await message.answer(
-        f"✅ <b>ФИО автора:</b> {html.escape(author)}\n\n"
         "👨‍🏫 <b>Введите ФИО преподавателя</b>\n\n<i>Пример: Петров Пётр Петрович</i>",
         parse_mode="HTML",
         reply_markup=kb_back_cancel(),
@@ -8892,19 +6822,30 @@ async def h_author(message: Message, state: FSMContext) -> None:
 
 @dp.message(WorkState.teacher)
 async def h_teacher(message: Message, state: FSMContext) -> None:
-    raw = (message.text or "").strip()
-    ok, value = _validate_fio(raw, kind="ФИО преподавателя")
-    if not ok:
+    teacher = (message.text or "").strip()
+
+    # Валидация
+    words = teacher.split()
+    if len(words) < 2 or _is_garbage(teacher):
         await message.answer(
-            value,
+            "❌ Введите полные ФИО преподавателя (минимум имя и фамилия) без случайных символов\n\n"
+            "<i>Пример: Петров Пётр Петрович</i>",
             parse_mode="HTML",
             reply_markup=kb_back_cancel(),
         )
         return
-    teacher = value
+
+    if any(len(w) == 1 for w in words):
+        await message.answer(
+            "❌ Не используйте однобуквенные сокращения\n\n"
+            "<i>Пример: Петров Пётр Петрович</i>",
+            parse_mode="HTML",
+            reply_markup=kb_back_cancel(),
+        )
+        return
+
     await state.update_data(teacher=teacher)
     await message.answer(
-        f"✅ <b>ФИО преподавателя:</b> {html.escape(teacher)}\n\n"
         "📚 <b>Выберите дисциплину (предмет)</b>",
         reply_markup=with_back(kb_subject()),
         parse_mode="HTML",
@@ -8919,8 +6860,6 @@ async def h_teacher(message: Message, state: FSMContext) -> None:
 @dp.callback_query(F.data.startswith("subj_"))
 async def h_subject_cb(cb: CallbackQuery, state: FSMContext) -> None:
     subj = cb.data.replace("subj_", "", 1)
-    data = await state.get_data()
-    skip_check = bool(data.get("skip_next_relevance"))
     if subj == "other":
         await cb.message.edit_text(
             "✏️ <b>Введите название предмета</b>",
@@ -8928,143 +6867,27 @@ async def h_subject_cb(cb: CallbackQuery, state: FSMContext) -> None:
             reply_markup=kb_back_cancel(),
         )
         await state.set_state(WorkState.subject)
-    elif skip_check:
-        await state.update_data(subject=subj, skip_next_relevance=False)
+    else:
+        await state.update_data(subject=subj)
         await cb.message.edit_text(
-            f"✅ Предмет: <b>{html.escape(subj)}</b>\n\n"
+            f"✅ Предмет: <b>{subj}</b>\n\n"
             "🌆 <b>Выберите город</b>:",
             reply_markup=with_back(kb_city()),
             parse_mode="HTML",
         )
         await state.set_state(WorkState.city)
-    else:
-        await handle_subject_selected(cb.message, state, subj, edit=True)
     await cb.answer()
 
 
 @dp.message(WorkState.subject)
 async def h_subject_text(message: Message, state: FSMContext) -> None:
-    subj = (message.text or "").strip()
-    if len(subj) < 2:
-        await message.answer(
-            "❌ Введите название предмета подробнее.",
-            reply_markup=kb_back_cancel(),
-        )
-        return
-    data = await state.get_data()
-    if data.get("skip_next_relevance"):
-        await state.update_data(subject=subj, skip_next_relevance=False)
-        await message.answer(
-            f"✅ Предмет: <b>{html.escape(subj)}</b>\n\n"
-            "🌆 <b>Выберите город</b>:",
-            reply_markup=with_back(kb_city()),
-            parse_mode="HTML",
-        )
-        await state.set_state(WorkState.city)
-        return
-    await handle_subject_selected(message, state, subj, edit=False)
-
-
-@dp.callback_query(F.data.startswith("topic_suggest_"))
-async def h_topic_suggest(cb: CallbackQuery, state: FSMContext) -> None:
-    data = await state.get_data()
-    suggestions = data.get("topic_suggestions", []) or []
-    try:
-        idx = int(cb.data.replace("topic_suggest_", "", 1))
-        new_topic = suggestions[idx]
-    except Exception:
-        await cb.answer("Вариант темы не найден. Напишите свою тему.", show_alert=True)
-        return
-
-    await state.update_data(topic=new_topic, topic_warning_ignored=False)
-    await cb.message.edit_text(
-        f"✅ Тема изменена: <b>{html.escape(new_topic)}</b>\n\n"
-        "🌆 <b>Выберите город</b>:",
+    await state.update_data(subject=(message.text or "").strip())
+    await message.answer(
+        "🌆 <b>Выберите город:</b>",
         reply_markup=with_back(kb_city()),
         parse_mode="HTML",
     )
     await state.set_state(WorkState.city)
-    await cb.answer()
-
-
-@dp.callback_query(F.data.startswith("topic_subject_"))
-async def h_topic_subject_suggest(cb: CallbackQuery, state: FSMContext) -> None:
-    if cb.data == "topic_subject_custom":
-        await state.update_data(skip_next_relevance=True)
-        await cb.message.edit_text(
-            "📚 <b>Выберите другой предмет</b> или нажмите «Другой предмет» и напи��ите свой вариант.",
-            reply_markup=with_back(kb_subject()),
-            parse_mode="HTML",
-        )
-        await state.set_state(WorkState.subject)
-        await cb.answer()
-        return
-
-    data = await state.get_data()
-    subjects = data.get("subject_suggestions", []) or []
-    try:
-        idx = int(cb.data.replace("topic_subject_", "", 1))
-        new_subject = subjects[idx]
-    except Exception:
-        await cb.answer("Вариант предмета не найден. Выберите или напишите предмет вручную.", show_alert=True)
-        return
-
-    await state.update_data(subject=new_subject, topic_warning_ignored=False)
-    await cb.message.edit_text(
-        f"✅ Предмет изменён: <b>{html.escape(new_subject)}</b>\n"
-        f"✅ Тема оставлена: <b>{html.escape((data.get('topic', '') or '').strip())}</b>\n\n"
-        "🌆 <b>Выберите город</b>:",
-        reply_markup=with_back(kb_city()),
-        parse_mode="HTML",
-    )
-    await state.set_state(WorkState.city)
-    await cb.answer()
-
-
-@dp.callback_query(F.data == "topic_custom")
-async def h_topic_custom(cb: CallbackQuery, state: FSMContext) -> None:
-    await cb.message.edit_text(
-        "✏️ <b>Введите новую тему работы</b>\n\n"
-        "Сформулируйте её так, чтобы была видна связь с выбранной дисциплиной.",
-        parse_mode="HTML",
-        reply_markup=kb_back_cancel(),
-    )
-    await state.set_state(WorkState.topic_adjustment)
-    await cb.answer()
-
-
-@dp.callback_query(F.data == "topic_continue")
-async def h_topic_continue(cb: CallbackQuery, state: FSMContext) -> None:
-    await state.update_data(topic_warning_ignored=True)
-    await cb.message.edit_text(
-        "➡️ Продолжаю с исходной темой.\n\n"
-        "🌆 <b>Выберите город</b>:",
-        reply_markup=with_back(kb_city()),
-        parse_mode="HTML",
-    )
-    await state.set_state(WorkState.city)
-    await cb.answer()
-
-
-@dp.message(WorkState.topic_adjustment)
-async def h_topic_adjustment_text(message: Message, state: FSMContext) -> None:
-    new_topic = (message.text or "").strip()
-    if len(new_topic) < 5:
-        await message.answer(
-            "❌ Тема слишком короткая. Опишите тему подробнее (минимум 5 символов).",
-            reply_markup=kb_back_cancel(),
-        )
-        return
-
-    await state.update_data(topic=new_topic, topic_warning_ignored=False)
-    data = await state.get_data()
-    subject = (data.get("subject", "") or "").strip()
-    if not subject:
-        await message.answer("📚 <b>Выберите дисциплину (предмет)</b>", reply_markup=with_back(kb_subject()), parse_mode="HTML")
-        await state.set_state(WorkState.subject)
-        return
-
-    await handle_subject_selected(message, state, subject, edit=False)
 
 
 @dp.callback_query(F.data.startswith("city_"))
@@ -9167,39 +6990,10 @@ async def h_pages(message: Message, state: FSMContext) -> None:
 async def h_pagepos(cb: CallbackQuery, state: FSMContext) -> None:
     pos = "top_center" if cb.data == "pagepos_top" else "bottom_center"
     await state.update_data(page_number_position=pos)
-    data = await state.get_data()
-    mode = data.get("mode", "free")
 
-    price_note = (
-        f"\n\n⭐ <i>Режим с изображениями платный: +{IMAGES_EXTRA_PRICE_PER_PAGE}⭐ за страницу. "
-        "DeepSeek подберёт изображения по теме и бот вставит их в DOCX с подписями по ГОСТ.</i>"
-        if mode == "paid" else
-        "\n\n⭐ <i>С изображениями — платная опция. Если выбрать её в бесплатном режиме, бот переведёт работу в платный режим.</i>"
-    )
-    await cb.message.edit_text(
-        "🖼 <b>Добавить изображения в работу?</b>\n\n"
-        "• <b>Без изображений</b> — обычная работа.\n"
-        "• <b>С изображениями</b> — поиск фото по теме, вставка по тексту, подписи вида "
-        "«Рисунок 1 – ...» и источник."
-        f"{price_note}",
-        reply_markup=with_back(kb_image_mode()),
-        parse_mode="HTML",
-    )
-    await state.set_state(WorkState.image_mode)
-    await cb.answer()
-
-
-async def _continue_after_image_choice(cb: CallbackQuery, state: FSMContext) -> None:
     data  = await state.get_data()
     pages = int(data.get("pages", 10))
     mode  = data.get("mode", "free")
-    include_images = bool(data.get("include_images"))
-
-    # Изображения — платная опция: если пользователь пришёл из бесплатного режима,
-    # переводим только эту генерацию в платный сценарий выбора модели/оплаты.
-    if include_images and mode == "free" and not is_vip(cb.from_user.id):
-        mode = "paid"
-        await state.update_data(mode="paid")
 
     # ── Бесплатный режим ──
     if mode == "free":
@@ -9239,112 +7033,15 @@ async def _continue_after_image_choice(cb: CallbackQuery, state: FSMContext) -> 
         return
 
     await state.update_data(humanize=False)
-    image_note = (
-        f"\n🖼 Изображения включены: +{IMAGES_EXTRA_PRICE_PER_PAGE}⭐/стр."
-        if include_images else "\n📄 Изображения отключены."
-    )
     await cb.message.edit_text(
         "🤖 <b>Выберите ИИ-модель</b>\n\n"
         "Цена указана в звёздах Telegram за страницу.\n"
-        "Текст будет без опечаток, markdown-маркеров и фраз-маркеров ИИ."
-        f"{image_note}",
+        "Текст будет без опечаток, markdown-маркеров и фраз-маркеров ИИ.",
         reply_markup=with_back(kb_models()),
         parse_mode="HTML",
     )
     await state.set_state(WorkState.model)
     await cb.answer()
-
-
-@dp.callback_query(F.data.in_(["images_yes", "images_no"]))
-async def h_image_mode(cb: CallbackQuery, state: FSMContext) -> None:
-    include_images = cb.data == "images_yes"
-    if not include_images:
-        await state.update_data(include_images=False, image_count=0)
-        await _continue_after_image_choice(cb, state)
-        return
-
-    data = await state.get_data()
-    pages = int(data.get("pages", 10))
-    await state.update_data(include_images=True)
-    await cb.message.edit_text(
-        "🖼 <b>Сколько реальных фото вставить?</b>\n\n"
-        f"📐 <b>По ГОСТ/авто</b>: { _image_count_for_pages(pages) } шт. "
-        "(примерно 1 изображение на 5 страниц, но не больше лимита).\n\n"
-        "Или выберите своё количество. Бот будет искать <b>только настоящие фото</b> "
-        "через бесплатные источники: Openverse, Wikipedia и Wikimedia Commons.",
-        reply_markup=with_back(kb_image_count(pages)),
-        parse_mode="HTML",
-    )
-    await state.set_state(WorkState.image_count)
-    await cb.answer()
-
-
-@dp.callback_query(F.data.startswith("imgcount_"))
-async def h_image_count_cb(cb: CallbackQuery, state: FSMContext) -> None:
-    data = await state.get_data()
-    pages = int(data.get("pages", 10))
-    value = cb.data.replace("imgcount_", "", 1)
-
-    if value == "custom":
-        await cb.message.edit_text(
-            f"✏️ <b>Введите количество фото</b> числом от 1 до {MAX_WORK_IMAGES}.",
-            reply_markup=kb_back_cancel(),
-            parse_mode="HTML",
-        )
-        await state.set_state(WorkState.image_count)
-        await cb.answer()
-        return
-
-    if value == "auto":
-        count = _image_count_for_pages(pages)
-    else:
-        count = int(value)
-    count = max(1, min(MAX_WORK_IMAGES, count))
-    await state.update_data(include_images=True, image_count=count)
-    await _continue_after_image_choice(cb, state)
-
-
-@dp.message(WorkState.image_count)
-async def h_image_count_text(message: Message, state: FSMContext) -> None:
-    try:
-        count = int((message.text or "").strip())
-    except Exception:
-        await message.answer(f"❌ Введите число от 1 до {MAX_WORK_IMAGES}.", reply_markup=kb_back_cancel())
-        return
-    if count < 1 or count > MAX_WORK_IMAGES:
-        await message.answer(f"❌ Допустимое количество фото: 1–{MAX_WORK_IMAGES}.", reply_markup=kb_back_cancel())
-        return
-    await state.update_data(include_images=True, image_count=count)
-
-    # После текстового ввода продолжаем тот же сценарий, только у message нет edit_text.
-    data = await state.get_data()
-    pages = int(data.get("pages", 10))
-    mode = data.get("mode", "free")
-    if mode == "free" and not is_vip(message.from_user.id):
-        await state.update_data(mode="paid")
-        mode = "paid"
-
-    if mode == "free":
-        ok, reason = check_user_limit(message.from_user.id, "free")
-        if not ok:
-            await message.answer(reason, parse_mode="HTML")
-            await state.clear()
-            return
-        await message.answer("🚀 <b>Запускаю генерацию...</b>", parse_mode="HTML")
-        await generate_and_send(message, state, model_key=FREE_MODEL_KEY, pay_mode="free")
-        return
-
-    ok, reason = check_user_limit(message.from_user.id, "paid")
-    if not ok and not is_vip(message.from_user.id):
-        await message.answer(reason, parse_mode="HTML")
-        await state.clear()
-        return
-    await message.answer(
-        f"✅ Фото: <b>{count}</b> шт.\n\n🤖 <b>Выберите ИИ-модель</b>",
-        reply_markup=with_back(kb_models()),
-        parse_mode="HTML",
-    )
-    await state.set_state(WorkState.model)
 
 
 @dp.callback_query(F.data.in_(["humanize_yes", "humanize_no"]))
@@ -9386,10 +7083,7 @@ async def h_model(cb: CallbackQuery, state: FSMContext) -> None:
     data  = await state.get_data()
     pages = int(data.get("pages", 10))
     model = AI_MODELS[model_key]
-    include_images = bool(data.get("include_images"))
-    image_extra = IMAGES_EXTRA_PRICE_PER_PAGE if include_images else 0
-    price_per_page = int(model["price_per_page"]) + image_extra
-    total = price_per_page * pages
+    total = int(model["price_per_page"]) * pages
 
     await state.update_data(model_key=model_key)
 
@@ -9397,8 +7091,7 @@ async def h_model(cb: CallbackQuery, state: FSMContext) -> None:
         await cb.message.edit_text(
             f"👑 <b>VIP — оплата не требуется</b>\n\n"
             f"Модель: {model['name']}\n"
-            f"Страниц: {pages}\n"
-            f"Изображения: {'да' if include_images else 'нет'}\n\n"
+            f"Страниц: {pages}\n\n"
             f"🚀 Запускаю генерацию...",
             parse_mode="HTML",
         )
@@ -9417,8 +7110,7 @@ async def h_model(cb: CallbackQuery, state: FSMContext) -> None:
         f"┌─────────────────────────\n"
         f"│ 🤖 Модель:  {model['name']}\n"
         f"│ 📄 Страниц: {pages}\n"
-        f"│ 🖼 Изображения: {(str(int(data.get('image_count') or 0)) + ' шт.') if include_images else 'нет'}\n"
-        f"│ 💰 Цена:    {price_per_page}⭐ × {pages} = <b>{total}⭐</b>\n"
+        f"│ 💰 Цена:    {model['price_per_page']}⭐ × {pages} = <b>{total}⭐</b>\n"
         f"└─────────────────────────\n\n"
         f"Нажмите кнопку для оплаты через Telegram Stars:",
         reply_markup=kb,
@@ -9445,12 +7137,7 @@ async def h_pay(cb: CallbackQuery, state: FSMContext) -> None:
     data      = await state.get_data()
     model_key = data.get("model_key", FREE_MODEL_KEY)
     payload   = json.dumps(
-        {
-            "model_key": model_key,
-            "pages": data.get("pages", 10),
-            "include_images": bool(data.get("include_images")),
-            "image_count": int(data.get("image_count") or 0),
-        },
+        {"model_key": model_key, "pages": data.get("pages", 10)},
         ensure_ascii=False,
     )
 
@@ -9479,10 +7166,6 @@ async def h_payment_ok(message: Message, state: FSMContext) -> None:
     try:
         payload   = json.loads(message.successful_payment.invoice_payload)
         model_key = payload.get("model_key", FREE_MODEL_KEY)
-        await state.update_data(
-            include_images=bool(payload.get("include_images")),
-            image_count=int(payload.get("image_count") or 0),
-        )
     except Exception:
         model_key = FREE_MODEL_KEY
 
@@ -9494,102 +7177,9 @@ async def h_payment_ok(message: Message, state: FSMContext) -> None:
     await generate_and_send(message, state, model_key=model_key, pay_mode="paid")
 
 
-
-
-@dp.callback_query(F.data == "fix_docx_yes")
-async def h_fix_docx_yes(cb: CallbackQuery, state: FSMContext) -> None:
-    """Пользователь выбрал 'Исправить ссылки и библиографию' — запускаем обработку."""
-    data = await state.get_data()
-    doc_dict = data.get("fix_docx_document")
-    if not doc_dict:
-        await cb.message.edit_text(
-            "❌ <b>Документ не найден.</b>\n\n"
-            "Пожалуйста, отправьте файл заново.",
-            parse_mode="HTML",
-        )
-        await cb.answer()
-        return
-
-    # Восстанавливаем объект Document из словаря
-    from aiogram.types import Document as TgDocument
-    try:
-        document = TgDocument(**doc_dict)
-    except Exception as e:
-        await cb.message.edit_text(
-            f"❌ <b>Ошибка восстановления документа:</b> {html.escape(str(e)[:100])}\n\n"
-            f"Пожалуйста, отправьте файл заново.",
-            parse_mode="HTML",
-        )
-        await cb.answer()
-        return
-
-    await cb.message.edit_text(
-        "⏳ <b>Начинаю исправление документа...</b>",
-        parse_mode="HTML",
-    )
-    await cb.answer()
-    await process_docx_fix(cb.bot, cb.message.chat.id, document, state)
-    await state.clear()
-
-@dp.callback_query(F.data == "fix_docx_yes")
-async def h_fix_docx_yes(cb: CallbackQuery, state: FSMContext) -> None:
-    """Пользователь выбрал 'Исправить ссылки и библиографию' — запускаем обработку."""
-    data = await state.get_data()
-    doc_dict = data.get("fix_docx_document")
-    if not doc_dict:
-        await cb.message.edit_text(
-            "❌ <b>Документ не найден.</b>\n\n"
-            "Пожалуйста, отправьте файл заново.",
-            parse_mode="HTML",
-        )
-        await cb.answer()
-        return
-
-    from aiogram.types import Document as TgDocument
-    try:
-        document = TgDocument(**doc_dict)
-    except Exception as e:
-        await cb.message.edit_text(
-            f"❌ <b>Ошибка восстановления документа:</b> {html.escape(str(e)[:100])}\n\n"
-            f"Пожалуйста, отправьте файл заново.",
-            parse_mode="HTML",
-        )
-        await cb.answer()
-        return
-
-    await cb.message.edit_text(
-        "⏳ <b>Начинаю исправление документа...</b>",
-        parse_mode="HTML",
-    )
-    await cb.answer()
-    await process_docx_fix(cb.bot, cb.message.chat.id, document, state)
-    await state.clear()
-
-
-@dp.callback_query(F.data == "source_add_text")
-async def h_source_add_text(cb: CallbackQuery, state: FSMContext) -> None:
-    """Пользователь хочет добавить дополнительные материалы текстом после отправки DOCX."""
-    await cb.message.edit_text(
-        "📎 <b>Отправьте дополнительные материалы текстом</b>\n\n"
-        "Вставьте план, тезисы, конспект, ссылки на сайты — ИИ использует это как основу.\n"
-        "Ранее извлечённый текст из DOCX уже сохранён и будет объединён с новыми материалами.\n"
-        "<i>Максимум 12 000 символов.</i>",
-        parse_mode="HTML",
-        reply_markup=kb_back_cancel(),
-    )
-    await state.set_state(WorkState.source_content)
-    await cb.answer()
-
-
 @dp.callback_query(F.data == "final_new")
 async def h_final_new(cb: CallbackQuery, state: FSMContext) -> None:
-    """Начать новую работу. Если есть сохранённые материалы из DOCX — сохраняем их."""
-    data = await state.get_data()
-    saved_source = data.get("source_content", "")
     await state.clear()
-    # Восстанавливаем материалы, если они были извлечены из DOCX
-    if saved_source:
-        await state.update_data(source_content=saved_source)
     first = cb.from_user.first_name or "пользователь"
     await cb.message.edit_text(
         _welcome_text(cb.from_user.id, first),
@@ -9753,21 +7343,6 @@ async def generate_and_send(
             # Форматируем заголовки «Глава N. ...» / «N.M. ...» (fix12)
             blocks = _apply_heading_format_to_blocks(blocks)
 
-            if data.get("include_images"):
-                await prog.update(label="🖼 Ищу изображения по теме и готовлю подписи по ГОСТ...", force=True)
-                data["images"] = await prepare_work_images(
-                    topic,
-                    subject,
-                    pages,
-                    model_key=model_key,
-                    image_count=int(data.get("image_count") or 0) or None,
-                )
-                if not data.get("images"):
-                    print("[IMAGES] Подходящие реальные фото не найдены — документ будет без иллюстраций")
-                else:
-                    # Компактный размер фото помогает сохранить точное число страниц.
-                    gost["image_width_cm"] = 10.0
-
             docx_raw = build_docx_bytes(data, blocks, gost)
             with open(tmp_in, "wb") as f:
                 f.write(docx_raw)
@@ -9796,7 +7371,7 @@ async def generate_and_send(
             # ── Постобработка: LO после обновления TOC может «раздуть»
             #    документ на 1–2 страницы. Поэтому крутим коррекцию в цикле
             #    до 3 раз: измерили → подогнали blocks → пересобрали → LO → снова замер. ──
-            POST_LO_MAX_ROUNDS = 6
+            POST_LO_MAX_ROUNDS = 3
             final_pages = pages
             for round_idx in range(POST_LO_MAX_ROUNDS):
                 post_lo_pages = await measure_pages_async(final_path, work_dir)
@@ -9824,7 +7399,7 @@ async def generate_and_send(
                     prog=prog,
                     work_dir=work_dir,
                 )
-                # Пересобирае�� DOCX «как новый» из обновлённых blocks
+                # Пересобираем DOCX «как новый» из обновлённых blocks
                 blocks = _apply_heading_format_to_blocks(blocks)
                 docx_raw = build_docx_bytes(data, blocks, gost)
                 with open(tmp_in, "wb") as f:
@@ -9835,44 +7410,6 @@ async def generate_and_send(
             else:
                 # Цикл закончился без break — печатаем итог
                 print(f"[PAGES] ⚠️ После {POST_LO_MAX_ROUNDS} раундов финальная цифра {final_pages}, цель {pages}")
-
-            # Финальный строгий контроль: не отправляем «почти нужный» объём без попытки исправить.
-            if final_pages != pages:
-                print(f"[PAGES] 🚨 Финальная строгая коррекция: факт {final_pages}, цель {pages}")
-                for strict_round in range(3):
-                    if final_pages == pages:
-                        break
-                    if final_pages > pages and data.get("images") and float(gost.get("image_width_cm", 10.0)) > 4.0:
-                        gost["image_width_cm"] = max(4.0, float(gost.get("image_width_cm", 10.0)) - 1.0)
-                        print(f"[PAGES] 🖼 strict: ширина изображений {gost['image_width_cm']} см")
-                    blocks, _ = await precise_page_adjustment(
-                        tmp_in=tmp_in,
-                        blocks=blocks,
-                        target_pages=pages,
-                        topic=topic,
-                        model_key=model_key,
-                        writing_style=writing_style,
-                        data=data,
-                        gost=gost,
-                        prog=prog,
-                        work_dir=work_dir,
-                    )
-                    blocks = _apply_heading_format_to_blocks(blocks)
-                    docx_raw = build_docx_bytes(data, blocks, gost)
-                    with open(tmp_in, "wb") as f:
-                        f.write(docx_raw)
-                    updated = libreoffice_update_docx(tmp_in, tmp_out)
-                    final_path = tmp_out if updated else tmp_in
-                    measured = await measure_pages_async(final_path, work_dir)
-                    if measured is not None:
-                        final_pages = measured
-                    print(f"[PAGES] strict round {strict_round+1}: {final_pages}/{pages}")
-
-            if final_pages != pages:
-                raise RuntimeError(
-                    f"Не удалось добиться точного объёма: получилось {final_pages} стр., нужно {pages}. "
-                    "Попробуйте уменьшить количество изображений или выбрать на 1 страницу больше."
-                )
 
             print(f"[PAGES] 📤 Итог в caption: {final_pages} страниц")
 
@@ -9898,18 +7435,12 @@ async def generate_and_send(
                 if relevance_ok
                 else f"⚠️ проверьте тему: {relevance_reason[:60]}"
             )
-            images_line = (
-                f"│ 🖼 Изображения: {len(data.get('images') or [])} шт.\n"
-                if data.get("include_images") else
-                "│ 🖼 Изображения: нет\n"
-            )
             caption = (
                 f"🎉 <b>{dt['word']} ГОТОВ!</b>\n\n"
                 f"┌─────────────────────────\n"
                 f"│ 📖 Тема: {topic[:60]}\n"
                 f"│ {pages_line}\n"
                 f"│ 🤖 ИИ: {AI_MODELS.get(model_key, {}).get('name', model_key)}\n"
-                f"{images_line}"
                 f"│ ✍️ Стиль: {style_label}\n"
                 f"│ 📐 Шрифт: {gost.get('font_name')} {gost.get('font_size')}pt\n"
                 f"│ ↕️ Интервал: {gost.get('line_spacing')}\n"
