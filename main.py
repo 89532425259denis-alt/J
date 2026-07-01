@@ -6652,8 +6652,8 @@ def _apply_heading_format_to_blocks(blocks):
     chapter_no = 0
     for title, level, text, subblocks in blocks:
         if _is_structural_heading(title):
-            # структурный раздел — без номера
-            new_title = _strip_markdown_markers(title).strip()
+            # структурный раздел — без номера, прописными буквами (ГОСТ 7.32-2017)
+            new_title = _strip_markdown_markers(title).strip().upper()
             new_subs = [
                 (_strip_markdown_markers(s_title).strip(), s_text)
                 for s_title, s_text in (subblocks or [])
@@ -6745,7 +6745,7 @@ def _render_gost_table(doc: Document, ch: str, gost: dict) -> None:
         if l.count("|") >= 2:
             rows_src.append(_split_md_row(l))
         elif re.match(r"(?i)^\s*табл", l) and not caption:
-            caption = re.sub(r"(?i)^\s*таблица\s*\d*\s*[—–:.-]*\s*", "", l).strip()
+            caption = re.sub(r"(?i)^\s*таблица\s*\d*\s*[—–:.-]*\s*", "", l).strip().rstrip(".")
     if not rows_src:
         return
     ncols = max(len(r) for r in rows_src)
@@ -6822,8 +6822,8 @@ def _render_gost_formula(doc: Document, ch: str, gost: dict) -> None:
 
     p = doc.add_paragraph()
     p.paragraph_format.first_line_indent = Cm(0)
-    p.paragraph_format.space_before = Pt(6)
-    p.paragraph_format.space_after = Pt(6)
+    p.paragraph_format.space_before = Pt(12)
+    p.paragraph_format.space_after = Pt(12)
     p.paragraph_format.line_spacing = 1.5
     p.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.LEFT
     p.paragraph_format.tab_stops.add_tab_stop(Mm(tw_mm / 2.0), WD_TAB_ALIGNMENT.CENTER)
@@ -7866,8 +7866,8 @@ def add_gost_image(doc: Document, image: dict, number: int, gost: dict) -> None:
 
     fn = gost.get("font_name", "Times New Roman")
     fs = int(gost.get("font_size", 14))
-    cap_fs = max(10, fs - 2)  # подпись меньше основного текста
-    src_fs = max(9, fs - 4)   # строка источника/ссылки ещё меньше
+    cap_fs = fs  # подпись тем же шрифтом, что и основной текст (ГОСТ 7.32)
+    src_fs = max(10, fs - 2)   # строка источника/ссылки чуть меньше
 
     align_map = {
         "left": WD_ALIGN_PARAGRAPH.LEFT,
@@ -8200,7 +8200,7 @@ def build_docx_bytes(
         if block_level != 1:
             return
         # Находим последний абзац тела главы, чтобы добавить в текст отсылку
-        # «(см. рис. N)». НЕ приклеиваем этот абзац к рисунку через keep_next:
+        # «(см. рисунок N)». НЕ приклеиваем этот абзац к рисунку через keep_next:
         # иначе текст может занять остаток страницы, а источник рисунка уедет
         # на следующий лист. Неразрывной должна быть именно группа
         # «рисунок + подпись + источник».
@@ -8217,7 +8217,7 @@ def build_docx_bytes(
                 if any(w in _low_txt for w in ("список использованных", "список литературы", "список источников")):
                     continue
                 # Берём последний обычный абзац текста, даже если Word/LO не
-                # сохранил alignment=JUSTIFY. Это гарантирует отсылку (см. рис. N).
+                # сохранил alignment=JUSTIFY. Это гарантирует отсылку (см. рисунок N).
                 if len(_txt) > 40:
                     _last_body_para = _pp
                     break
@@ -8226,31 +8226,35 @@ def build_docx_bytes(
         except Exception as _ke:
             print(f"[FIX 7.32-G] keep_next не установлен: {_ke}")
 
-        # (user-patch): вставляем отсылку «(см. рис. N)» в конец последнего
+        # (user-patch): вставляем отсылку «(см. рисунок N)» в конец последнего
         # абзаца перед изображением, если её там ещё нет. Это требование
         # ГОСТ 7.32: на каждое изображение должна быть ссылка в тексте.
         try:
             if _last_body_para is not None:
                 _full_txt = "".join(_r.text for _r in _last_body_para.runs)
-                _ref_token = f"рис. {image_number}"
-                if _ref_token not in _full_txt.lower():
-                    # Срезаем финальную точку, добавляем «(см. рис. N)» и точку обратно.
-                    _stripped = _full_txt.rstrip()
-                    _last_char = _stripped[-1] if _stripped else ""
-                    _suffix = " (см. рис. " + str(image_number) + ")"
-                    if _last_char in ".!?…":
-                        _new_txt = _stripped[:-1] + _suffix + _last_char
+                # Учитываем разные падежи: рисунок, рисунке, рисунка (ГОСТ 7.32-2017)
+                _ref_pat = re.compile(rf"рисун(?:ок|ке|ка)\s+{image_number}", re.I)
+                if not _ref_pat.search(_full_txt):
+                    _suffix = " (см. рисунок " + str(image_number) + ")"
+                    # Добавляем ссылку в конец последнего абзаца, сохраняя форматирование runs.
+                    # Находим последний run, содержащий текст.
+                    target_run = None
+                    for _r in reversed(_last_body_para.runs):
+                        if _r.text.strip():
+                            target_run = _r
+                            break
+                    if target_run:
+                        _t = target_run.text.rstrip()
+                        if _t and _t[-1] in ".!?…":
+                            target_run.text = _t[:-1] + _suffix + _t[-1]
+                        else:
+                            target_run.text = _t + _suffix + "."
+                    elif _last_body_para.runs:
+                        _last_body_para.runs[-1].text += _suffix + "."
                     else:
-                        _new_txt = _stripped + _suffix + "."
-                    # Перезаписываем все runs одним run с новым текстом,
-                    # сохраняя форматирование первого run.
-                    _first_run = _last_body_para.runs[0] if _last_body_para.runs else None
-                    for _r in list(_last_body_para.runs):
-                        _r.text = ""
-                    if _first_run is not None:
-                        _first_run.text = _new_txt
+                        _last_body_para.add_run(_suffix + ".")
         except Exception as _re:
-            print(f"[FIG-REF] не удалось добавить «(см. рис. {image_number})»: {_re}")
+            print(f"[FIG-REF] не удалось добавить «(см. рисунок {image_number})»: {_re}")
 
         if _last_body_para is None:
             # Последняя страховка: отдельная текстовая отсылка перед рисунком,
@@ -8260,7 +8264,7 @@ def build_docx_bytes(
             p_ref.paragraph_format.first_line_indent = Cm(float(gost.get("first_line_indent_cm", 1.25)))
             p_ref.paragraph_format.space_before = Pt(0)
             p_ref.paragraph_format.space_after = Pt(0)
-            rr = p_ref.add_run(f"Иллюстративный материал представлен на рисунке {image_number} (см. рис. {image_number}).")
+            rr = p_ref.add_run(f"Иллюстративный материал представлен на рисунке {image_number} (см. рисунок {image_number}).")
             _set_run_font(rr, gost.get("font_name", "Times New Roman"), int(gost.get("font_size", 14)), False)
             _set_paragraph_keep(p_ref, keep_next=True, keep_lines=True, widow=True)
 
@@ -8289,9 +8293,16 @@ def build_docx_bytes(
             # ГОСТ 7.32: на каждый рисунок должна быть ссылка в тексте.
             # Добавляем её в конец последнего абзаца части, предшествующей рисунку.
             part1_paras = [p.strip() for p in part1.split("\n\n") if p.strip()]
-            if part1_paras and f"рис. {number}" not in part1_paras[-1].lower():
-                last = part1_paras[-1].rstrip(".")
-                part1_paras[-1] = f"{last} (см. рис. {number})."
+            if part1_paras:
+                # Учитываем разные падежи: рисунок, рисунке, рисунка
+                _ref_pat = re.compile(rf"рисун(?:ок|ке|ка)\s+{number}", re.I)
+                if not _ref_pat.search(part1_paras[-1]):
+                    last_p = part1_paras[-1].strip()
+                suffix = f" (см. рисунок {number})"
+                if last_p and last_p[-1] in ".!?…":
+                    part1_paras[-1] = last_p[:-1] + suffix + last_p[-1]
+                else:
+                    part1_paras[-1] = last_p + suffix + "."
             part1 = "\n\n".join(part1_paras)
             add_paragraphs_from_text(doc, part1, gost, skip_first_heading=sub_title)
 
