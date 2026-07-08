@@ -3625,6 +3625,12 @@ async def generate_text_blocks(
         else:
             text, used_model = await chat_with_fallback(model_key, messages, max_tok)
 
+        if text:
+                _dbg = text[:200].replace(chr(10), ' ')
+                print(f'[DEBUG _gen_one_block] key={key}, len={len(text)}, preview: {_dbg}...')
+            else:
+                print(f'[DEBUG _gen_one_block] key={key}, EMPTY RESPONSE')
+        
         if prog and used_model and used_model != model_key:
             await prog.update(model_name=AI_MODELS.get(used_model, {}).get("name", used_model))
 
