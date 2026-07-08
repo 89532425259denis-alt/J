@@ -13002,6 +13002,7 @@ async def generate_and_send(
             )[:2500]
             relevance_ok, relevance_reason = await verify_discipline_relevance(
                 model_key, topic, subject, sample_for_check,
+            await event.answer(f"📊 Блоки: {', '.join(f'{k}={len(v)}' for k,v in sorted(parts.items()) if k != 'literature')}", parse_mode="HTML")
             )
             if not relevance_ok:
                 print(f"[RELEVANCE] ⚠️ Текст может не соответствовать дисциплине "
