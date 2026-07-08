@@ -86,12 +86,32 @@ class AggregateImageSearcher:
         for query in queries:
             if len(found) >= count:
                 break
-            for provider in self.providers:
-                remaining = self.deadline_sec - (time.monotonic() - start)
-                if remaining <= 1.0 or len(found) >= count:
-                    break
-                need = count - len(found)
-                results = await provider.search(query, need, timeout=min(20.0, remaining))
+            remaining = self.deadline_sec - (time.monotonic() - start)
+            if remaining <= 1.0:
+                break
+            need = count - len(found)
+            per_provider_timeout = min(20.0, remaining)
+
+            # FIX: провайдеры опрашиваются ПАРАЛЛЕЛЬНО (было — по очереди),
+            # чтобы один зависший/медленный источник не съедал весь
+            # deadline_sec и не оставлял остальных без шанса ответить.
+            tasks = [
+                provider.search(query, need, timeout=per_provider_timeout)
+                for provider in self.providers
+            ]
+            try:
+                provider_results = await asyncio.wait_for(
+                    asyncio.gather(*tasks, return_exceptions=True),
+                    timeout=per_provider_timeout + 2.0,
+                )
+            except asyncio.TimeoutError:
+                provider_results = []
+
+            for results in provider_results:
+                if isinstance(results, BaseException):
+                    continue
+                if not results:
+                    continue
                 for img in results:
                     if len(found) >= count:
                         break
