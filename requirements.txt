@@ -1,7 +1,0 @@
-aiogram
-aiohttp
-python-docx
-Pillow
-pypdf
-PyPDF2
-PyMuPDF
